@@ -23,12 +23,12 @@ onMounted(async () => {
       const data = thresholdRes.data.thresholds
       chart.setOption({
         tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-        legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
-        grid: { left: 50, right: 30, top: 20, bottom: 40 },
+        legend: { top: 0, textStyle: { color: '#9ca3af', fontSize: 11 }, itemGap: 14 },
+        grid: { left: 50, right: 50, top: 36, bottom: 20 },
         xAxis: { type: 'category', data: data.map(d => d.threshold), axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } } },
         yAxis: [
-          { type: 'value', name: '数量', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
-          { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#9ca3af' } }
+          { type: 'value', name: '数量', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } },
+          { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } }
         ],
         series: [
           { name: 'TP(挽留成功)', type: 'bar', stack: 'count', data: data.map(d => d.tp), itemStyle: { color: '#22c55e' } },

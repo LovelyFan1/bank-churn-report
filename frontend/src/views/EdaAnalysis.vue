@@ -4,6 +4,16 @@ import * as echarts from 'echarts'
 import api from '../api'
 
 const loading = ref(true)
+
+const LABELS = {
+  credit_score: '信用评分', geography: '地区', gender: '性别',
+  age: '年龄', tenure: '任期', balance: '余额',
+  num_products: '产品数', has_credit_card: '有信用卡', is_active_member: '活跃会员',
+  estimated_salary: '预估薪资', satisfaction_score: '满意度', points_earned: '积分',
+  complain: '投诉', exited: '流失', age_group: '年龄组', balance_salary_ratio: '余薪比',
+}
+const fmtLabel = (key) => LABELS[key] || key
+
 const correlationChart = shallowRef(null)
 const churnByGenderChart = shallowRef(null)
 const churnByGeoChart = shallowRef(null)
@@ -43,18 +53,18 @@ onMounted(async () => {
           backgroundColor: 'rgba(15,15,35,0.9)',
           borderColor: 'rgba(99,102,241,0.3)',
           textStyle: { color: '#e0e0e0' },
-          formatter: (p) => `${features[p.value[1]]} vs ${features[p.value[0]]}: ${p.value[2].toFixed(3)}`
+          formatter: (p) => `${fmtLabel(features[p.value[1]])} vs ${fmtLabel(features[p.value[0]])}: ${p.value[2].toFixed(3)}`
         },
         grid: { left: 80, right: 40, top: 10, bottom: 60 },
         xAxis: {
           type: 'category',
-          data: features,
+          data: features.map(fmtLabel),
           axisLabel: { color: '#9ca3af', fontSize: 10, rotate: 45 },
           axisLine: { lineStyle: { color: '#374151' } }
         },
         yAxis: {
           type: 'category',
-          data: features,
+          data: features.map(fmtLabel),
           axisLabel: { color: '#9ca3af', fontSize: 10 },
           axisLine: { lineStyle: { color: '#374151' } }
         },

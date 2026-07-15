@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -62,6 +62,13 @@ async def predict_single(customer_data: dict, db: Session = Depends(get_db)):
     """单个客户预测"""
     service = get_model_service(db)
     return service.predict_single(customer_data)
+
+
+@router.get("/batch-score")
+async def batch_score(top_n: int = Query(default=100, ge=1, le=1000), db: Session = Depends(get_db)):
+    """批量打分所有客户，返回 Top N 高风险客户 + 风险分布"""
+    service = get_model_service(db)
+    return service.batch_score_all(top_n=top_n)
 
 
 @router.post("/save")

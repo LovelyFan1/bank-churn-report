@@ -14,6 +14,13 @@ async def get_comprehensive_eda(db: Session = Depends(get_db)):
     return service.get_comprehensive_eda()
 
 
+@router.get("/key-insights")
+async def get_key_insights(db: Session = Depends(get_db)):
+    """动态关键洞察"""
+    service = get_eda_service(db)
+    return service.get_key_insights()
+
+
 @router.get("/correlation")
 async def get_correlation_matrix(db: Session = Depends(get_db)):
     """相关性矩阵"""

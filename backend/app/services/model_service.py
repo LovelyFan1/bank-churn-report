@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import json
+import os
+from pathlib import Path
 from sqlalchemy.orm import Session
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
@@ -310,6 +312,80 @@ class ModelService:
             "model_used": best_model_name
         }
 
+    def batch_score_all(self, top_n: int = 100) -> Dict[str, Any]:
+        """批量打分所有客户，返回 Top N 高风险客户 + 风险分布"""
+        if not self._models:
+            self.train_all_models()
+
+        best_model_name = max(self._results.keys(), key=lambda x: self._results[x]["auc"])
+        model = self._models[best_model_name]
+
+        df = self._get_dataframe()
+        X, y, feature_names = self._prepare_features(df)
+
+        # 批量预测
+        probabilities = model.predict_proba(X)[:, 1]
+
+        # 构建客户风险列表
+        customers = self.db.query(Customer).all()
+        scored = []
+        for i, c in enumerate(customers):
+            prob = float(probabilities[i])
+            if prob >= 0.7:
+                risk_level = "CRITICAL"
+            elif prob >= 0.3:
+                risk_level = "HIGH"
+            elif prob >= 0.1:
+                risk_level = "MEDIUM"
+            else:
+                risk_level = "LOW"
+
+            # 风险因素
+            risk_factors = []
+            if c.complain == 1:
+                risk_factors.append("已投诉")
+            if c.is_active_member == 0:
+                risk_factors.append("非活跃")
+            if c.num_products >= 3:
+                risk_factors.append(f"{c.num_products}产品")
+            if c.age >= 50:
+                risk_factors.append("高龄")
+            if c.balance == 0:
+                risk_factors.append("零余额")
+            if c.geography == "Germany":
+                risk_factors.append("德国")
+
+            scored.append({
+                "id": c.id,
+                "customer_id": c.customer_id,
+                "surname": c.surname,
+                "geography": c.geography,
+                "age": c.age,
+                "balance": round(c.balance, 2),
+                "estimated_salary": round(c.estimated_salary, 2),
+                "num_products": c.num_products,
+                "is_active_member": c.is_active_member,
+                "complain": c.complain,
+                "probability": round(prob, 4),
+                "risk_level": risk_level,
+                "risk_factors": risk_factors,
+            })
+
+        # 按概率降序排序
+        scored.sort(key=lambda x: x["probability"], reverse=True)
+
+        # 风险分布统计
+        dist = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for s in scored:
+            dist[s["risk_level"]] += 1
+
+        return {
+            "total_customers": len(scored),
+            "top_customers": scored[:top_n],
+            "risk_distribution": dist,
+            "model_used": best_model_name,
+        }
+
     def get_shap_global(self) -> Dict[str, Any]:
         """全局SHAP特征重要性分析"""
         if _model_cache.get("shap_global"):
@@ -439,6 +515,9 @@ _model_cache = {
     "shap_global": None,
 }
 
+# 模型持久化目录
+MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
+
 
 def get_model_service(db: Session) -> ModelService:
     service = ModelService(db)
@@ -456,3 +535,65 @@ def _save_to_cache(service: ModelService):
     _model_cache["results"] = service._results
     _model_cache["feature_names"] = service._feature_names
     _model_cache["df"] = service._df
+    # 持久化到磁盘
+    _save_to_disk(service)
+
+
+def _save_to_disk(service: ModelService):
+    """将模型和元数据保存到磁盘"""
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 保存每个模型
+    for name, model in service._models.items():
+        filename = name.lower().replace(" ", "_") + ".joblib"
+        joblib.dump(model, MODEL_DIR / filename)
+
+    # 保存元数据（结果、特征名）
+    meta = {
+        "results": service._results,
+        "feature_names": service._feature_names,
+    }
+    with open(MODEL_DIR / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+
+    print(f"Models saved to {MODEL_DIR}")
+
+
+def _load_from_disk() -> bool:
+    """从磁盘加载模型，成功返回 True"""
+    meta_path = MODEL_DIR / "meta.json"
+    if not meta_path.exists():
+        return False
+
+    try:
+        # 加载元数据
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        # 加载所有模型文件
+        models = {}
+        for name in meta["results"].keys():
+            filename = name.lower().replace(" ", "_") + ".joblib"
+            model_path = MODEL_DIR / filename
+            if model_path.exists():
+                models[name] = joblib.load(model_path)
+            else:
+                print(f"Model file not found: {model_path}")
+                return False
+
+        # 写入缓存
+        _model_cache["trained"] = True
+        _model_cache["models"] = models
+        _model_cache["results"] = meta["results"]
+        _model_cache["feature_names"] = meta["feature_names"]
+
+        print(f"Loaded {len(models)} models from {MODEL_DIR}")
+        return True
+
+    except Exception as e:
+        print(f"Failed to load models from disk: {e}")
+        return False
+
+
+# 启动时尝试从磁盘加载
+_load_from_disk()

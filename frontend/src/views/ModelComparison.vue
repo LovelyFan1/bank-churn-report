@@ -15,6 +15,18 @@ const shapData = ref(null)
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4']
 
+// 中英文映射
+const LABELS = {
+  accuracy: '准确率', precision: '精确率', recall: '召回率',
+  f1_score: 'F1分数', auc: 'AUC面积', cv_auc: '交叉验证AUC',
+  credit_score: '信用评分', geography: '地区', gender: '性别',
+  age: '年龄', tenure: '任期', balance: '余额',
+  num_products: '产品数', has_credit_card: '有信用卡', is_active_member: '活跃会员',
+  estimated_salary: '预估薪资', satisfaction_score: '满意度', points_earned: '积分',
+  complain: '投诉',
+}
+const fmtLabel = (key) => LABELS[key] ? `${key}\n(${LABELS[key]})` : key
+
 async function trainModels() {
   training.value = true
   try {
@@ -53,10 +65,10 @@ async function initCharts() {
     const curves = _rocRes.curves
     chart.setOption({
       tooltip: { trigger: 'item', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-      legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
-      grid: { left: 50, right: 20, top: 20, bottom: 40 },
-      xAxis: { name: 'FPR', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } } },
-      yAxis: { name: 'TPR', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } } },
+      legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 }, itemGap: 16 },
+      grid: { left: 60, right: 20, top: 30, bottom: 50 },
+      xAxis: { name: 'FPR (假正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } },
+      yAxis: { name: 'TPR (真正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } },
       series: [
         { type: 'line', data: [[0, 0], [1, 1]], lineStyle: { color: '#4b5563', type: 'dashed' }, symbol: 'none', silent: true },
         ...Object.entries(curves).map(([name, data], i) => ({
@@ -77,16 +89,18 @@ async function initCharts() {
     const chart = echarts.init(radarChart.value)
     const models = comparison.value.models
     const metrics = ['accuracy', 'precision', 'recall', 'f1_score', 'auc']
-    const metricLabels = ['Accuracy', 'Precision', 'Recall', 'F1', 'AUC']
+    const metricLabels = ['准确率\nAccuracy', '精确率\nPrecision', '召回率\nRecall', 'F1分数\nF1', 'AUC面积\nAUC']
 
     chart.setOption({
       tooltip: { backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-      legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
+      legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 }, itemGap: 16 },
       radar: {
         indicator: metricLabels.map(m => ({ name: m, max: 1 })),
         shape: 'polygon',
         splitNumber: 4,
-        axisName: { color: '#9ca3af', fontSize: 11 },
+        radius: '60%',
+        center: ['50%', '46%'],
+        axisName: { color: '#9ca3af', fontSize: 10, lineHeight: 16 },
         splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } },
         splitArea: { areaStyle: { color: ['rgba(99,102,241,0.02)', 'rgba(99,102,241,0.04)'] } },
         axisLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }
@@ -124,7 +138,7 @@ async function initCharts() {
       tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
       grid: { left: 120, right: 30, top: 10, bottom: 20 },
       xAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
-      yAxis: { type: 'category', data: sortedFeatures.map(f => f.name), axisLabel: { color: '#9ca3af', fontSize: 11 }, axisLine: { lineStyle: { color: '#374151' } } },
+      yAxis: { type: 'category', data: sortedFeatures.map(f => fmtLabel(f.name)), axisLabel: { color: '#9ca3af', fontSize: 10 }, axisLine: { lineStyle: { color: '#374151' } } },
       series: [{
         type: 'bar',
         data: sortedFeatures.map((f, i) => ({
@@ -151,7 +165,7 @@ async function initCharts() {
       tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
       grid: { left: 130, right: 30, top: 10, bottom: 20 },
       xAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
-      yAxis: { type: 'category', data: sorted.map(([k]) => k), axisLabel: { color: '#9ca3af', fontSize: 11 }, axisLine: { lineStyle: { color: '#374151' } } },
+      yAxis: { type: 'category', data: sorted.map(([k]) => fmtLabel(k)), axisLabel: { color: '#9ca3af', fontSize: 10 }, axisLine: { lineStyle: { color: '#374151' } } },
       series: [{
         type: 'bar',
         data: sorted.map(([k, v], i) => ({
@@ -208,12 +222,12 @@ onMounted(async () => {
           <thead>
             <tr class="text-gray-500 border-b border-white/5">
               <th class="text-left py-3 px-3">模型</th>
-              <th class="text-right py-3 px-3">Accuracy</th>
-              <th class="text-right py-3 px-3">Precision</th>
-              <th class="text-right py-3 px-3">Recall</th>
-              <th class="text-right py-3 px-3">F1</th>
-              <th class="text-right py-3 px-3">AUC</th>
-              <th class="text-right py-3 px-3">CV AUC</th>
+              <th class="text-right py-3 px-3" title="准确率">Accuracy<br><span class="text-[10px] text-gray-600">准确率</span></th>
+              <th class="text-right py-3 px-3" title="精确率">Precision<br><span class="text-[10px] text-gray-600">精确率</span></th>
+              <th class="text-right py-3 px-3" title="召回率">Recall<br><span class="text-[10px] text-gray-600">召回率</span></th>
+              <th class="text-right py-3 px-3" title="F1分数">F1<br><span class="text-[10px] text-gray-600">F1分数</span></th>
+              <th class="text-right py-3 px-3" title="AUC面积">AUC<br><span class="text-[10px] text-gray-600">AUC面积</span></th>
+              <th class="text-right py-3 px-3" title="交叉验证AUC">CV AUC<br><span class="text-[10px] text-gray-600">交叉验证</span></th>
             </tr>
           </thead>
           <tbody>
@@ -222,7 +236,7 @@ onMounted(async () => {
               <td class="py-3 px-3 font-medium flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full" :style="{ background: COLORS[i % COLORS.length] }"></span>
                 {{ m.model_name }}
-                <span v-if="i === 0" class="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300">BEST</span>
+                <span v-if="i === 0" class="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300">最优</span>
               </td>
               <td class="text-right py-3 px-3 text-gray-300">{{ (m.accuracy * 100).toFixed(2) }}%</td>
               <td class="text-right py-3 px-3 text-gray-300">{{ (m.precision * 100).toFixed(2) }}%</td>
@@ -239,11 +253,11 @@ onMounted(async () => {
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="glass-card p-5">
           <h3 class="text-sm font-medium text-gray-400 mb-4">ROC曲线对比</h3>
-          <div ref="rocChart" class="w-full h-[320px]"></div>
+          <div ref="rocChart" class="w-full h-[360px]"></div>
         </div>
         <div class="glass-card p-5">
           <h3 class="text-sm font-medium text-gray-400 mb-4">性能雷达图</h3>
-          <div ref="radarChart" class="w-full h-[320px]"></div>
+          <div ref="radarChart" class="w-full h-[360px]"></div>
         </div>
       </div>
 
@@ -269,16 +283,16 @@ onMounted(async () => {
             <div class="text-xs text-gray-500 mb-3 text-center font-medium">{{ name }}</div>
             <div class="grid grid-cols-2 gap-1 text-center text-xs">
               <div class="p-2 rounded bg-green-500/10 text-green-400">
-                <div class="text-[10px] text-gray-500">TN</div>{{ data.tn }}
+                <div class="text-[10px] text-gray-500">TN<br>真负</div>{{ data.tn }}
               </div>
               <div class="p-2 rounded bg-red-500/10 text-red-400">
-                <div class="text-[10px] text-gray-500">FP</div>{{ data.fp }}
+                <div class="text-[10px] text-gray-500">FP<br>假正</div>{{ data.fp }}
               </div>
               <div class="p-2 rounded bg-orange-500/10 text-orange-400">
-                <div class="text-[10px] text-gray-500">FN</div>{{ data.fn }}
+                <div class="text-[10px] text-gray-500">FN<br>假负</div>{{ data.fn }}
               </div>
               <div class="p-2 rounded bg-blue-500/10 text-blue-400">
-                <div class="text-[10px] text-gray-500">TP</div>{{ data.tp }}
+                <div class="text-[10px] text-gray-500">TP<br>真正</div>{{ data.tp }}
               </div>
             </div>
           </div>

@@ -9,6 +9,15 @@ const result = ref(null)
 const shapResult = ref(null)
 const gaugeChart = shallowRef(null)
 
+const LABELS = {
+  credit_score: '信用评分', geography: '地区', gender: '性别',
+  age: '年龄', tenure: '任期', balance: '余额',
+  num_products: '产品数', has_credit_card: '有信用卡', is_active_member: '活跃会员',
+  estimated_salary: '预估薪资', satisfaction_score: '满意度', points_earned: '积分',
+  complain: '投诉',
+}
+const fmtLabel = (key) => LABELS[key] || key
+
 const form = ref({
   credit_score: 650,
   age: 39,
@@ -138,17 +147,17 @@ const riskColors = {
             <label class="block text-xs text-gray-500 mb-1">地区</label>
             <select v-model="form.geography"
                     class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none">
-              <option value="France">France</option>
-              <option value="Germany">Germany</option>
-              <option value="Spain">Spain</option>
+              <option value="France">France (法国)</option>
+              <option value="Germany">Germany (德国)</option>
+              <option value="Spain">Spain (西班牙)</option>
             </select>
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">性别</label>
             <select v-model="form.gender"
                     class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none">
-              <option value="Male">Male</option>
-              <option value="Female">Female</option>
+              <option value="Male">Male (男)</option>
+              <option value="Female">Female (女)</option>
             </select>
           </div>
           <div>
@@ -222,7 +231,7 @@ const riskColors = {
               <div v-for="factor in shapResult.top_factors" :key="factor.feature"
                    class="flex items-center justify-between py-1.5 px-2 rounded-lg"
                    :class="factor.direction === 'positive' ? 'bg-red-500/10' : 'bg-green-500/10'">
-                <span class="text-xs text-gray-300">{{ factor.feature }}</span>
+                <span class="text-xs text-gray-300">{{ fmtLabel(factor.feature) }}</span>
                 <span class="text-xs font-medium"
                       :class="factor.direction === 'positive' ? 'text-red-400' : 'text-green-400'">
                   {{ factor.direction === 'positive' ? '+' : '' }}{{ factor.impact.toFixed(4) }}
