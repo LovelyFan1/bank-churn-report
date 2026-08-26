@@ -1,7 +1,8 @@
 <script setup>
-import { ref, onMounted, shallowRef, nextTick, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick, computed } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
+import { pollTask } from '../api/taskPoller'
 
 const loading = ref(true)
 const profiles = ref(null)
@@ -11,6 +12,7 @@ const compareChart = shallowRef(null)
 const churnChart = shallowRef(null)
 const k = ref(5)
 const scatterColorBy = ref('cluster')  // 'cluster' | 'churn'
+const notClusteredYet = ref(false)     // 是否尚未执行聚类
 
 const COLORS = ['#6366f1', '#ef4444', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899']
 
@@ -25,6 +27,11 @@ const avgChurn = computed(() => {
 async function loadProfiles() {
   const { data } = await api.get('/cluster/profiles')
   profiles.value = data
+  if (data.error) {
+    notClusteredYet.value = true
+    return null
+  }
+  notClusteredYet.value = false
   return data
 }
 
@@ -32,16 +39,17 @@ async function loadProfiles() {
 let scatterInstance = null
 let scatterRawData = null
 let scatterProfilesData = null
+const chartInstances = []
 
 function initScatter(profilesData, scatterData) {
-  if (!scatterChart.value || !scatterData?.data) return
+  if (!scatterChart.value || !scatterData?.data?.length) return
   scatterInstance = echarts.init(scatterChart.value)
   scatterRawData = scatterData
   scatterProfilesData = profilesData
 
   renderScatter(scatterData, profilesData, scatterColorBy.value)
 
-  window.addEventListener('resize', () => scatterInstance?.resize())
+  chartInstances.push(scatterInstance)
 }
 
 function renderScatter(scatterData, profilesData, colorBy) {
@@ -149,7 +157,7 @@ function initCompare(profilesData) {
       },
     ]
   })
-  window.addEventListener('resize', () => chart.resize())
+  chartInstances.push(chart)
 }
 
 // ====== Churn Distribution Chart ======
@@ -191,7 +199,7 @@ function initChurnDist(profilesData) {
       }
     ]
   })
-  window.addEventListener('resize', () => chart.resize())
+  chartInstances.push(chart)
 }
 
 // ====== Radar ======
@@ -240,7 +248,7 @@ function initRadar(profilesData) {
       }))
     }]
   })
-  window.addEventListener('resize', () => chart.resize())
+  chartInstances.push(chart)
 }
 
 async function loadScatter() {
@@ -258,14 +266,24 @@ function onColorByChange(val) {
 async function runClustering() {
   loading.value = true
   try {
-    await api.post(`/cluster/kmeans/save?k=${k.value}`)
-    await loadProfiles()
-    const scatterData = await loadScatter()
+    // 1) 提交聚类任务 → 拿到 task_id
+    const { data: submitData } = await api.post(`/cluster/kmeans/save?k=${k.value}`)
+
+    // 2) 轮询直到完成
+    await pollTask(submitData.task_id, {
+      onProgress: (meta) => {
+        // 可在此显示进度，例如更新 loading 文案
+      },
+    })
+
+    // 3) 加载结果
+    const [profilesData, scatterData] = await Promise.all([loadProfiles(), loadScatter()])
+    profiles.value = profilesData
     await nextTick()
-    initScatter(profiles.value, scatterData)
-    initCompare(profiles.value)
-    initChurnDist(profiles.value)
-    initRadar(profiles.value)
+    initScatter(profilesData, scatterData)
+    initCompare(profilesData)
+    initChurnDist(profilesData)
+    initRadar(profilesData)
   } finally {
     loading.value = false
   }
@@ -275,6 +293,7 @@ onMounted(async () => {
   try {
     const [profilesData, scatterData] = await Promise.all([loadProfiles(), loadScatter()])
     loading.value = false
+    if (notClusteredYet.value) return  // 尚未聚类，不初始化图表
     await nextTick()
     initScatter(profilesData, scatterData)
     initCompare(profilesData)
@@ -284,6 +303,17 @@ onMounted(async () => {
     console.error('Clustering load error:', e)
     loading.value = false
   }
+})
+
+function handleResize() {
+  chartInstances.forEach(c => c.resize())
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstances.forEach(c => c.dispose())
+  chartInstances.length = 0
+  scatterInstance = null
 })
 </script>
 
@@ -308,6 +338,26 @@ onMounted(async () => {
 
     <div v-if="loading" class="flex items-center justify-center h-64">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+
+    <!-- 未聚类空状态提示 -->
+    <div v-else-if="notClusteredYet" class="flex flex-col items-center justify-center py-20 text-center">
+      <div class="w-16 h-16 mb-4 rounded-full bg-indigo-500/10 flex items-center justify-center">
+        <svg class="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+        </svg>
+      </div>
+      <h3 class="text-lg font-medium text-gray-300 mb-2">尚未执行聚类分析</h3>
+      <p class="text-sm text-gray-500 max-w-md mb-6">
+        当前数据库中暂无聚类标签数据。请点击上方的 <span class="text-indigo-400 font-medium">"重新聚类"</span> 按钮，
+        系统将自动对客户进行 K-Means 聚类并生成客群画像。
+      </p>
+      <button @click="runClustering" :disabled="loading"
+              class="px-6 py-3 rounded-lg text-sm font-medium text-white transition-colors"
+              style="background: linear-gradient(135deg, #6366f1, #a855f7);">
+        {{ loading ? '计算中...' : '开始聚类分析' }}
+      </button>
     </div>
 
     <template v-else>

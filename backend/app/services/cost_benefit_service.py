@@ -1,40 +1,65 @@
+"""成本收益分析服务 — 依赖已训练模型（从磁盘加载）。"""
+
+import json
 import numpy as np
+from pathlib import Path
 from sqlalchemy.orm import Session
 from typing import Dict, Any
-from app.services.model_service import get_model_service
+
+from app.config import settings
+from app.services.data_loader import DataLoader, prepare_features
+from app.services import risk_scoring
+from sklearn.model_selection import train_test_split
+import joblib
+
+MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
 
 class CostBenefitService:
-    """成本收益分析服务"""
+    """成本收益分析服务 — 从磁盘加载最佳模型进行分析。"""
 
     def __init__(self, db: Session):
         self.db = db
 
+    def _load_best_model(self):
+        """从磁盘加载最佳模型, 返回 (model, model_name, meta)。"""
+        meta_path = MODEL_DIR / "meta.json"
+        if not meta_path.exists():
+            return None, None, None
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
+        model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
+
+        if not model_path.exists():
+            return None, None, None
+
+        return joblib.load(model_path), best_name, meta
+
     def analyze_thresholds(self, cost_ratio: float = 5.0) -> Dict[str, Any]:
-        """
-        分析不同阈值下的成本收益
+        """分析不同阈值下的成本收益。
 
         cost_ratio: 漏检成本/误报成本 的比值
-                     例如 cost_ratio=5 表示漏掉一个流失客户的成本是误报的5倍
+                    例如 cost_ratio=5 表示漏掉一个流失客户的成本是误报的 5 倍
         """
-        model_service = get_model_service(self.db)
-        if not model_service._results:
-            model_service.train_all_models()
+        model, best_name, _ = self._load_best_model()
+        if model is None:
+            return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
 
-        # 获取最佳模型的预测概率
-        from sklearn.model_selection import train_test_split
-        from app.config import settings
-
-        df = model_service._get_dataframe()
-        X, y, feature_names = model_service._prepare_features(df)
+        # 加载数据
+        loader = DataLoader(self.db)
+        df = loader.load_all()
+        X, y, feature_names = prepare_features(df)
 
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=settings.TEST_SIZE, random_state=settings.RANDOM_STATE, stratify=y
+            X, y, test_size=settings.TEST_SIZE,
+            random_state=settings.RANDOM_STATE, stratify=y,
         )
 
-        best_model_name = max(model_service._results.keys(), key=lambda x: model_service._results[x]["auc"])
-        model = model_service._models[best_model_name]
-        y_proba = model.predict_proba(X_test)[:, 1]
+        raw_proba = model.predict_proba(X_test)[:, 1]
+        y_proba, _ = risk_scoring.calibrate_probs(self.db, raw_proba)
 
         thresholds = np.arange(0.05, 0.96, 0.05)
         results = []
@@ -42,20 +67,16 @@ class CostBenefitService:
         for threshold in thresholds:
             y_pred = (y_proba >= threshold).astype(int)
 
-            # 混淆矩阵元素
-            tp = int(np.sum((y_pred == 1) & (y_test == 1)))  # 真阳性：正确识别流失
-            fp = int(np.sum((y_pred == 1) & (y_test == 0)))  # 误报：误判为流失
-            fn = int(np.sum((y_pred == 0) & (y_test == 1)))  # 漏检：遗漏了流失客户
-            tn = int(np.sum((y_pred == 0) & (y_test == 0)))  # 真阴性：正确识别留存
+            tp = int(np.sum((y_pred == 1) & (y_test == 1)))
+            fp = int(np.sum((y_pred == 1) & (y_test == 0)))
+            fn = int(np.sum((y_pred == 0) & (y_test == 1)))
+            tn = int(np.sum((y_pred == 0) & (y_test == 0)))
 
-            # 成本收益计算（单位：万元）
-            # 假设：挽留一个客户收益 = 1单位，漏检一个流失客户成本 = cost_ratio单位，误报成本 = 1单位
-            benefit = tp * 1  # 挽留成功的收益
-            cost_fn = fn * cost_ratio  # 漏检成本
-            cost_fp = fp * 1  # 误报成本
+            benefit = tp * 1
+            cost_fn = fn * cost_ratio
+            cost_fp = fp * 1
             net_profit = benefit - cost_fn - cost_fp
 
-            # 关键指标
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
@@ -72,12 +93,11 @@ class CostBenefitService:
                 "cost_fp": round(float(cost_fp), 2),
             })
 
-        # 找最优阈值（按净利润排序）
         optimal = max(results, key=lambda x: x["net_profit"])
 
         return {
             "cost_ratio": cost_ratio,
-            "best_model": best_model_name,
+            "best_model": best_name,
             "test_size": len(y_test),
             "churn_count": int(y_test.sum()),
             "thresholds": results,
@@ -86,20 +106,21 @@ class CostBenefitService:
         }
 
     def get_business_summary(self) -> Dict[str, Any]:
-        """获取业务摘要 - 用于前端展示"""
+        """业务摘要 — 年化成本收益，用于前端展示。"""
         analysis = self.analyze_thresholds(cost_ratio=5.0)
-        opt = analysis["optimal_metrics"]
+        if "error" in analysis:
+            return analysis
 
-        # 模拟年化数据
+        opt = analysis.get("optimal_metrics", {})
+
         total_customers = 10000
         annual_churn_rate = 0.2037
-        avg_customer_value = 50000  # 假设客户年均价值5万
+        avg_customer_value = 50000
 
         annual_churn_count = int(total_customers * annual_churn_rate)
         annual_loss = annual_churn_count * avg_customer_value
 
-        # 使用模型后的预期改善
-        retained_with_model = int(annual_churn_count * opt["recall"])
+        retained_with_model = int(annual_churn_count * opt.get("recall", 0))
         reduced_loss = retained_with_model * avg_customer_value
 
         return {
@@ -108,8 +129,8 @@ class CostBenefitService:
             "annual_churn_rate": round(annual_churn_rate * 100, 2),
             "avg_customer_value": avg_customer_value,
             "annual_loss": annual_loss,
-            "optimal_threshold": opt["threshold"],
-            "model_recall": opt["recall"],
+            "optimal_threshold": opt.get("threshold", 0.5),
+            "model_recall": opt.get("recall", 0),
             "retained_customers": retained_with_model,
             "reduced_loss": reduced_loss,
             "roi": round(reduced_loss / (annual_loss * 0.1), 2) if annual_loss > 0 else 0,

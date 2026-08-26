@@ -1,0 +1,89 @@
+services:
+  # ============================================================
+  # Redis — Celery broker & result backend
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: churn-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================
+  # FastAPI Backend
+  # ============================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: churn-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=true
+      - DATABASE_URL=sqlite:///./data/churn_analysis.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - CORS_ORIGINS=["http://localhost:5173","http://localhost:3000","http://192.168.1.12:5173","http://192.168.1.12:8000"]
+    volumes:
+      - ./backend:/app
+      - backend_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ============================================================
+  # Celery Worker — async ML training / prediction
+  # ============================================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: churn-celery
+    restart: unless-stopped
+    environment:
+      - DEBUG=true
+      - DATABASE_URL=sqlite:///./data/churn_analysis.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - backend_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q celery
+
+  # ============================================================
+  # Vue 3 Frontend (Vite dev server)
+  # ============================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: churn-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - API_PROXY_TARGET=http://backend:8000
+    volumes:
+      - ./frontend/src:/app/src
+    depends_on:
+      - backend
+    command: npm run dev
+
+volumes:
+  redis_data:
+  backend_data:

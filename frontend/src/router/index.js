@@ -12,6 +12,12 @@ const routes = [
     meta: { title: '数据概览', icon: 'dashboard' }
   },
   {
+    path: '/customers',
+    name: 'CustomerManagement',
+    component: () => import('../views/CustomerManagement.vue'),
+    meta: { title: '客户管理', icon: 'customers' }
+  },
+  {
     path: '/eda',
     name: 'EdaAnalysis',
     component: () => import('../views/EdaAnalysis.vue'),
@@ -40,6 +46,12 @@ const routes = [
     name: 'InterventionStrategy',
     component: () => import('../views/InterventionStrategy.vue'),
     meta: { title: '干预策略', icon: 'intervention' }
+  },
+  {
+    path: '/work-orders',
+    name: 'WorkOrders',
+    component: () => import('../views/WorkOrders.vue'),
+    meta: { title: '工单管理', icon: 'work-orders' }
   }
 ]
 

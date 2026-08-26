@@ -1,11 +1,12 @@
 <script setup>
-import { ref, onMounted, shallowRef, nextTick } from 'vue'
+import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
 
 const businessSummary = ref(null)
 const thresholdData = ref(null)
 const thresholdChart = shallowRef(null)
+const chartInstances = []
 const loading = ref(true)
 
 onMounted(async () => {
@@ -37,13 +38,23 @@ onMounted(async () => {
           { name: '净利润', type: 'line', yAxisIndex: 1, data: data.map(d => d.net_profit), lineStyle: { color: '#6366f1', width: 2 }, itemStyle: { color: '#6366f1' }, symbol: 'circle', symbolSize: 6 }
         ]
       })
-      window.addEventListener('resize', () => chart.resize())
+      chartInstances.push(chart)
     }
   } catch (e) {
     console.error('Cost-benefit load error:', e)
   } finally {
     loading.value = false
   }
+})
+
+function handleResize() {
+  chartInstances.forEach(c => c.resize())
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstances.forEach(c => c.dispose())
+  chartInstances.length = 0
 })
 
 const strategies = [

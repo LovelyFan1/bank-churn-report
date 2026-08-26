@@ -1,5 +1,5 @@
 <script setup>
-import { ref, shallowRef, onMounted } from 'vue'
+import { ref, shallowRef, onBeforeUnmount } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
 
@@ -8,6 +8,8 @@ const predicting = ref(false)
 const result = ref(null)
 const shapResult = ref(null)
 const gaugeChart = shallowRef(null)
+const chartInstances = []
+let gaugeInstance = null
 
 const LABELS = {
   credit_score: '信用评分', geography: '地区', gender: '性别',
@@ -51,7 +53,12 @@ async function predict() {
 
 function updateGauge(probability) {
   if (!gaugeChart.value) return
-  const chart = echarts.init(gaugeChart.value)
+  if (!gaugeInstance) {
+    gaugeInstance = echarts.init(gaugeChart.value)
+    chartInstances.push(gaugeInstance)
+    window.addEventListener('resize', handleResize)
+  }
+  const chart = gaugeInstance
   const color = probability >= 0.7 ? '#ef4444' : probability >= 0.3 ? '#f59e0b' : '#22c55e'
 
   chart.setOption({
@@ -90,7 +97,6 @@ function updateGauge(probability) {
       title: { offsetCenter: [0, '90%'], color: '#9ca3af', fontSize: 13 }
     }]
   })
-  window.addEventListener('resize', () => chart.resize())
 }
 
 const riskColors = {
@@ -99,6 +105,17 @@ const riskColors = {
   MEDIUM: { bg: 'bg-yellow-500/15', border: 'border-yellow-500/30', text: 'text-yellow-400' },
   LOW: { bg: 'bg-green-500/15', border: 'border-green-500/30', text: 'text-green-400' },
 }
+
+function handleResize() {
+  chartInstances.forEach(c => c.resize())
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstances.forEach(c => c.dispose())
+  chartInstances.length = 0
+  gaugeInstance = null
+})
 </script>
 
 <template>

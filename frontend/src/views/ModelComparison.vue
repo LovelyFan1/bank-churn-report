@@ -1,15 +1,18 @@
 <script setup>
-import { ref, onMounted, shallowRef, nextTick } from 'vue'
+import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
+import { pollTask } from '../api/taskPoller'
 
 const loading = ref(true)
 const training = ref(false)
+const trainingMessage = ref('')
 const comparison = ref(null)
 const rocChart = shallowRef(null)
 const radarChart = shallowRef(null)
 const featureChart = shallowRef(null)
 const shapChart = shallowRef(null)
+const chartInstances = []
 const confusionData = ref(null)
 const shapData = ref(null)
 
@@ -29,12 +32,25 @@ const fmtLabel = (key) => LABELS[key] ? `${key}\n(${LABELS[key]})` : key
 
 async function trainModels() {
   training.value = true
+  trainingMessage.value = '提交训练任务...'
   try {
-    await api.post('/model/train')
+    // 1) 提交训练任务 → 拿到 task_id
+    const { data: submitData } = await api.post('/model/train')
+    const trainTaskId = submitData.task_id
+
+    // 2) 轮询训练进度（训练完成后自动包含 SHAP）
+    await pollTask(trainTaskId, {
+      onProgress: (meta) => {
+        trainingMessage.value = meta.message || '训练中...'
+      },
+    })
+
+    // 3) 加载结果
     await loadData()
     await initCharts()
   } finally {
     training.value = false
+    trainingMessage.value = ''
   }
 }
 
@@ -81,7 +97,7 @@ async function initCharts() {
         }))
       ]
     })
-    window.addEventListener('resize', () => chart.resize())
+    chartInstances.push(chart)
   }
 
   // Performance Radar
@@ -116,7 +132,7 @@ async function initCharts() {
         }))
       }]
     })
-    window.addEventListener('resize', () => chart.resize())
+    chartInstances.push(chart)
   }
 
   // Feature Importance
@@ -150,7 +166,7 @@ async function initCharts() {
         label: { show: true, position: 'right', color: '#9ca3af', fontSize: 10, formatter: (p) => p.value.toFixed(3) }
       }]
     })
-    window.addEventListener('resize', () => chart.resize())
+    chartInstances.push(chart)
   }
 
   // SHAP Global Importance
@@ -180,7 +196,7 @@ async function initCharts() {
         label: { show: true, position: 'right', color: '#9ca3af', fontSize: 10, formatter: (p) => p.value.toFixed(4) }
       }]
     })
-    window.addEventListener('resize', () => chart.resize())
+    chartInstances.push(chart)
   }
 }
 
@@ -194,6 +210,16 @@ onMounted(async () => {
     loading.value = false
   }
 })
+
+function handleResize() {
+  chartInstances.forEach(c => c.resize())
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstances.forEach(c => c.dispose())
+  chartInstances.length = 0
+})
 </script>
 
 <template>
@@ -203,11 +229,14 @@ onMounted(async () => {
         <h1 class="page-title">模型对比</h1>
         <p class="page-subtitle">5种ML模型训练与性能评估</p>
       </div>
-      <button @click="trainModels" :disabled="training"
-              class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors"
-              style="background: linear-gradient(135deg, #6366f1, #a855f7);">
-        {{ training ? '训练中...' : '重新训练' }}
-      </button>
+      <div class="flex items-center gap-3">
+        <span v-if="training" class="text-xs text-indigo-300">{{ trainingMessage }}</span>
+        <button @click="trainModels" :disabled="training"
+                class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50"
+                style="background: linear-gradient(135deg, #6366f1, #a855f7);">
+          {{ training ? '训练中...' : '重新训练' }}
+        </button>
+      </div>
     </div>
 
     <div v-if="loading" class="flex items-center justify-center h-64">

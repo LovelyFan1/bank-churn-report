@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, shallowRef, nextTick } from 'vue'
+import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
 
@@ -20,6 +20,7 @@ const churnByGeoChart = shallowRef(null)
 const productOverloadChart = shallowRef(null)
 const satisfactionChart = shallowRef(null)
 const balanceChart = shallowRef(null)
+const chartInstances = []
 
 onMounted(async () => {
   try {
@@ -84,7 +85,7 @@ onMounted(async () => {
           emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0, 0, 0, 0.5)' } }
         }]
       })
-      window.addEventListener('resize', () => chart.resize())
+      chartInstances.push(chart)
     }
 
     // Churn by gender
@@ -102,7 +103,7 @@ onMounted(async () => {
           { name: '流失', type: 'bar', stack: 'total', data: d.map(item => item.churned), itemStyle: { color: '#ef4444', borderRadius: [4, 4, 0, 0] } }
         ]
       })
-      window.addEventListener('resize', () => chart.resize())
+      chartInstances.push(chart)
     }
 
     // Churn by geography
@@ -120,7 +121,7 @@ onMounted(async () => {
           { name: '流失', type: 'bar', stack: 'total', data: d.map(item => item.churned), itemStyle: { color: '#f59e0b' } }
         ]
       })
-      window.addEventListener('resize', () => chart.resize())
+      chartInstances.push(chart)
     }
 
     // Product overload
@@ -143,7 +144,7 @@ onMounted(async () => {
           itemStyle: { borderRadius: [6, 6, 0, 0] }
         }]
       })
-      window.addEventListener('resize', () => chart.resize())
+      chartInstances.push(chart)
     }
 
     // Satisfaction
@@ -161,7 +162,7 @@ onMounted(async () => {
           { name: '流失', type: 'bar', stack: 't', data: d.map(item => item.churned), itemStyle: { color: '#ef4444', borderRadius: [4, 4, 0, 0] } }
         ]
       })
-      window.addEventListener('resize', () => chart.resize())
+      chartInstances.push(chart)
     }
 
   } catch (e) {
@@ -169,6 +170,16 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+})
+
+function handleResize() {
+  chartInstances.forEach(c => c.resize())
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstances.forEach(c => c.dispose())
+  chartInstances.length = 0
 })
 </script>
 

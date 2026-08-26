@@ -1,198 +1,112 @@
-import pandas as pd
-import numpy as np
-from sqlalchemy.orm import Session
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
+"""聚类服务 — 聚类结果读取 + 画像分析。
+
+重算力任务（K-Means 拟合、肘部法则）已迁移到 Celery Worker:
+    app/celery_tasks/cluster.py
+
+本服务只负责:
+- 读取已有聚类标签的数据，生成画像
+- 3D 散点数据（PCA 降维）
+- 聚类自动命名
+"""
+
 import json
-from typing import Dict, List, Any
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sqlalchemy.orm import Session
+from typing import Dict, Any, Optional
+
 from app.models.customer import Customer
 from app.config import settings
+from app.services.data_loader import DataLoader, CLUSTER_FEATURES
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+CLUSTER_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
 
 class ClusteringService:
-    """客户分群服务 - K-Means聚类"""
+    """聚类读取 + 画像服务 — 无全局状态，线程安全。"""
 
     def __init__(self, db: Session):
         self.db = db
-        self._df = None
-        self._scaler = StandardScaler()
-        self._pca = PCA(n_components=3)
-        self._kmeans = None
-        self.n_clusters = 5
+        self._df: Optional[pd.DataFrame] = None
+
+    @property
+    def is_clustered(self) -> bool:
+        """检查是否有客户被分配了聚类标签。"""
+        return self.db.query(Customer).filter(Customer.cluster_id.isnot(None)).first() is not None
 
     def _get_dataframe(self) -> pd.DataFrame:
+        """加载全量数据（仅用于画像分析，聚类标签已落在 DB 中）。"""
         if self._df is None:
-            customers = self.db.query(Customer).all()
-            self._df = pd.DataFrame([{
-                "id": c.id,
-                "credit_score": c.credit_score,
-                "age": c.age,
-                "tenure": c.tenure,
-                "balance": c.balance,
-                "num_products": c.num_products,
-                "has_credit_card": c.has_credit_card,
-                "is_active_member": c.is_active_member,
-                "estimated_salary": c.estimated_salary,
-                "exited": c.exited,
-                "complain": c.complain,
-                "satisfaction_score": c.satisfaction_score,
-                "points_earned": c.points_earned,
-                "balance_salary_ratio": c.balance_salary_ratio,
-            } for c in customers])
+            loader = DataLoader(self.db)
+            self._df = loader.load_all()
         return self._df
 
-    def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        """准备聚类特征"""
-        features = ["credit_score", "age", "tenure", "balance", "num_products",
-                    "has_credit_card", "is_active_member", "estimated_salary",
-                    "satisfaction_score", "points_earned", "balance_salary_ratio"]
+    # ── 聚类元数据（从磁盘读取上次聚类结果）─────────────────
 
-        X = df[features].values
-        X_scaled = self._scaler.fit_transform(X)
-        return X_scaled
+    def get_cluster_meta(self) -> Optional[dict]:
+        meta_path = CLUSTER_DIR / "cluster_meta.json"
+        if not meta_path.exists():
+            return None
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    def fit_kmeans(self, n_clusters: int = None) -> Dict[str, Any]:
-        """训练K-Means模型"""
-        if n_clusters is None:
-            n_clusters = self.n_clusters
-
-        df = self._get_dataframe()
-        X_scaled = self._prepare_features(df)
-
-        self._kmeans = KMeans(n_clusters=n_clusters, random_state=settings.RANDOM_STATE, n_init=10)
-        df["cluster_id"] = self._kmeans.fit_predict(X_scaled)
-
-        # PCA for 3D visualization
-        X_pca = self._pca.fit_transform(X_scaled)
-        df["pca_x"] = X_pca[:, 0]
-        df["pca_y"] = X_pca[:, 1]
-        df["pca_z"] = X_pca[:, 2]
-
-        self._df = df
-
-        # Calculate metrics
-        inertia = self._kmeans.inertia_
-        silhouette = silhouette_score(X_scaled, df["cluster_id"])
-
-        _save_cluster_cache(self)
-
-        return {
-            "n_clusters": n_clusters,
-            "inertia": round(inertia, 2),
-            "silhouette_score": round(silhouette, 4)
-        }
-
-    def get_elbow_method(self) -> Dict[str, Any]:
-        """肘部法则 - 确定最优K值"""
-        if _cluster_cache.get("elbow"):
-            return _cluster_cache["elbow"]
-
-        df = self._get_dataframe()
-        X_scaled = self._prepare_features(df)
-
-        inertias = []
-        silhouette_scores = []
-        k_range = range(2, 11)
-
-        for k in k_range:
-            kmeans = KMeans(n_clusters=k, random_state=settings.RANDOM_STATE, n_init=10)
-            labels = kmeans.fit_predict(X_scaled)
-            inertias.append(round(kmeans.inertia_, 2))
-            silhouette_scores.append(round(silhouette_score(X_scaled, labels), 4))
-
-        result = {
-            "k_range": list(k_range),
-            "inertias": inertias,
-            "silhouette_scores": silhouette_scores
-        }
-
-        _cluster_cache["elbow"] = result
-        return result
+    # ── 聚类画像 ───────────────────────────────────────────
 
     def get_cluster_profiles(self) -> Dict[str, Any]:
-        """获取聚类画像"""
+        """获取聚类画像 — 需要聚类标签已存在于 DB 中。"""
+        if not self.is_clustered:
+            return {"clusters": [], "total_customers": 0, "error": "尚未执行聚类，请先调用 POST /api/cluster/kmeans/save"}
+
         df = self._get_dataframe()
 
-        if "cluster_id" not in df.columns:
-            self.fit_kmeans()
-
         profiles = []
-        features = ["credit_score", "age", "tenure", "balance", "num_products",
-                    "estimated_salary", "satisfaction_score", "is_active_member"]
+        features = [
+            "credit_score", "age", "tenure", "balance", "num_products",
+            "estimated_salary", "satisfaction_score", "is_active_member",
+        ]
 
-        for cluster_id in sorted(df["cluster_id"].unique()):
+        for cluster_id in sorted(df["cluster_id"].dropna().unique()):
             cluster_df = df[df["cluster_id"] == cluster_id]
 
             profile = {
                 "cluster_id": int(cluster_id),
                 "count": len(cluster_df),
                 "churn_rate": round(cluster_df["exited"].mean() * 100, 2),
-                "features": {}
+                "features": {},
             }
 
             for feature in features:
-                profile["features"][feature] = {
-                    "mean": round(cluster_df[feature].mean(), 2),
-                    "std": round(cluster_df[feature].std(), 2)
-                }
+                if feature in cluster_df.columns:
+                    profile["features"][feature] = {
+                        "mean": round(cluster_df[feature].mean(), 2),
+                        "std": round(cluster_df[feature].std(), 2),
+                    }
 
             profiles.append(profile)
 
         return {
             "clusters": profiles,
-            "total_customers": len(df)
+            "total_customers": len(df),
         }
-
-    def get_3d_scatter_data(self) -> Dict[str, Any]:
-        """获取3D散点图数据"""
-        df = self._get_dataframe()
-
-        if "pca_x" not in df.columns:
-            self.fit_kmeans()
-
-        scatter_data = []
-        for cluster_id in sorted(df["cluster_id"].unique()):
-            cluster_df = df[df["cluster_id"] == cluster_id]
-            scatter_data.append({
-                "cluster_id": int(cluster_id),
-                "points": cluster_df[["pca_x", "pca_y", "pca_z", "exited"]].values.tolist()
-            })
-
-        return {
-            "data": scatter_data,
-            "explained_variance": self._pca.explained_variance_ratio_.tolist()
-        }
-
-    def assign_clusters_to_customers(self):
-        """将聚类结果保存到数据库"""
-        df = self._get_dataframe()
-
-        if "cluster_id" not in df.columns:
-            self.fit_kmeans()
-
-        for _, row in df.iterrows():
-            customer = self.db.query(Customer).filter(Customer.id == row["id"]).first()
-            if customer:
-                customer.cluster_id = int(row["cluster_id"])
-        self.db.commit()
 
     def get_cluster_names(self) -> Dict[int, str]:
-        """基于聚类特征自动命名"""
+        """基于聚类特征自动命名。"""
         profiles = self.get_cluster_profiles()
         names = {}
 
-        for cluster in profiles["clusters"]:
+        for cluster in profiles.get("clusters", []):
             cid = cluster["cluster_id"]
             f = cluster["features"]
             churn = cluster["churn_rate"]
-            balance = f["balance"]["mean"]
-            products = f["num_products"]["mean"]
-            active = f["is_active_member"]["mean"]
-            salary = f["estimated_salary"]["mean"]
+            balance = f.get("balance", {}).get("mean", 0)
+            products = f.get("num_products", {}).get("mean", 0)
+            active = f.get("is_active_member", {}).get("mean", 0)
+            salary = f.get("estimated_salary", {}).get("mean", 0)
 
-            # 组合多个维度判断
             if churn > 40:
                 names[cid] = "高流失风险客户"
             elif balance > 120000:
@@ -212,30 +126,43 @@ class ClusteringService:
 
         return names
 
+    # ── 3D 散点数据 ───────────────────────────────────────
 
-_cluster_cache = {
-    "fitted": False,
-    "kmeans": None,
-    "df": None,
-    "pca": None,
-    "scaler": None,
-    "elbow": None,
-}
+    def get_3d_scatter_data(self) -> Dict[str, Any]:
+        """获取 PCA 3D 散点数据（用于前端可视化）。"""
+        if not self.is_clustered:
+            return {"data": [], "explained_variance": [], "error": "尚未执行聚类"}
+
+        df = self._get_dataframe()
+        clustered = df[df["cluster_id"].notna()].copy()
+
+        # 提取特征并标准化
+        X = clustered[CLUSTER_FEATURES].fillna(0).values
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # PCA 降维到 3 维
+        pca = PCA(n_components=3)
+        X_pca = pca.fit_transform(X_scaled)
+
+        clustered["pca_x"] = X_pca[:, 0]
+        clustered["pca_y"] = X_pca[:, 1]
+        clustered["pca_z"] = X_pca[:, 2]
+
+        scatter_data = []
+        for cluster_id in sorted(clustered["cluster_id"].unique()):
+            cluster_df = clustered[clustered["cluster_id"] == cluster_id]
+            scatter_data.append({
+                "cluster_id": int(cluster_id),
+                "points": cluster_df[["pca_x", "pca_y", "pca_z", "exited"]].values.tolist(),
+            })
+
+        return {
+            "data": scatter_data,
+            "explained_variance": pca.explained_variance_ratio_.tolist(),
+        }
 
 
 def get_clustering_service(db: Session) -> ClusteringService:
-    service = ClusteringService(db)
-    if _cluster_cache["fitted"]:
-        service._kmeans = _cluster_cache["kmeans"]
-        service._df = _cluster_cache["df"]
-        service._pca = _cluster_cache["pca"]
-        service._scaler = _cluster_cache["scaler"]
-    return service
-
-
-def _save_cluster_cache(service: ClusteringService):
-    _cluster_cache["fitted"] = True
-    _cluster_cache["kmeans"] = service._kmeans
-    _cluster_cache["df"] = service._df
-    _cluster_cache["pca"] = service._pca
-    _cluster_cache["scaler"] = service._scaler
+    """工厂函数 — 每次创建新的 ClusteringService（无共享状态）。"""
+    return ClusteringService(db)

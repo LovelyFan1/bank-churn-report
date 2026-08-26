@@ -1,0 +1,174 @@
+"""分块数据加载器 — 面向千万级数据规模。
+
+核心原则:
+- 永远不要一次性把全量数据加载到 pandas DataFrame
+- 用 SQL 做聚合 / 过滤，用 chunksize 做流式迭代
+- 训练时按 chunk 流式喂给模型 (partial_fit / MiniBatch)
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Iterator, Tuple, Optional, List
+from sqlalchemy.orm import Session
+from app.models.customer import Customer
+from app.config import settings
+
+
+# ── 特征定义 ──────────────────────────────────────────────
+
+NUMERIC_FEATURES = [
+    "credit_score", "age", "tenure", "balance", "num_products",
+    "has_credit_card", "is_active_member", "estimated_salary",
+    "satisfaction_score", "points_earned",
+]
+
+CATEGORICAL_FEATURES = ["geography", "gender"]
+
+FEATURE_NAMES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+
+GEOGRAPHY_MAP = {"France": 0, "Germany": 1, "Spain": 2}
+GENDER_MAP = {"Male": 0, "Female": 1}
+
+# 聚类特征（包含 balance_salary_ratio）
+CLUSTER_FEATURES = [
+    "credit_score", "age", "tenure", "balance", "num_products",
+    "has_credit_card", "is_active_member", "estimated_salary",
+    "satisfaction_score", "points_earned", "balance_salary_ratio",
+]
+
+
+class DataLoader:
+    """分块数据加载器 — 支持分块迭代和数据库内聚合。"""
+
+    def __init__(self, db: Session, chunksize: int = None):
+        self.db = db
+        self.chunksize = chunksize or settings.DATA_CHUNK_SIZE
+
+    @property
+    def total_count(self) -> int:
+        """客户总数（走 COUNT 查询，不加载数据）"""
+        return self.db.query(Customer).count()
+
+    # ── 分块迭代 ──────────────────────────────────────────
+
+    def iter_chunks(self) -> Iterator[pd.DataFrame]:
+        """逐块迭代全量客户数据，每块一个 DataFrame。
+
+        用法:
+            for chunk in loader.iter_chunks():
+                X, y = prepare_features(chunk)
+                model.partial_fit(X, y)
+        """
+        offset = 0
+        while True:
+            rows = (
+                self.db.query(Customer)
+                .order_by(Customer.id)
+                .offset(offset)
+                .limit(self.chunksize)
+                .all()
+            )
+            if not rows:
+                break
+            yield self._rows_to_df(rows)
+            offset += self.chunksize
+
+    def load_chunk(self, offset: int, limit: int = None) -> pd.DataFrame:
+        """加载指定偏移量的一块数据。"""
+        limit = limit or self.chunksize
+        rows = (
+            self.db.query(Customer)
+            .order_by(Customer.id)
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return self._rows_to_df(rows)
+
+    def load_all(self) -> pd.DataFrame:
+        """全量加载（仅适合万级数据；千万级请用 iter_chunks）。"""
+        rows = self.db.query(Customer).all()
+        return self._rows_to_df(rows)
+
+    # ── 数据库内聚合（避免 Python 侧计算）─────────────────
+
+    def count_by(self, column: str) -> dict:
+        """数据库内 GROUP BY 计数，不加载原始行。"""
+        from sqlalchemy import func
+        results = (
+            self.db.query(getattr(Customer, column), func.count(Customer.id))
+            .group_by(getattr(Customer, column))
+            .all()
+        )
+        return {str(r[0]): r[1] for r in results}
+
+    def churn_rate_by(self, column: str) -> pd.DataFrame:
+        """数据库内按列计算流失率。"""
+        from sqlalchemy import func
+        results = (
+            self.db.query(
+                getattr(Customer, column),
+                func.count(Customer.id),
+                func.sum(Customer.exited),
+            )
+            .group_by(getattr(Customer, column))
+            .all()
+        )
+        df = pd.DataFrame(results, columns=["value", "total", "churned"])
+        df["churn_rate"] = (df["churned"] / df["total"] * 100).round(2)
+        return df
+
+    # ── 内部工具 ──────────────────────────────────────────
+
+    def _rows_to_df(self, rows) -> pd.DataFrame:
+        """将 ORM 对象列表转为 DataFrame。"""
+        return pd.DataFrame([{
+            "id": r.id,
+            "customer_id": r.customer_id,
+            "surname": r.surname,
+            "credit_score": r.credit_score,
+            "geography": r.geography,
+            "gender": r.gender,
+            "age": r.age,
+            "tenure": r.tenure,
+            "balance": r.balance,
+            "num_products": r.num_products,
+            "has_credit_card": r.has_credit_card,
+            "is_active_member": r.is_active_member,
+            "estimated_salary": r.estimated_salary,
+            "exited": r.exited,
+            "complain": r.complain,
+            "satisfaction_score": r.satisfaction_score,
+            "points_earned": r.points_earned,
+            "balance_salary_ratio": r.balance_salary_ratio,
+            "cluster_id": r.cluster_id,
+            "risk_score": r.risk_score,
+            "risk_level": r.risk_level,
+        } for r in rows])
+
+
+# ── 特征工程（独立函数，方便 Celery 任务复用）─────────────
+
+def prepare_features(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """从 DataFrame 提取特征矩阵 X、标签 y、特征名列表。"""
+    y = df["exited"].values
+
+    X_numeric = df[NUMERIC_FEATURES].values
+
+    X_geography = df["geography"].map(GEOGRAPHY_MAP).fillna(0).values.reshape(-1, 1)
+    X_gender = df["gender"].map(GENDER_MAP).fillna(0).values.reshape(-1, 1)
+
+    X = np.hstack([X_numeric, X_geography, X_gender])
+
+    return X, y, FEATURE_NAMES
+
+
+def prepare_cluster_features(df: pd.DataFrame) -> np.ndarray:
+    """提取聚类特征矩阵（已标准化以外的数值特征）。"""
+    return df[CLUSTER_FEATURES].values
+
+
+def get_customer_dataframe(db: Session) -> pd.DataFrame:
+    """一次性全量加载（兼容旧接口，仅用于万级数据）。"""
+    loader = DataLoader(db)
+    return loader.load_all()

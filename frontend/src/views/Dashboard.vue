@@ -1,18 +1,21 @@
 <script setup>
-import { ref, onMounted, shallowRef, nextTick } from 'vue'
+import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
+import { pollTask } from '../api/taskPoller'
 
 const loading = ref(true)
 const overview = ref(null)
 const batchData = ref(null)
 const businessSummary = ref(null)
 const topCustomers = ref([])
+const activeCustomerIds = ref(new Set())
 
 // Chart refs
 const trendChart = shallowRef(null)
 const riskChart = shallowRef(null)
 const roiChart = shallowRef(null)
+const chartInstances = []
 
 // Mock monthly trend (data has no time dimension)
 const monthlyTrend = [
@@ -50,18 +53,48 @@ const riskColors = { CRITICAL: '#ef4444', HIGH: '#f59e0b', MEDIUM: '#84cc16', LO
 
 onMounted(async () => {
   try {
-    const [overviewRes, batchRes, summaryRes, insightsRes] = await Promise.all([
+    // 先加载不需要模型的结果
+    const [overviewRes, insightsRes, activeRes] = await Promise.all([
       api.get('/data/overview'),
-      api.get('/model/batch-score?top_n=10'),
-      api.get('/cost-benefit/summary'),
       api.get('/eda/key-insights'),
+      api.get('/work-orders/active-customers').catch(() => ({ data: { customer_ids: [] } })),
     ])
+    activeCustomerIds.value = new Set(activeRes.data.customer_ids)
 
     overview.value = overviewRes.data
-    batchData.value = batchRes.data
-    businessSummary.value = summaryRes.data
-    topCustomers.value = batchRes.data.top_customers
     insights.value = insightsRes.data.insights
+
+    // 批量预测（异步任务 → 轮询）
+    let batchResult = null
+    let summaryResult = null
+    try {
+      const { data: batchSubmit } = await api.get('/model/batch-score?top_n=10')
+      if (batchSubmit.task_id) {
+        batchResult = await pollTask(batchSubmit.task_id)
+      } else if (batchSubmit.error) {
+        console.warn('batch-score not available:', batchSubmit.error)
+      } else {
+        batchResult = batchSubmit  // 兼容直接返回
+      }
+    } catch (e) {
+      console.warn('batch-score failed:', e)
+    }
+
+    try {
+      const summaryRes = await api.get('/cost-benefit/summary')
+      if (summaryRes.data && !summaryRes.data.error) {
+        businessSummary.value = summaryRes.data
+        summaryResult = summaryRes.data
+      }
+    } catch (e) {
+      console.warn('cost-benefit not available:', e)
+    }
+
+    if (batchResult) {
+      batchData.value = batchResult
+      topCustomers.value = batchResult.top_customers || []
+      riskDist.value = batchResult.risk_distribution || { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }
+    }
 
     // Compute metrics
     const total = overviewRes.data.total_customers
@@ -69,11 +102,9 @@ onMounted(async () => {
     churnRate.value = overviewRes.data.churn_rate
 
     const avgBalance = overviewRes.data.avg_balance
-    lossAmount.value = Math.round(churned * avgBalance / 10000) // 万元
-    recoverable.value = Math.round(summaryRes.data.reduced_loss / 10000)
-    roi.value = summaryRes.data.roi
-
-    riskDist.value = batchRes.data.risk_distribution
+    lossAmount.value = Math.round(churned * avgBalance / 10000)
+    recoverable.value = summaryResult ? Math.round(summaryResult.reduced_loss / 10000) : 0
+    roi.value = summaryResult ? summaryResult.roi : 0
 
     loading.value = false
     await nextTick()
@@ -88,7 +119,18 @@ function initCharts() {
   initTrendChart()
   initRiskChart()
   initRoiChart()
+  window.addEventListener('resize', handleResize)
 }
+
+function handleResize() {
+  chartInstances.forEach(c => c.resize())
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstances.forEach(c => c.dispose())
+  chartInstances.length = 0
+})
 
 function initTrendChart() {
   if (!trendChart.value) return
@@ -119,7 +161,7 @@ function initTrendChart() {
       }
     ]
   })
-  window.addEventListener('resize', () => chart.resize())
+  chartInstances.push(chart)
 }
 
 function initRiskChart() {
@@ -141,7 +183,7 @@ function initRiskChart() {
       ]
     }]
   })
-  window.addEventListener('resize', () => chart.resize())
+  chartInstances.push(chart)
 }
 
 function initRoiChart() {
@@ -168,7 +210,7 @@ function initRoiChart() {
       }
     }]
   })
-  window.addEventListener('resize', () => chart.resize())
+  chartInstances.push(chart)
 }
 
 function fmtProb(prob) {
@@ -196,6 +238,52 @@ function riskLabel(level) {
 
 function fmtMoney(val) {
   return '¥' + val.toLocaleString()
+}
+
+// ── 创建工单 Modal ──
+const orderModalOpen = ref(false)
+const orderForm = ref({
+  customer_id: '', customer_name: '', geography: '',
+  risk_level: 'MEDIUM', probability: 0, balance: 0,
+  risk_factors: [], strategy: '', assignee: '', note: ''
+})
+const orderToast = ref('')
+let orderToastTimer = null
+
+function openCreateOrder(c) {
+  orderForm.value = {
+    customer_id: c.customer_id || c.id || '',
+    customer_name: c.surname || c.name || '',
+    geography: c.geography || '',
+    risk_level: c.risk_level || 'MEDIUM',
+    probability: c.probability || 0,
+    balance: c.balance || 0,
+    risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
+    strategy: c.strategy || '',
+    assignee: '',
+    note: ''
+  }
+  orderModalOpen.value = true
+}
+
+async function submitOrder() {
+  if (!orderForm.value.customer_id) {
+    showOrderToast('请填写客户信息')
+    return
+  }
+  try {
+    await api.post('/work-orders', orderForm.value)
+    showOrderToast('工单创建成功')
+    orderModalOpen.value = false
+  } catch (e) {
+    showOrderToast('创建失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+function showOrderToast(msg) {
+  orderToast.value = msg
+  clearTimeout(orderToastTimer)
+  orderToastTimer = setTimeout(() => { orderToast.value = '' }, 2500)
 }
 </script>
 
@@ -261,8 +349,8 @@ function fmtMoney(val) {
         <!-- Right: Top Customers (70%) -->
         <div class="lg:col-span-7 glass-card p-5">
           <div class="section-title">
-            🚨 高风险客户 Top 10
-            <span class="badge">按流失概率排序</span>
+            <span>🚨 高风险客户 Top 10 <span class="badge">按流失概率排序</span></span>
+            <router-link to="/customers" class="view-all-link">查看全部 →</router-link>
           </div>
           <div class="overflow-x-auto">
             <table class="action-table">
@@ -302,7 +390,16 @@ function fmtMoney(val) {
                     </div>
                   </td>
                   <td>
-                    <button class="btn-action">创建工单</button>
+                    <button
+                      v-if="activeCustomerIds.has(c.customer_id)"
+                      class="btn-action-done"
+                      disabled
+                    >已创建</button>
+                    <button
+                      v-else
+                      class="btn-action"
+                      @click="openCreateOrder(c)"
+                    >创建工单</button>
                   </td>
                 </tr>
               </tbody>
@@ -387,6 +484,82 @@ function fmtMoney(val) {
       </div>
     </template>
   </div>
+
+  <!-- 创建工单 Modal -->
+  <div v-if="orderModalOpen" class="modal-overlay" @click.self="orderModalOpen = false">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>创建工单</h2>
+        <button class="modal-close" @click="orderModalOpen = false">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>客户编号</label>
+            <input :value="orderForm.customer_id" readonly class="readonly" />
+          </div>
+          <div class="form-group">
+            <label>客户姓名</label>
+            <input :value="orderForm.customer_name" readonly class="readonly" />
+          </div>
+          <div class="form-group">
+            <label>地区</label>
+            <input :value="orderForm.geography" readonly class="readonly" />
+          </div>
+          <div class="form-group">
+            <label>风险等级</label>
+            <select v-model="orderForm.risk_level">
+              <option value="CRITICAL">🔴 紧急 CRITICAL</option>
+              <option value="HIGH">🟠 高危 HIGH</option>
+              <option value="MEDIUM">🟡 中等 MEDIUM</option>
+              <option value="LOW">🟢 低风险 LOW</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>流失概率</label>
+            <input :value="(orderForm.probability * 100).toFixed(1) + '%'" readonly class="readonly" />
+          </div>
+          <div class="form-group">
+            <label>客户余额</label>
+            <input :value="'¥' + (orderForm.balance || 0).toLocaleString()" readonly class="readonly" />
+          </div>
+          <div class="form-group">
+            <label>风险因素</label>
+            <input :value="(orderForm.risk_factors || []).join(', ')" readonly class="readonly" />
+          </div>
+          <div class="form-group">
+            <label>负责人</label>
+            <input v-model="orderForm.assignee" placeholder="输入负责人姓名" />
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1">
+            <label>推荐策略</label>
+            <select v-model="orderForm.strategy">
+              <option value="">-- 选择干预策略 --</option>
+              <option>专属客户经理一对一挽留</option>
+              <option>定制化产品优惠方案</option>
+              <option>VIP费率优惠</option>
+              <option>主动外呼关怀</option>
+              <option>产品升级推荐</option>
+              <option>满意度回访</option>
+              <option>积分奖励计划</option>
+              <option>定期营销推送</option>
+            </select>
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1">
+            <label>备注</label>
+            <textarea v-model="orderForm.note" placeholder="添加备注..." rows="2"></textarea>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="modal-btn-cancel" @click="orderModalOpen = false">取消</button>
+        <button class="modal-btn-submit" @click="submitOrder">确认创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div v-if="orderToast" class="dash-toast">{{ orderToast }}</div>
 </template>
 
 <style scoped>
@@ -427,6 +600,12 @@ function fmtMoney(val) {
   font-size: 10px; padding: 2px 10px; border-radius: 20px;
   background: rgba(99,102,241,0.12); color: #a5b4fc;
 }
+.view-all-link {
+  font-size: 11px; color: #a5b4fc; text-decoration: none;
+  padding: 2px 12px; border-radius: 20px; border: 1px solid rgba(99,102,241,0.3);
+  background: rgba(99,102,241,0.08); transition: .2s; white-space: nowrap;
+}
+.view-all-link:hover { background: rgba(99,102,241,0.18); }
 
 /* Insights */
 .insight-list { display: flex; flex-direction: column; gap: 10px; }
@@ -484,6 +663,11 @@ function fmtMoney(val) {
   transition: all 0.2s; white-space: nowrap;
 }
 .btn-action:hover { background: rgba(99,102,241,0.25); border-color: #6366f1; }
+.btn-action-done {
+  padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(52,211,153,0.2);
+  background: rgba(52,211,153,0.08); color: #6ee7b7; font-size: 12px;
+  white-space: nowrap; cursor: default;
+}
 
 /* Charts */
 .chart-box { width: 100%; height: 260px; }
@@ -520,4 +704,66 @@ function fmtMoney(val) {
 @media (max-width: 1024px) {
   .hero-grid { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ── 创建工单 Modal ── */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  animation: modal-fade .2s ease;
+}
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+.modal-card {
+  background: #13132b; border: 1px solid rgba(255,255,255,.08);
+  border-radius: 20px; width: 540px; max-height: 85vh; overflow-y: auto;
+  animation: modal-up .25s ease;
+}
+@keyframes modal-up { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+.modal-header {
+  padding: 20px 26px; border-bottom: 1px solid rgba(255,255,255,.06);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-header h2 { font-size: 17px; font-weight: 700; }
+.modal-close {
+  width: 30px; height: 30px; border-radius: 8px; background: rgba(255,255,255,.04);
+  border: none; color: #94a3b8; cursor: pointer; font-size: 14px; transition: .2s;
+}
+.modal-close:hover { background: rgba(255,255,255,.1); color: #fff; }
+.modal-body { padding: 22px 26px; }
+.modal-footer {
+  padding: 16px 26px; border-top: 1px solid rgba(255,255,255,.06);
+  display: flex; justify-content: flex-end; gap: 10px;
+}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.form-group { display: flex; flex-direction: column; gap: 5px; }
+.form-group label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+.form-group input, .form-group select, .form-group textarea {
+  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
+  border-radius: 9px; padding: 9px 12px; color: #e2e8f0; font-size: 13px;
+  outline: none; transition: .2s; font-family: inherit;
+}
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+  border-color: #6366f1;
+}
+.form-group textarea { resize: vertical; min-height: 60px; }
+.form-group select { cursor: pointer; }
+.form-group select option { background: #13132b; color: #e2e8f0; }
+.form-group .readonly { background: rgba(255,255,255,.015); border-style: dashed; cursor: default; color: #94a3b8; }
+.modal-btn-cancel {
+  padding: 9px 20px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12);
+  background: transparent; color: #cbd5e1; font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s;
+}
+.modal-btn-cancel:hover { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.04); }
+.modal-btn-submit {
+  padding: 9px 20px; border-radius: 10px; border: none; background: #6366f1; color: #fff;
+  font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s;
+}
+.modal-btn-submit:hover { background: #4f46e5; box-shadow: 0 4px 18px rgba(99,102,241,.35); }
+.dash-toast {
+  position: fixed; top: 24px; right: 24px; z-index: 2000;
+  padding: 12px 22px; border-radius: 12px; font-size: 13px; font-weight: 600;
+  background: #065f46; color: #6ee7b7; border: 1px solid rgba(52,211,153,.3);
+  box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  animation: toast-in .3s ease;
+}
+@keyframes toast-in { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }
 </style>

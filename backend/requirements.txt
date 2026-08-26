@@ -1,5 +1,5 @@
 fastapi==0.115.0
-uvicorn==0.30.0
+uvicorn[standard]==0.30.0
 sqlalchemy==2.0.35
 pydantic-settings==2.5.0
 pandas==2.2.2
@@ -9,3 +9,10 @@ xgboost==2.1.1
 lightgbm==4.5.0
 shap==0.45.0
 joblib==1.4.2
+
+# Async task queue
+celery[redis]==5.4.0
+redis==5.2.1
+
+# Production database (for 10M+ scale; SQLite still works for dev)
+# psycopg2-binary==2.9.9

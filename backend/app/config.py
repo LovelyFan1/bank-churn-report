@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite:///./churn_analysis.db"
 
+    # Redis / Celery
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
+
     # Data generation
     NUM_CUSTOMERS: int = 10000
     CHURN_RATE: float = 0.2037
@@ -21,6 +26,9 @@ class Settings(BaseSettings):
     RANDOM_STATE: int = 42
     TEST_SIZE: float = 0.2
     CV_FOLDS: int = 5
+
+    # Chunked data loading (for 10M+ scale)
+    DATA_CHUNK_SIZE: int = 50000
 
     class Config:
         env_file = ".env"
