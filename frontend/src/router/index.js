@@ -18,6 +18,14 @@ const routes = [
     meta: { title: '客户管理', icon: 'customers' }
   },
   {
+    // 客户详情 —— 从列表点行进入，看 SHAP 归因 / 推荐动作 / 历史工单。
+    // hidden：不是一级入口，不出现在侧边栏。
+    path: '/customers/:id',
+    name: 'CustomerDetail',
+    component: () => import('../views/CustomerDetail.vue'),
+    meta: { title: '客户详情', hidden: true }
+  },
+  {
     path: '/eda',
     name: 'EdaAnalysis',
     component: () => import('../views/EdaAnalysis.vue'),

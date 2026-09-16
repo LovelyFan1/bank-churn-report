@@ -17,6 +17,15 @@ class WorkOrderCreate(BaseModel):
     strategy: str = ""
     assignee: str = ""
     note: str = ""
+    # 分级依据快照 —— 前端可选传入；缺省时由后端补齐（见 routers/work_orders.py）
+    thresholds_snapshot: dict | None = None
+    model_used: str | None = None
+    # 价值层快照 —— 同上，与 risk_level 快照配套（见 models/work_order.py 说明）
+    value_tier_snapshot: str | None = None
+    expected_value_snapshot: float | None = None
+    # 渠道 —— 缺省时由后端按价值层预填；人工改选时须给 override_reason
+    channel: str | None = None
+    override_reason: str | None = None
 
     @field_validator("risk_level")
     @classmethod
@@ -25,6 +34,26 @@ class WorkOrderCreate(BaseModel):
         if v.upper() not in allowed:
             raise ValueError(f"risk_level must be one of {allowed}")
         return v.upper()
+
+    @field_validator("value_tier_snapshot")
+    @classmethod
+    def validate_value_tier(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        allowed = {"HIGH", "LOW", "ZERO"}
+        if v.upper() not in allowed:
+            raise ValueError(f"value_tier_snapshot must be one of {allowed}")
+        return v.upper()
+
+    @field_validator("channel")
+    @classmethod
+    def validate_channel(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        allowed = {"relationship", "outbound", "automated"}
+        if v not in allowed:
+            raise ValueError(f"channel must be one of {allowed}")
+        return v
 
 
 # ── 更新工单 ───────────────────────────────────────────
@@ -77,6 +106,13 @@ class WorkOrderResponse(BaseModel):
     result: str | None = None
     assignee: str | None = None
     note: str | None = None
+    thresholds_snapshot: dict | None = None
+    model_used: str | None = None
+    value_tier_snapshot: str | None = None
+    expected_value_snapshot: float | None = None
+    channel: str | None = None
+    channel_overridden: int | None = None
+    override_reason: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     completed_at: datetime | None = None
@@ -97,3 +133,18 @@ class WorkOrderResponse(BaseModel):
             except json.JSONDecodeError:
                 return [v]
         return []
+
+    @field_validator("thresholds_snapshot", mode="before")
+    @classmethod
+    def parse_thresholds(cls, v: object) -> dict | None:
+        """DB 中存 JSON 字符串，响应时转为 dict"""
+        if v is None or isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            import json
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
+        return None

@@ -57,6 +57,11 @@ function renderScatter(scatterData, profilesData, colorBy) {
   const clusterNames = {}
   profilesData?.clusters?.forEach(c => { clusterNames[c.cluster_id] = c.name || `聚类 ${c.cluster_id}` })
 
+  // 主成分方差解释率由后端 PCA 实时给出（/cluster/3d-scatter 的 explained_variance），
+  // 此前轴上写死的「PC1 (15.8%) / PC2 (9.4%)」是固定字符串，与实际结果无关。
+  const ev = scatterData.explained_variance || []
+  const pct = (i) => (ev[i] != null ? (ev[i] * 100).toFixed(1) + '%' : '—')
+
   let series
   if (colorBy === 'cluster') {
     series = scatterData.data.map((group) => {
@@ -107,13 +112,13 @@ function renderScatter(scatterData, profilesData, colorBy) {
     },
     grid: { left: 50, right: 30, top: 20, bottom: 45, containLabel: false },
     xAxis: {
-      type: 'value', name: 'PC1 (15.8%)', nameTextStyle: { color: '#9ca3af', fontSize: 11 },
+      type: 'value', name: `PC1 (${pct(0)})`, nameTextStyle: { color: '#9ca3af', fontSize: 11 },
       splitLine: { lineStyle: { color: 'rgba(75,85,99,0.15)' } },
       axisLabel: { color: '#6b7280', fontSize: 10 },
       axisLine: { lineStyle: { color: '#374151' } },
     },
     yAxis: {
-      type: 'value', name: 'PC2 (9.4%)', nameTextStyle: { color: '#9ca3af', fontSize: 11 },
+      type: 'value', name: `PC2 (${pct(1)})`, nameTextStyle: { color: '#9ca3af', fontSize: 11 },
       splitLine: { lineStyle: { color: 'rgba(75,85,99,0.15)' } },
       axisLabel: { color: '#6b7280', fontSize: 10 },
       axisLine: { lineStyle: { color: '#374151' } },
@@ -305,9 +310,14 @@ onMounted(async () => {
   }
 })
 
+// 保留最后一次的散点原始数据，供窗口缩放后按新尺寸重绘
+// （renderScatter 内部依赖 explained_variance，重绘时需带上）
 function handleResize() {
   chartInstances.forEach(c => c.resize())
 }
+
+// 此前只在 onBeforeUnmount 里 remove、从未 add —— 本页图表不随窗口缩放。
+onMounted(() => window.addEventListener('resize', handleResize))
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)

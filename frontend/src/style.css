@@ -95,6 +95,87 @@ body {
   font-size: 14px;
 }
 
+/* ── 风险徽章（全局统一）──────────────────────────────────
+   四个视图原先各自 <style scoped> 定义了一套 .risk-* / .badge-*，
+   且颜色不一致。现收敛到全局一处，类名由 utils/risk.js 的
+   riskBadgeClass() 生成，配色与等级语义一一对应。          */
+.risk-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.risk-critical { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+.risk-high     { background: rgba(249, 115, 22, 0.15); color: #fdba74; }
+.risk-medium   { background: rgba(250, 204, 21, 0.12); color: #facc15; }
+.risk-low      { background: rgba(34, 211, 238, 0.12); color: #22d3ee; }
+
+/* 风险因素标签 —— 与 .risk-badge 同理，原先在 CustomerManagement / WorkOrders /
+   Dashboard 三个视图各自 scoped 定义（内容还不一致），现收敛到这里一处。 */
+.risk-tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(248, 113, 113, 0.1);
+  color: #f87171;
+  margin-right: 3px;
+  margin-bottom: 3px;
+}
+
+/* ── 工具栏控件（全局统一）────────────────────────────────
+   这两个类原先只定义在 CustomerManagement.vue 的 <style scoped> 里，
+   别的页面写 class="select" / "search-input" 拿不到样式，落回浏览器默认外观
+   —— 于是同一个工具栏里，原生下拉和自定义按钮放一起明显不搭。
+   与 .risk-badge / .risk-tag 同样的收敛做法。                    */
+.select {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 8px 12px;
+  color: #e2e8f0;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  /* 跟随暗色主题，否则 Windows/Chrome 会按系统亮色渲染下拉箭头与弹层 */
+  color-scheme: dark;
+}
+.select:hover { border-color: rgba(255, 255, 255, 0.16); }
+.select:focus { border-color: rgba(99, 102, 241, 0.5); }
+/* 下拉弹层是原生控件，背景需显式指定，否则在暗色页面上是刺眼的白 */
+.select option { background: #13132b; color: #e2e8f0; }
+
+/* 文本 / 数字输入框 —— 与 .select 同一套配色，避免同一表单里两种外观 */
+.input {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 8px 12px;
+  color: #e2e8f0;
+  font-size: 13px;
+  outline: none;
+  color-scheme: dark;
+}
+.input:hover { border-color: rgba(255, 255, 255, 0.16); }
+.input:focus { border-color: rgba(99, 102, 241, 0.5); }
+.input::placeholder { color: #6b7280; }
+
+.search-input {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 8px 12px;
+  color: #e2e8f0;
+  font-size: 13px;
+  outline: none;
+  min-width: 220px;
+}
+.search-input::placeholder { color: #6b7280; }
+.search-input:focus { border-color: rgba(99, 102, 241, 0.5); }
+
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.25s ease;

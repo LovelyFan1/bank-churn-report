@@ -25,9 +25,9 @@
           <div class="text-xs text-gray-500 mt-1">建议优先跟进</div>
         </div>
         <div class="glass-card p-5">
-          <div class="text-xs text-gray-400 mb-1">已流失客户</div>
+          <div class="text-xs text-gray-400 mb-1">历史流失样本</div>
           <div class="text-3xl font-bold text-amber-400">{{ summary.exited?.toLocaleString() }}</div>
-          <div class="text-xs text-gray-500 mt-1">exited = 1</div>
+          <div class="text-xs text-gray-500 mt-1">数据集中的历史标签，非模型预测</div>
         </div>
         <div class="glass-card p-5">
           <div class="text-xs text-gray-400 mb-1">在管工单</div>
@@ -37,8 +37,11 @@
       </div>
 
       <!-- 风险分级标准 -->
+      <!-- 口径说明：后端 risk_scoring 用的是**原始概率的分位数边界**（P95/P70/P35），
+           不是固定阈值、也没有做概率校准（树模型校准会失真，见 risk_scoring.py 顶部注释）。
+           riskInfo.calibrated 只是「引擎已就绪」的标记，不代表概率经过校准。 -->
       <div v-if="riskInfo?.calibrated" class="risk-banner">
-        <span>🎯 风险分级已按概率校准（{{ riskInfo.model }} · 成本比 1:{{ riskInfo.cost_ratio }}）：</span>
+        <span>🎯 风险分级口径：按概率分位数 P95 / P70 / P35 划四级（{{ riskInfo.model }} · 漏检/误报成本比 1:{{ riskInfo.cost_ratio }}）：</span>
         <span class="risk-banner-item" style="color:#f87171">极高 ≥ {{ fmtPercent(riskInfo.thresholds.critical) }}</span>
         <span class="risk-banner-item" style="color:#fb923c">高危 ≥ {{ fmtPercent(riskInfo.thresholds.high) }}</span>
         <span class="risk-banner-item" style="color:#facc15">中等 ≥ {{ fmtPercent(riskInfo.thresholds.medium) }}</span>
@@ -66,13 +69,21 @@
           <option value="Germany">Germany</option>
           <option value="Spain">Spain</option>
         </select>
+        <select v-model="currentTier" class="select" @change="onFilter">
+          <option value="">全部价值层</option>
+          <option value="HIGH">高价值</option>
+          <option value="LOW">低价值</option>
+          <option value="ZERO">零余额</option>
+        </select>
         <select v-model="exitedFilter" class="select" @change="onFilter">
           <option value="">全部客户</option>
           <option value="1">已流失</option>
           <option value="0">未流失</option>
         </select>
+        <button class="btn btn-outline btn-sm" @click="exportCsv">⬇ 导出</button>
         <span class="flex-1"></span>
         <select v-model="sortBy" class="select" @change="onFilter">
+          <option value="expected_value">按期望价值 ↓</option>
           <option value="probability">按流失概率 ↓</option>
           <option value="balance">按余额 ↓</option>
           <option value="age">按年龄 ↑</option>
@@ -84,15 +95,49 @@
         </select>
       </div>
 
+      <!-- 批量操作条 —— 仅在选中时出现，避免常态占用工具栏空间 -->
+      <div v-if="selected.size" class="batch-bar">
+        <span class="text-sm text-gray-300">已选 <b class="text-white">{{ selected.size }}</b> 位客户</span>
+        <span class="text-xs text-gray-500">
+          每条按该客户自己的价值层渠道建单（零余额 → APP 推送，高价值 → 客户经理）
+        </span>
+        <span class="flex-1"></span>
+        <button class="btn btn-outline btn-sm" @click="clearSelection">取消选择</button>
+        <button class="btn btn-primary btn-sm" :disabled="batchRunning" @click="batchCreate">
+          {{ batchRunning ? '建单中…' : `＋ 批量建单（${selected.size}）` }}
+        </button>
+      </div>
+
+      <!-- 批量结果 —— 成功与失败都要显示，失败逐条给原因 -->
+      <div v-if="batchResult" class="batch-result" :class="{ 'has-fail': batchResult.fail.length }">
+        <div>
+          ✅ 成功 <b>{{ batchResult.ok }}</b> 条
+          <span v-if="batchResult.fail.length"> · ❌ 失败 <b>{{ batchResult.fail.length }}</b> 条</span>
+        </div>
+        <ul v-if="batchResult.fail.length" class="fail-list">
+          <li v-for="f in batchResult.fail" :key="f.id">{{ f.id }}：{{ f.reason }}</li>
+        </ul>
+        <button class="btn btn-outline btn-xs mt-2" @click="batchResult = null">关闭</button>
+      </div>
+
       <!-- Table -->
       <div class="glass-card overflow-hidden">
         <table class="w-full">
           <thead>
             <tr>
+              <th style="width:36px">
+                <!-- indeterminate 是 DOM 属性不是 HTML 特性，必须用 .prop 绑定，
+                     否则 Vue 会写成 attribute 而无效 -->
+                <input type="checkbox" :checked="allSelected"
+                       :indeterminate.prop="someSelected && !allSelected"
+                       :disabled="!selectableRows.length"
+                       @change="toggleAll" />
+              </th>
               <th>客户</th>
               <th>风险等级</th>
               <th>流失概率</th>
               <th>余额</th>
+              <th>价值层</th>
               <th>产品 / 活跃</th>
               <th>工单状态</th>
               <th class="text-right">操作</th>
@@ -100,12 +145,17 @@
           </thead>
           <tbody>
             <tr v-if="customers.length === 0">
-              <td colspan="7" class="text-center py-16 text-gray-500">
+              <td colspan="9" class="text-center py-16 text-gray-500">
                 <div class="text-4xl mb-2">🔍</div>
                 <p>没有匹配的客户，换个筛选条件试试</p>
               </td>
             </tr>
-            <tr v-for="c in customers" :key="c.id">
+            <tr v-for="c in customers" :key="c.id" class="row-clickable" @click="openDetail(c)">
+              <td @click.stop>
+                <!-- 已建单的客户不可再选（后端也会 409 拒掉） -->
+                <input type="checkbox" :checked="selected.has(c.customer_id)"
+                       :disabled="c.has_active_order" @change="toggleRow(c.customer_id)" />
+              </td>
               <td>
                 <div class="flex items-center gap-2.5">
                   <div class="w-9 h-9 rounded-lg flex items-center justify-center text-white font-bold text-sm flex-shrink-0" :style="{ background: avatarColor(c.surname) }">
@@ -117,16 +167,22 @@
                   </div>
                 </div>
               </td>
-              <td><span class="badge" :class="riskBadgeClass(c.risk_level)">{{ riskLabel(c.risk_level) }}</span></td>
+              <td><span class="risk-badge" :class="riskBadgeClass(c.risk_level)">{{ riskLabel(c.risk_level) }}</span></td>
               <td>
                 <div class="flex items-center gap-2">
                   <div class="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
-                    <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(c.probability), background: probColor(c.probability) }"></div>
+                    <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(c.probability), background: probColor(c.probability, riskInfo?.thresholds) }"></div>
                   </div>
-                  <span class="text-xs font-semibold" :style="{ color: probColor(c.probability) }">{{ fmtPercent(c.probability) }}</span>
+                  <span class="text-xs font-semibold" :style="{ color: probColor(c.probability, riskInfo?.thresholds) }">{{ fmtPercent(c.probability) }}</span>
                 </div>
               </td>
               <td class="tabular-nums">{{ fmtMoney(c.balance) }}</td>
+              <td>
+                <!-- 价值层与风险等级正交：等级说「会不会跑」，这里说「跑了值多少」 -->
+                <span class="tag-mini" :style="{ color: valueTierColor(c.value_tier), background: valueTierColor(c.value_tier) + '1f' }">
+                  {{ valueTierLabel(c.value_tier) }}
+                </span>
+              </td>
               <td>
                 {{ c.num_products }} 个产品 ·
                 <span class="tag-mini" :class="c.is_active_member ? 'tag-active' : 'tag-inactive'">
@@ -139,7 +195,7 @@
               </td>
               <td class="text-right">
                 <button v-if="c.has_active_order" class="btn-disabled" disabled>已建单</button>
-                <button v-else class="btn btn-primary btn-sm" @click="openCreate(c)">＋ 创建工单</button>
+                <button v-else class="btn btn-primary btn-sm" @click.stop="openCreate(c)">＋ 创建工单</button>
               </td>
             </tr>
           </tbody>
@@ -187,6 +243,10 @@
               <label>客户余额</label>
               <input :value="fmtMoney(form.balance)" readonly class="readonly" />
             </div>
+            <div class="form-group">
+              <label>价值层</label>
+              <input :value="valueTierLabel(form.value_tier_snapshot)" readonly class="readonly" />
+            </div>
             <div class="form-group full">
               <label>风险因素（模型自动识别）</label>
               <div class="flex flex-wrap gap-1.5">
@@ -195,18 +255,28 @@
               </div>
             </div>
             <div class="form-group full">
-              <label>推荐策略</label>
-              <select v-model="form.strategy">
-                <option value="">-- 选择干预策略 --</option>
-                <option>专属客户经理一对一挽留</option>
-                <option>定制化产品优惠方案</option>
-                <option>VIP费率优惠</option>
-                <option>主动外呼关怀</option>
-                <option>产品升级推荐</option>
-                <option>满意度回访</option>
-                <option>积分奖励计划</option>
-                <option>定期营销推送</option>
+              <label>触达渠道</label>
+              <!-- 预填后端推荐值；频道由价值层硬定，改选须填原因（后端亦会校验） -->
+              <select v-model="form.channel">
+                <option value="relationship">客户经理 1 对 1</option>
+                <option value="outbound">主动外呼</option>
+                <option value="automated">APP 推送 / 短信</option>
               </select>
+              <p v-if="channelOverridden" class="text-xs text-amber-400 mt-1">
+                ⚠ 已偏离该价值层的推荐渠道（{{ channelLabel(recommendedChannel) }}），需填写原因
+              </p>
+            </div>
+            <div v-if="channelOverridden" class="form-group full">
+              <label>覆盖原因 <span class="text-red-400">*</span></label>
+              <textarea v-model="form.override_reason" rows="2"
+                        placeholder="例如：客户在本行资产为 0，但他行有高净值，主管特批"></textarea>
+            </div>
+            <div class="form-group full">
+              <label>推荐动作（后端统一策略）</label>
+              <!-- 只读：动作由后端 recommend_action(价值层, 风险等级) 产出，
+                   与干预策略页矩阵、客户列表 strategy 字段同源。
+                   此前这里是写死的 8 项下拉，构成第三套说法。 -->
+              <input :value="recommendedAction" readonly class="readonly" />
             </div>
             <div class="form-group">
               <label>负责人</label>
@@ -231,8 +301,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
+import { riskLabel, riskBadgeClass, probColor, fmtPercent, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
@@ -243,10 +315,16 @@ const riskInfo = ref(null)
 const total = ref(0)
 
 const currentRisk = ref('all')
+// URL 同步用的路由 —— 筛选状态写进 query，支持前进/后退/分享链接
+const route = useRoute()
+const router = useRouter()
+const currentTier = ref('')
 const searchText = ref('')
 const geoFilter = ref('')
 const exitedFilter = ref('')
-const sortBy = ref('probability')
+// 默认按期望价值排序 —— 与 Dashboard「优先干预 Top10」、干预策略页矩阵同源。
+// 按纯概率排会把 44 个零余额客户排进首页（他们概率高但无可挽回资产）。
+const sortBy = ref('expected_value')
 const pageSize = ref(20)
 const page = ref(1)
 const totalPages = ref(1)
@@ -263,32 +341,34 @@ const modalOpen = ref(false)
 const form = reactive({
   customer_id: '', customer_name: '', geography: '',
   risk_level: 'MEDIUM', probability: 0, balance: 0,
-  risk_factors: [], strategy: '', assignee: '', note: ''
+  risk_factors: [], strategy: '', assignee: '', note: '',
+  // 阈值快照 —— 与 Dashboard 建单一致，供事后审计分级依据
+  thresholds_snapshot: null, model_used: null,
+  // 价值层快照 —— 与 risk_level 快照配套，见 models/work_order.py
+  value_tier_snapshot: null, expected_value_snapshot: null,
+  // 渠道 —— 由价值层预填推荐值；改选需填 override_reason
+  channel: 'outbound', override_reason: '',
 })
+
+// 该客户所属价值层的推荐渠道 —— 用于判断当前选择是否已偏离推荐
+const recommendedChannel = computed(() => {
+  const t = form.value_tier_snapshot
+  if (t === 'ZERO') return 'automated'
+  if (t === 'HIGH') return 'relationship'
+  return 'outbound'
+})
+const channelOverridden = computed(() => form.channel !== recommendedChannel.value)
+const recommendedAction = computed(
+  () => form.strategy || '—',
+)
 
 const toastMsg = ref('')
 let toastTimer = null
 let searchTimer = null
 
 // ── Helpers ────────────────────────────────────────
-function riskLabel(level) {
-  const m = { CRITICAL: '极高', HIGH: '高危', MEDIUM: '中等', LOW: '低风险' }
-  return m[level] || level
-}
-function riskBadgeClass(level) {
-  return 'badge-' + (level || 'medium').toLowerCase()
-}
-function probColor(p) {
-  if (!p && p !== 0) return '#94a3b8'
-  if (p >= 0.7) return '#ef4444'
-  if (p >= 0.3) return '#f97316'
-  if (p >= 0.1) return '#eab308'
-  return '#22d3ee'
-}
-function fmtPercent(p) {
-  if (p == null) return '0%'
-  return (p * 100).toFixed(0) + '%'
-}
+// riskLabel / riskBadgeClass / probColor / fmtPercent 已抽到 src/utils/risk.js
+// —— 阈值口径与配色必须全局唯一，四个视图原先各写一份且取值不同。
 function fmtMoney(v) {
   return '¥' + (v || 0).toLocaleString()
 }
@@ -310,17 +390,166 @@ function onSearch() {
 }
 function onFilter() {
   page.value = 1
+  syncUrl()
   fetchCustomers()
 }
 function goPage(p) {
   page.value = p
+  syncUrl()
   fetchCustomers()
+}
+
+/** 点行进详情页 */
+function openDetail(c) {
+  router.push(`/customers/${c.customer_id}`)
+}
+
+// ── 批量建单 ────────────────────────────────────────
+// 每行的渠道由该客户**自己的价值层**决定，不能一套参数批量提交 ——
+// 否则零余额客户会被当成高价值客户处理（正是本项目要消除的那类错误）。
+// 因此逐条按各行的 channel / action 提交，各记各的账。
+const selected = ref(new Set())
+const batchRunning = ref(false)
+const batchResult = ref(null)
+
+const selectableRows = computed(() => customers.value.filter((c) => !c.has_active_order))
+const allSelected = computed(
+  () => selectableRows.value.length > 0
+    && selectableRows.value.every((c) => selected.value.has(c.customer_id)),
+)
+const someSelected = computed(
+  () => selectableRows.value.some((c) => selected.value.has(c.customer_id)),
+)
+
+function toggleRow(id) {
+  // Set 是浅层响应式，需换新实例才能触发更新
+  const s = new Set(selected.value)
+  s.has(id) ? s.delete(id) : s.add(id)
+  selected.value = s
+}
+
+function toggleAll() {
+  selected.value = allSelected.value
+    ? new Set()
+    : new Set(selectableRows.value.map((c) => c.customer_id))
+}
+
+function clearSelection() {
+  selected.value = new Set()
+  batchResult.value = null
+}
+
+/**
+ * 批量建单：逐条提交，汇总成功/失败。
+ * 失败原因逐条记录（如并发建单撞上 409），不吞掉 —— 否则用户以为全成功了。
+ */
+async function batchCreate() {
+  const targets = customers.value.filter((c) => selected.value.has(c.customer_id))
+  if (!targets.length) return
+  batchRunning.value = true
+  batchResult.value = null
+
+  const okList = []
+  const failList = []
+  for (const c of targets) {
+    try {
+      await api.post('/work-orders', {
+        customer_id: c.customer_id,
+        customer_name: c.surname,
+        geography: c.geography,
+        risk_level: c.risk_level,
+        probability: c.probability,
+        balance: c.balance,
+        risk_factors: c.risk_factors || [],
+        strategy: c.action || '',
+        // 渠道直接用该客户的推荐值 —— 不覆盖，因此无需 override_reason
+        channel: c.channel,
+        thresholds_snapshot: riskInfo.value?.thresholds || null,
+        model_used: riskInfo.value?.model || null,
+        value_tier_snapshot: c.value_tier,
+        expected_value_snapshot: c.expected_value,
+      })
+      okList.push(c.customer_id)
+    } catch (e) {
+      failList.push({ id: c.customer_id, reason: e.response?.data?.detail || e.message })
+    }
+  }
+
+  batchResult.value = { ok: okList.length, fail: failList }
+  batchRunning.value = false
+  clearSelectionOnly()
+  fetchCustomers()
+}
+
+/** 清空选择但保留结果提示（批量建单后要展示汇总） */
+function clearSelectionOnly() {
+  selected.value = new Set()
+}
+
+/**
+ * 把筛选/排序/分页写入 URL query。
+ * 这样前进后退可用、刷新不丢状态、也能把「某类客户的链接」直接发给别人
+ * （矩阵下钻就是靠这个跳过来的）。
+ * 用 replace 而非 push：筛选是连续操作，不该在历史里堆一串记录。
+ */
+function syncUrl() {
+  const q = {}
+  if (currentRisk.value !== 'all') q.risk_level = currentRisk.value
+  if (currentTier.value) q.value_tier = currentTier.value
+  if (geoFilter.value) q.geography = geoFilter.value
+  if (exitedFilter.value !== '') q.exited = exitedFilter.value
+  if (searchText.value.trim()) q.search = searchText.value.trim()
+  if (sortBy.value !== 'expected_value') q.sort_by = sortBy.value
+  if (page.value > 1) q.page = String(page.value)
+  if (pageSize.value !== 20) q.page_size = String(pageSize.value)
+  router.replace({ path: '/customers', query: q })
+}
+
+/** 从 URL 还原筛选状态 —— 供首次进入与浏览器前进/后退使用 */
+function readUrl() {
+  const q = route.query
+  currentRisk.value = q.risk_level || 'all'
+  currentTier.value = q.value_tier || ''
+  geoFilter.value = q.geography || ''
+  exitedFilter.value = q.exited ?? ''
+  searchText.value = q.search || ''
+  sortBy.value = q.sort_by || 'expected_value'
+  page.value = q.page ? parseInt(q.page, 10) || 1 : 1
+  pageSize.value = q.page_size ? parseInt(q.page_size, 10) || 20 : 20
+}
+
+/** 导出当前筛选结果为 CSV —— 与列表共用后端筛选，保证导出的是同一批人 */
+async function exportCsv() {
+  try {
+    const params = {}
+    if (currentRisk.value !== 'all') params.risk_level = currentRisk.value
+    if (currentTier.value) params.value_tier = currentTier.value
+    if (geoFilter.value) params.geography = geoFilter.value
+    if (exitedFilter.value !== '') params.exited = exitedFilter.value
+    if (searchText.value.trim()) params.search = searchText.value.trim()
+    params.sort_by = sortBy.value
+    params.sort_order = sortBy.value === 'age' ? 'asc' : 'desc'
+
+    const { data } = await api.get('/customers/export', { params, responseType: 'blob' })
+    const url = URL.createObjectURL(new Blob([data], { type: 'text/csv;charset=utf-8' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `客户名单_${new Date().toISOString().slice(0, 10)}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    showToast('已导出当前筛选结果')
+  } catch (e) {
+    showToast('导出失败: ' + (e.response?.data?.detail || e.message))
+  }
 }
 
 async function fetchCustomers() {
   try {
     const params = { page: page.value, page_size: pageSize.value }
     if (currentRisk.value !== 'all') params.risk_level = currentRisk.value
+    if (currentTier.value) params.value_tier = currentTier.value
     if (searchText.value.trim()) params.search = searchText.value.trim()
     if (geoFilter.value) params.geography = geoFilter.value
     if (exitedFilter.value !== '') params.exited = exitedFilter.value
@@ -351,7 +580,14 @@ function openCreate(c) {
     risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
     strategy: c.strategy || '',
     assignee: '',
-    note: ''
+    note: '',
+    thresholds_snapshot: riskInfo.value?.thresholds || null,
+    model_used: riskInfo.value?.model || null,
+    value_tier_snapshot: c.value_tier || null,
+    expected_value_snapshot: c.expected_value ?? null,
+    // 渠道预填该客户价值层的推荐值；strategy 直接用后端产出的动作
+    channel: c.channel || 'outbound',
+    override_reason: '',
   })
   modalOpen.value = true
 }
@@ -362,6 +598,11 @@ function closeModal() {
 async function submitOrder() {
   if (!form.customer_id || !form.customer_name) {
     showToast('请填写客户信息')
+    return
+  }
+  // 与后端同一条规则：偏离推荐渠道必须留原因（后端也会校验，这里提前拦一道）
+  if (channelOverridden.value && !form.override_reason.trim()) {
+    showToast('已偏离推荐渠道，请填写覆盖原因')
     return
   }
   try {
@@ -382,8 +623,20 @@ function showToast(msg) {
 
 // ── Lifecycle ──────────────────────────────────────
 onMounted(async () => {
+  // 先按 URL 还原筛选 —— 支持从矩阵下钻跳进来、以及直接分享筛选链接
+  readUrl()
   await fetchCustomers()
   loading.value = false
+})
+
+// 浏览器前进/后退时同步筛选状态（syncUrl 用的是 replace，不会与这里形成循环）
+watch(() => route.query, () => {
+  const before = JSON.stringify([currentRisk.value, currentTier.value, geoFilter.value,
+    exitedFilter.value, searchText.value, sortBy.value, page.value])
+  readUrl()
+  const after = JSON.stringify([currentRisk.value, currentTier.value, geoFilter.value,
+    exitedFilter.value, searchText.value, sortBy.value, page.value])
+  if (before !== after) fetchCustomers()
 })
 </script>
 
@@ -397,14 +650,13 @@ onMounted(async () => {
 .risk-banner-item { font-weight: 700; }
 
 /* ── 搜索 / 下拉 ── */
-.search-input {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
-  border-radius: 10px; padding: 8px 14px; color: #e2e8f0; font-size: 13px;
-  width: 240px; outline: none; transition: .2s;
-}
-.search-input:focus { border-color: #6366f1; }
-.search-input::placeholder { color: #64748b; }
+/* .search-input 已全局化到 style.css */
 
+/* ── 徽章 ──
+   .badge 已移除：列表里的风险徽章改用全局 .risk-badge（见 style.css），
+   避免 scoped 与全局两套同名类互相覆盖。 */
+
+/* ── Tabs ── */
 .tabs { display: flex; gap: 4px; background: rgba(255,255,255,.03); padding: 4px; border-radius: 10px; }
 .tab {
   padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600;
@@ -414,12 +666,7 @@ onMounted(async () => {
 .tab:hover { color: #e2e8f0; }
 .tab.active { background: rgba(99,102,241,.18); color: #a5b4fc; }
 
-.select {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
-  border-radius: 10px; padding: 8px 12px; color: #e2e8f0; font-size: 13px;
-  outline: none; cursor: pointer;
-}
-.select option { background: #13132b; color: #e2e8f0; }
+/* .select 已全局化到 style.css（原先只在本页 scoped 定义，其他页面用不到） */
 
 /* ── Table ── */
 table { width: 100%; border-collapse: collapse; }
@@ -435,14 +682,31 @@ tbody td {
 }
 tbody tr { transition: .15s; }
 tbody tr:hover { background: rgba(255,255,255,.02); }
+/* 整行可点进详情 —— 给出指针与悬停反馈，否则用户不知道能点 */
+.row-clickable { cursor: pointer; }
+.row-clickable:hover { background: rgba(99,102,241,.07) !important; }
 
-/* ── Badge ── */
-.badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
-.badge-critical { background: rgba(239,68,68,.15); color: #f87171; }
-.badge-high     { background: rgba(249,115,22,.15); color: #fb923c; }
-.badge-medium   { background: rgba(250,204,21,.12); color: #facc15; }
-.badge-low      { background: rgba(34,211,238,.12); color: #22d3ee; }
+/* 批量操作条 —— 选中时出现 */
+.batch-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 16px; border-radius: 12px;
+  background: rgba(99,102,241,.1); border: 1px solid rgba(99,102,241,.28);
+}
+.batch-result {
+  padding: 12px 16px; border-radius: 12px; font-size: 13px;
+  background: rgba(34,197,94,.08); border: 1px solid rgba(34,197,94,.25); color: #86efac;
+}
+.batch-result.has-fail {
+  background: rgba(245,158,11,.08); border-color: rgba(245,158,11,.28); color: #fcd34d;
+}
+.fail-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #fca5a5; }
+.fail-list li { margin-top: 2px; }
 
+/* ── Badge ──
+   .risk-badge / .risk-* 已移至 style.css（全局），由 utils/risk.js 的
+   riskBadgeClass() 生成类名，四个视图共用一套配色。 */
+
+/* ── Mini tags ── */
 /* ── Mini tags ── */
 .tag-mini { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 11px; }
 .tag-active   { background: rgba(52,211,153,.12); color: #34d399; }
@@ -460,7 +724,7 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 .btn-disabled { padding: 6px 14px; font-size: 12px; border-radius: 7px; background: rgba(255,255,255,.04); color: #64748b; cursor: not-allowed; border: none; }
 
 /* ── Risk tag ── */
-.risk-tag { font-size: 11px; padding: 2px 7px; border-radius: 4px; background: rgba(248,113,113,.1); color: #f87171; }
+/* .risk-tag 已全局化到 style.css（原先三个视图各写一份，内容不一致） */
 
 /* ── Modal ── */
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn .2s ease; }

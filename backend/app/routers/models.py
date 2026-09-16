@@ -8,9 +8,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.services import risk_scoring
 from app.services.model_service import get_model_service
 from app.celery_tasks.train import train_all_models_task
-from app.celery_tasks.predict import batch_score_task, predict_single_sync
+from app.celery_tasks.predict import batch_score_task
 
 router = APIRouter(prefix="/api/model", tags=["Models"])
 
@@ -51,6 +52,16 @@ async def batch_score(top_n: int = Query(default=100, ge=1, le=1000)):
 # ═══════════════════════════════════════════════════════════
 # 同步读取（轻量 — 直接读磁盘/DB）
 # ═══════════════════════════════════════════════════════════
+
+@router.get("/risk-info")
+async def get_risk_info():
+    """当前风险分级标准 — 阈值 / 最优阈值 / 成本比。
+
+    这是全系统分级口径的**唯一对外出口**：风险等级由 risk_scoring 的分位数
+    边界（P95/P70/P35）决定，前端各页面必须读这里的值，不得自行写死阈值。
+    """
+    return risk_scoring.get_risk_info()
+
 
 @router.get("/comparison")
 async def get_model_comparison(db: Session = Depends(get_db)):

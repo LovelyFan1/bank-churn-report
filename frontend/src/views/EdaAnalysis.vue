@@ -176,6 +176,9 @@ function handleResize() {
   chartInstances.forEach(c => c.resize())
 }
 
+// 此前只 remove 从未 add —— 本页图表不随窗口缩放，一并修掉
+onMounted(() => window.addEventListener('resize', handleResize))
+
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   chartInstances.forEach(c => c.dispose())

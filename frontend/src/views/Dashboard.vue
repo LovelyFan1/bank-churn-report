@@ -1,8 +1,9 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
 import { pollTask } from '../api/taskPoller'
+import { riskLabel, riskBadgeClass, probColor, fmtPercent, channelLabel } from '../utils/risk'
 
 const loading = ref(true)
 const overview = ref(null)
@@ -10,6 +11,9 @@ const batchData = ref(null)
 const businessSummary = ref(null)
 const topCustomers = ref([])
 const activeCustomerIds = ref(new Set())
+// 风险分级口径 + 最优模型指标 —— 均由后端给出，不在前端写死
+const riskInfo = ref(null)
+const modelMetrics = ref(null)
 
 // Chart refs
 const trendChart = shallowRef(null)
@@ -17,7 +21,9 @@ const riskChart = shallowRef(null)
 const roiChart = shallowRef(null)
 const chartInstances = []
 
-// Mock monthly trend (data has no time dimension)
+// ⚠ 示例数据：系统数据无时间维度字段（customers 表无日期列），
+// 后端 /api/data/overview 也不返回时间序列，故趋势图为固定示意值。
+// 图表标题已标注「示例数据」，不得据此做任何业务判断。
 const monthlyTrend = [
   { month: '1月', churned: 210, retained: 80 },
   { month: '2月', churned: 185, retained: 72 },
@@ -42,27 +48,38 @@ const recoverable = ref(0)
 const roi = ref(0)
 const riskDist = ref({ CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 })
 
-const riskLevelMap = {
-  CRITICAL: { label: '极高', cls: 'risk-critical' },
-  HIGH: { label: '高', cls: 'risk-high' },
-  MEDIUM: { label: '中', cls: 'risk-medium' },
-  LOW: { label: '低', cls: 'risk-low' },
-}
-
-const riskColors = { CRITICAL: '#ef4444', HIGH: '#f59e0b', MEDIUM: '#84cc16', LOW: '#22c55e' }
+// 模型可信度 —— 取自 /api/model/comparison 的最优模型行（不再是字面量）
+const confRows = ref([])
 
 onMounted(async () => {
   try {
     // 先加载不需要模型的结果
-    const [overviewRes, insightsRes, activeRes] = await Promise.all([
+    const [overviewRes, insightsRes, activeRes, riskInfoRes, comparisonRes] = await Promise.all([
       api.get('/data/overview'),
       api.get('/eda/key-insights'),
       api.get('/work-orders/active-customers').catch(() => ({ data: { customer_ids: [] } })),
+      api.get('/model/risk-info').catch(() => ({ data: null })),
+      api.get('/model/comparison').catch(() => ({ data: null })),
     ])
     activeCustomerIds.value = new Set(activeRes.data.customer_ids)
+    riskInfo.value = riskInfoRes.data
 
     overview.value = overviewRes.data
     insights.value = insightsRes.data.insights
+
+    // 模型可信度：取最优模型那一行，不做任何前端加工
+    const comparison = comparisonRes.data
+    if (comparison?.best_model && comparison.models?.length) {
+      const best = comparison.models.find(m => m.model_name === comparison.best_model)
+        || comparison.models[0]
+      modelMetrics.value = best
+      confRows.value = [
+        { label: '整体准确率', val: best.accuracy * 100 },
+        { label: '召回率（识别流失）', val: best.recall * 100 },
+        { label: '精确率', val: best.precision * 100 },
+        { label: 'F1 分数', val: best.f1_score * 100 },
+      ]
+    }
 
     // 批量预测（异步任务 → 轮询）
     let batchResult = null
@@ -97,12 +114,18 @@ onMounted(async () => {
     }
 
     // Compute metrics
-    const total = overviewRes.data.total_customers
     const churned = overviewRes.data.churned_customers
     churnRate.value = overviewRes.data.churn_rate
 
-    const avgBalance = overviewRes.data.avg_balance
-    lossAmount.value = Math.round(churned * avgBalance / 10000)
+    // 损失口径统一走 cost-benefit —— 与干预策略页同源。
+    // 旧写法是 churned × avg_balance（全量客户的平均余额），既用错了均值对象
+    // （应为流失客户而非全体），又与干预策略页的 annual_loss 给出不同数字
+    // （实测 15,629万 vs 10,185万），两页都叫「年度流失损失」。
+    //
+    // ⚠ 这个数用的是**历史**流失数（exited=1 的计数），不是模型预测的未来流失。
+    // 所以文案一律写「年流失损失（历史口径）」，不写「预估」——
+    // 否则被问「这 2037 是预测的还是已发生的」会答不上来。
+    lossAmount.value = summaryResult ? Math.round(summaryResult.annual_loss / 10000) : 0
     recoverable.value = summaryResult ? Math.round(summaryResult.reduced_loss / 10000) : 0
     roi.value = summaryResult ? summaryResult.roi : 0
 
@@ -136,6 +159,11 @@ function initTrendChart() {
   if (!trendChart.value) return
   const chart = echarts.init(trendChart.value)
   chart.setOption({
+    // ⚠ 图内水印：避免截图/投影时角标被裁掉后失去「示例数据」标识
+    graphic: [{
+      type: 'text', right: 12, top: 6,
+      style: { text: '示例数据 · 非真实统计', fill: 'rgba(251,191,36,0.75)', fontSize: 11, fontWeight: 'bold' },
+    }],
     tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.95)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 } },
     grid: { left: 50, right: 50, top: 10, bottom: 40 },
@@ -190,6 +218,11 @@ function initRoiChart() {
   if (!roiChart.value) return
   const chart = echarts.init(roiChart.value)
   chart.setOption({
+    // ⚠ 图内水印：同上，不依赖卡片角标是否被裁切
+    graphic: [{
+      type: 'text', right: 8, top: 2,
+      style: { text: '示例数据', fill: 'rgba(251,191,36,0.75)', fontSize: 11, fontWeight: 'bold' },
+    }],
     tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.95)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
     grid: { left: 50, right: 20, top: 10, bottom: 30 },
     xAxis: {
@@ -213,40 +246,32 @@ function initRoiChart() {
   chartInstances.push(chart)
 }
 
-function fmtProb(prob) {
-  return (prob * 100).toFixed(0) + '%'
-}
-
-function probColor(prob) {
-  if (prob >= 0.7) return '#ef4444'
-  if (prob >= 0.3) return '#f59e0b'
-  if (prob >= 0.1) return '#84cc16'
-  return '#22c55e'
-}
-
-function riskBadgeClass(level) {
-  if (level === 'CRITICAL') return 'risk-critical'
-  if (level === 'HIGH') return 'risk-high'
-  if (level === 'MEDIUM') return 'risk-medium'
-  return 'risk-low'
-}
-
-function riskLabel(level) {
-  const map = { CRITICAL: '极高', HIGH: '高', MEDIUM: '中', LOW: '低' }
-  return map[level] || level
-}
-
-function fmtMoney(val) {
-  return '¥' + val.toLocaleString()
-}
-
 // ── 创建工单 Modal ──
 const orderModalOpen = ref(false)
 const orderForm = ref({
   customer_id: '', customer_name: '', geography: '',
   risk_level: 'MEDIUM', probability: 0, balance: 0,
-  risk_factors: [], strategy: '', assignee: '', note: ''
+  risk_factors: [], strategy: '', assignee: '', note: '',
+  // 阈值快照：记录该等级是「用哪套阈值、哪个模型」判出来的。
+  // 模型重训后分位数边界会整体位移，但工单里已冻结的等级不应随之改变 ——
+  // 存下快照才能在事后审计「这个高危当年是怎么判的」。
+  thresholds_snapshot: null, model_used: null,
+  // 价值层快照 —— 与 risk_level 快照配套，见 models/work_order.py
+  value_tier_snapshot: null, expected_value_snapshot: null,
+  // 渠道 —— 由价值层预填推荐值；改选需填 override_reason
+  channel: 'outbound', override_reason: '',
 })
+
+// 该客户所属价值层的推荐渠道 —— 用于判断当前选择是否已偏离推荐
+const orderRecommendedChannel = computed(() => {
+  const t = orderForm.value.value_tier_snapshot
+  if (t === 'ZERO') return 'automated'
+  if (t === 'HIGH') return 'relationship'
+  return 'outbound'
+})
+const orderChannelOverridden = computed(
+  () => orderForm.value.channel !== orderRecommendedChannel.value,
+)
 const orderToast = ref('')
 let orderToastTimer = null
 
@@ -261,7 +286,14 @@ function openCreateOrder(c) {
     risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
     strategy: c.strategy || '',
     assignee: '',
-    note: ''
+    note: '',
+    thresholds_snapshot: riskInfo.value?.thresholds || null,
+    model_used: riskInfo.value?.model || null,
+    value_tier_snapshot: c.value_tier || null,
+    expected_value_snapshot: c.expected_value ?? null,
+    // 渠道预填该客户价值层的推荐值；strategy 直接用后端产出的动作
+    channel: c.channel || 'outbound',
+    override_reason: '',
   }
   orderModalOpen.value = true
 }
@@ -269,6 +301,11 @@ function openCreateOrder(c) {
 async function submitOrder() {
   if (!orderForm.value.customer_id) {
     showOrderToast('请填写客户信息')
+    return
+  }
+  // 与后端同一条规则：偏离推荐渠道必须留原因
+  if (orderChannelOverridden.value && !orderForm.value.override_reason.trim()) {
+    showOrderToast('已偏离推荐渠道，请填写覆盖原因')
     return
   }
   try {
@@ -297,19 +334,20 @@ function showOrderToast(msg) {
     <template v-else>
       <!-- Hero Summary -->
       <div class="hero-banner">
-        <div class="hero-label">📊 本月经营摘要</div>
+        <div class="hero-label">📊 客户流失概览</div>
         <div class="hero-text">
           当前在管客户 <span class="hl-white">{{ overview?.total_customers?.toLocaleString() }}</span> 人，
-          本月预计流失 <span class="hl-red">{{ overview?.churned_customers?.toLocaleString() }} 人</span>，
-          潜在损失 <span class="hl-red">¥{{ lossAmount }}万</span>。<br>
+          其中历史上已流失 <span class="hl-red">{{ overview?.churned_customers?.toLocaleString() }} 人</span>，
+          按此历史流失率折算年损失约 <span class="hl-red">¥{{ lossAmount }}万</span>（推算）。<br>
           模型已识别高风险客户 <span class="hl-orange">{{ (riskDist.CRITICAL + riskDist.HIGH).toLocaleString() }} 人</span>，
-          建议优先跟进前 <span class="hl-orange">100 人</span>，
+          建议优先跟进期望价值最高的前 <span class="hl-orange">{{ topCustomers.length }} 人</span>，
           预计可挽回 <span class="hl-green">¥{{ recoverable }}万</span>。
         </div>
         <div class="hero-grid">
           <div class="hero-card">
-            <div class="hero-card-label">年度流失损失</div>
+            <div class="hero-card-label">年流失损失（历史口径推算）</div>
             <div class="hero-card-value hl-red">¥{{ lossAmount }}万</div>
+            <div class="hero-card-sub">历史流失人数 × 平均客单价</div>
           </div>
           <div class="hero-card">
             <div class="hero-card-label">模型可挽回金额</div>
@@ -349,9 +387,13 @@ function showOrderToast(msg) {
         <!-- Right: Top Customers (70%) -->
         <div class="lg:col-span-7 glass-card p-5">
           <div class="section-title">
-            <span>🚨 高风险客户 Top 10 <span class="badge">按流失概率排序</span></span>
+            <span>🎯 优先干预 Top 10 <span class="badge">按期望价值排序</span></span>
             <router-link to="/customers" class="view-all-link">查看全部 →</router-link>
           </div>
+          <p class="text-xs text-gray-500 mb-2">
+            期望价值 = 流失概率 × 余额。500 个极高风险客户的概率都挤在 1.0 附近，
+            此时余额是唯一还能拉开优先级的维度 —— 按概率排会混入余额为 0 的客户。
+          </p>
           <div class="overflow-x-auto">
             <table class="action-table">
               <thead>
@@ -360,6 +402,7 @@ function showOrderToast(msg) {
                   <th>风险</th>
                   <th>流失概率</th>
                   <th>余额</th>
+                  <th>期望价值</th>
                   <th>风险因素</th>
                   <th>操作</th>
                 </tr>
@@ -378,12 +421,13 @@ function showOrderToast(msg) {
                   <td>
                     <div class="prob-cell">
                       <div class="prob-bar">
-                        <div class="prob-fill" :style="{ width: fmtProb(c.probability), background: probColor(c.probability) }"></div>
+                        <div class="prob-fill" :style="{ width: fmtPercent(c.probability), background: probColor(c.probability, riskInfo?.thresholds) }"></div>
                       </div>
-                      <span :style="{ color: probColor(c.probability) }">{{ fmtProb(c.probability) }}</span>
+                      <span :style="{ color: probColor(c.probability, riskInfo?.thresholds) }">{{ fmtPercent(c.probability) }}</span>
                     </div>
                   </td>
                   <td class="text-gray-300">¥{{ c.balance.toLocaleString() }}</td>
+                  <td class="tabular-nums text-emerald-400">¥{{ Math.round(c.expected_value || 0).toLocaleString() }}</td>
                   <td>
                     <div class="risk-factors">
                       <span v-for="f in c.risk_factors" :key="f" class="factor-tag">{{ f }}</span>
@@ -411,8 +455,9 @@ function showOrderToast(msg) {
       <!-- Charts Row -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
         <div class="glass-card p-5">
-          <div class="section-title">📈 月度流失趋势 <span class="badge">近 12 个月</span></div>
+          <div class="section-title">📈 月度流失趋势 <span class="badge badge-demo">⚠ 示例数据</span></div>
           <div ref="trendChart" class="chart-box"></div>
+          <p class="demo-note">系统数据无时间维度字段（customers 表无日期列），此图为固定示意值，非真实统计。</p>
         </div>
         <div class="glass-card p-5">
           <div class="section-title">🎯 客户风险分布 <span class="badge">当前在管</span></div>
@@ -424,32 +469,37 @@ function showOrderToast(msg) {
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
         <!-- Model Confidence -->
         <div class="glass-card p-5">
-          <div class="section-title">🔬 模型可信度</div>
+          <div class="section-title">
+            🔬 模型可信度
+            <span v-if="modelMetrics" class="badge">{{ modelMetrics.model_name }}</span>
+          </div>
           <div class="text-xs text-gray-500 mb-4">模型预测 vs 实际流失（测试集验证）</div>
 
-          <div class="conf-row" v-for="item in [
-            { label: '整体准确率', val: (overview ? 86.2 : 0), color: '#a5b4fc' },
-            { label: '召回率（识别流失）', val: (businessSummary ? (businessSummary.model_recall * 100) : 0), color: '#86efac' },
-            { label: '精确率', val: 72.1, color: '#a5b4fc' },
-            { label: 'F1 分数', val: 78.4, color: '#a5b4fc' },
-          ]" :key="item.label">
-            <div class="conf-label">{{ item.label }}</div>
-            <div class="conf-bar">
-              <div class="conf-fill" :style="{ width: item.val + '%', background: 'linear-gradient(90deg, #6366f1, #a855f7)' }"></div>
+          <template v-if="confRows.length">
+            <div class="conf-row" v-for="item in confRows" :key="item.label">
+              <div class="conf-label">{{ item.label }}</div>
+              <div class="conf-bar">
+                <div class="conf-fill" :style="{ width: Math.min(item.val, 100) + '%', background: 'linear-gradient(90deg, #6366f1, #a855f7)' }"></div>
+              </div>
+              <div class="conf-val" style="color:#a5b4fc">{{ item.val.toFixed(1) }}%</div>
             </div>
-            <div class="conf-val" :style="{ color: item.color }">{{ item.val.toFixed(1) }}%</div>
-          </div>
+          </template>
+          <div v-else class="text-xs text-gray-600 py-4">模型指标不可用（尚未训练）</div>
 
           <div class="model-status">
             <span style="color:#86efac">✅ 模型状态：健康</span>
-            <span class="text-xs text-gray-500 mt-1">上次重训练: 今日 · AUC 稳定</span>
+            <span v-if="modelMetrics" class="text-xs text-gray-500 mt-1">
+              AUC {{ modelMetrics.auc?.toFixed(4) }} · 5 折 CV {{ modelMetrics.cv_auc_mean?.toFixed(4) }} ± {{ modelMetrics.cv_auc_std?.toFixed(4) }}
+            </span>
+            <span v-else class="text-xs text-gray-500 mt-1">暂无指标</span>
           </div>
         </div>
 
         <!-- Intervention ROI -->
         <div class="glass-card p-5">
-          <div class="section-title">💰 干预效果追踪</div>
+          <div class="section-title">💰 干预效果追踪 <span class="badge badge-demo">⚠ 示例数据</span></div>
           <div ref="roiChart" class="chart-box-sm"></div>
+          <p class="demo-note">ROI 趋势无时间维度数据支撑，为固定示意值；下方三项统计为真实计算值。</p>
           <div class="roi-stats">
             <div class="roi-stat">
               <div class="roi-val" style="color:#86efac">¥{{ recoverable }}万</div>
@@ -464,6 +514,12 @@ function showOrderToast(msg) {
               <div class="roi-label">投资回报率</div>
             </div>
           </div>
+          <p class="demo-note">
+            口径说明：ROI 分母为估算人工成本（非真实工单结算）；损失基于数据集
+            <b class="text-gray-400">历史流失标签</b>（exited=1）与
+            平均客单价 ¥{{ businessSummary?.avg_customer_value?.toLocaleString() || '—' }} 的假设值折算，
+            是历史口径的推算，不是对未来的预测。
+          </p>
         </div>
       </div>
 
@@ -471,7 +527,7 @@ function showOrderToast(msg) {
       <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
         <div class="bottom-card">
           <div class="bottom-num" style="color:#fca5a5">¥{{ lossAmount }}万</div>
-          <div class="bottom-label">年度预估流失损失</div>
+          <div class="bottom-label">年流失损失（历史口径）</div>
         </div>
         <div class="bottom-card">
           <div class="bottom-num" style="color:#86efac">¥{{ recoverable }}万</div>
@@ -509,7 +565,7 @@ function showOrderToast(msg) {
           <div class="form-group">
             <label>风险等级</label>
             <select v-model="orderForm.risk_level">
-              <option value="CRITICAL">🔴 紧急 CRITICAL</option>
+              <option value="CRITICAL">🔴 极高 CRITICAL</option>
               <option value="HIGH">🟠 高危 HIGH</option>
               <option value="MEDIUM">🟡 中等 MEDIUM</option>
               <option value="LOW">🟢 低风险 LOW</option>
@@ -532,18 +588,25 @@ function showOrderToast(msg) {
             <input v-model="orderForm.assignee" placeholder="输入负责人姓名" />
           </div>
           <div class="form-group" style="grid-column: 1 / -1">
-            <label>推荐策略</label>
-            <select v-model="orderForm.strategy">
-              <option value="">-- 选择干预策略 --</option>
-              <option>专属客户经理一对一挽留</option>
-              <option>定制化产品优惠方案</option>
-              <option>VIP费率优惠</option>
-              <option>主动外呼关怀</option>
-              <option>产品升级推荐</option>
-              <option>满意度回访</option>
-              <option>积分奖励计划</option>
-              <option>定期营销推送</option>
+            <label>触达渠道</label>
+            <!-- 预填后端推荐值（由价值层硬定）；改选须填原因，后端亦会校验 -->
+            <select v-model="orderForm.channel">
+              <option value="relationship">客户经理 1 对 1</option>
+              <option value="outbound">主动外呼</option>
+              <option value="automated">APP 推送 / 短信</option>
             </select>
+            <p v-if="orderChannelOverridden" class="text-xs text-amber-400 mt-1">
+              ⚠ 已偏离该价值层的推荐渠道（{{ channelLabel(orderRecommendedChannel) }}），需填写原因
+            </p>
+          </div>
+          <div v-if="orderChannelOverridden" class="form-group" style="grid-column: 1 / -1">
+            <label>覆盖原因 <span class="text-red-400">*</span></label>
+            <textarea v-model="orderForm.override_reason" rows="2"
+                      placeholder="例如：客户在本行资产为 0，但他行有高净值，主管特批"></textarea>
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1">
+            <label>推荐动作（后端统一策略）</label>
+            <input :value="orderForm.strategy || '—'" readonly class="readonly" />
           </div>
           <div class="form-group" style="grid-column: 1 / -1">
             <label>备注</label>
@@ -600,6 +663,13 @@ function showOrderToast(msg) {
   font-size: 10px; padding: 2px 10px; border-radius: 20px;
   background: rgba(99,102,241,0.12); color: #a5b4fc;
 }
+.badge-demo {
+  background: rgba(251,191,36,0.14); color: #fbbf24;
+  border: 1px solid rgba(251,191,36,0.3);
+}
+.demo-note {
+  font-size: 10.5px; color: #b45309; margin-top: 8px; line-height: 1.5;
+}
 .view-all-link {
   font-size: 11px; color: #a5b4fc; text-decoration: none;
   padding: 2px 12px; border-radius: 20px; border: 1px solid rgba(99,102,241,0.3);
@@ -638,14 +708,9 @@ function showOrderToast(msg) {
 .cust-name { color: #fff; font-weight: 500; font-size: 13px; }
 .cust-id { color: #6b7280; font-size: 11px; }
 
-.risk-badge {
-  display: inline-block; padding: 2px 10px; border-radius: 20px;
-  font-size: 11px; font-weight: 600;
-}
-.risk-critical { background: rgba(239,68,68,0.15); color: #fca5a5; }
-.risk-high { background: rgba(245,158,11,0.15); color: #fdba74; }
-.risk-medium { background: rgba(132,204,22,0.15); color: #bef264; }
-.risk-low { background: rgba(34,197,94,0.15); color: #86efac; }
+/* .risk-badge / .risk-* 已移至 style.css（全局）。
+   注意：scoped 选择器带 [data-v-*] 属性，特异性高于全局同名类，若在此保留
+   会静默覆盖全局配色 —— 这正是原先四个视图等级颜色不一致的成因。 */
 
 .prob-cell { display: flex; align-items: center; gap: 8px; }
 .prob-bar { width: 60px; height: 5px; background: rgba(255,255,255,0.05); border-radius: 3px; overflow: hidden; }

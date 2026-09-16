@@ -17,7 +17,9 @@ const navItems = [
   { path: '/work-orders', title: '工单管理', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
 ]
 
-const isActive = (path) => route.path === path
+// 客户详情(/customers/:id)属于客户管理，父级也应保持高亮 ——
+// 否则点进详情后侧边栏「客户管理」失去选中态，像是离开了这个模块。
+const isActive = (path) => route.path === path || route.path.startsWith(path + '/')
 
 const navigateTo = (path) => {
   router.push(path)

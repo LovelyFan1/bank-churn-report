@@ -29,6 +29,10 @@
           @click="setFilter(f.key)"
         >{{ f.label }}</button>
         <span class="flex-1"></span>
+        <select v-model="assigneeFilter" class="select" @change="onFilterChange">
+          <option value="">全部负责人</option>
+          <option v-for="a in assignees" :key="a" :value="a">{{ a }}</option>
+        </select>
         <input
           v-model="searchText"
           placeholder="搜索客户姓名 / 编号..."
@@ -46,6 +50,8 @@
               <th>客户</th>
               <th>风险等级</th>
               <th>流失概率</th>
+              <th>触达渠道</th>
+              <th>期望价值</th>
               <th>工单状态</th>
               <th>负责人</th>
               <th>创建时间</th>
@@ -54,7 +60,7 @@
           </thead>
           <tbody>
             <tr v-if="orders.length === 0">
-              <td colspan="7" class="text-center py-16 text-gray-500">
+              <td colspan="9" class="text-center py-16 text-gray-500">
                 <div class="text-4xl mb-2">📭</div>
                 <p>暂无工单数据</p>
               </td>
@@ -72,14 +78,22 @@
                     </div>
                   </div>
                 </td>
-                <td><span class="badge" :class="riskBadgeClass(o.risk_level)">{{ riskLabel(o.risk_level) }}</span></td>
+                <td><span class="risk-badge" :class="riskBadgeClass(o.risk_level)">{{ riskLabel(o.risk_level) }}</span></td>
                 <td>
                   <div class="flex items-center gap-2">
                     <div class="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
-                      <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(o.probability), background: probColor(o.probability) }"></div>
+                      <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(o.probability), background: probColor(o.probability, o.thresholds_snapshot) }"></div>
                     </div>
-                    <span class="text-xs font-semibold" :style="{ color: probColor(o.probability) }">{{ fmtPercent(o.probability) }}</span>
+                    <span class="text-xs font-semibold" :style="{ color: probColor(o.probability, o.thresholds_snapshot) }">{{ fmtPercent(o.probability) }}</span>
                   </div>
+                </td>
+                <td>
+                  <!-- 渠道由价值层硬定，覆盖过的标出来（覆盖原因见展开详情） -->
+                  <span class="text-xs text-gray-300">{{ o.channel ? channelLabel(o.channel) : '—' }}</span>
+                  <span v-if="o.channel_overridden" class="text-amber-400 ml-1 text-xs" title="人工覆盖了推荐渠道">⚠</span>
+                </td>
+                <td class="tabular-nums text-emerald-400 text-xs">
+                  {{ o.expected_value_snapshot != null ? fmtWan(o.expected_value_snapshot) : '—' }}
                 </td>
                 <td>
                   <span class="status-tag" :class="o.status">
@@ -95,7 +109,7 @@
               </tr>
               <!-- Detail Panel -->
               <tr v-if="expandedId === o.id">
-                <td colspan="7" class="p-0">
+                <td colspan="9" class="p-0">
                   <div class="detail-panel">
                     <div class="grid grid-cols-2 gap-4">
                       <div><dt>风险因素</dt><dd><span v-for="f in o.risk_factors" :key="f" class="risk-tag">{{ f }}</span></dd></div>
@@ -104,6 +118,40 @@
                       <div><dt>处理结果</dt><dd>{{ o.result === 'retained' ? '✅ 已挽留' : o.result === 'lost' ? '❌ 已流失' : '—' }}</dd></div>
                       <div><dt>更新时间</dt><dd class="text-gray-400">{{ fmtDate(o.updated_at) }}</dd></div>
                       <div><dt>完成时间</dt><dd class="text-gray-400">{{ fmtDate(o.completed_at) || '—' }}</dd></div>
+                      <!-- 快照溯源：等级是建单时按当时那套阈值判的，不随模型重训改变 -->
+                      <div style="grid-column: 1 / -1">
+                        <dt>分级依据（建单时快照）</dt>
+                        <dd v-if="o.thresholds_snapshot" class="text-gray-400">
+                          {{ o.model_used || '—' }} ·
+                          极高≥{{ fmtPercent(o.thresholds_snapshot.critical) }} ·
+                          高危≥{{ fmtPercent(o.thresholds_snapshot.high) }} ·
+                          中等≥{{ fmtPercent(o.thresholds_snapshot.medium) }}
+                        </dd>
+                        <dd v-else class="text-gray-600">该工单创建于快照功能上线前，无留存依据</dd>
+                      </div>
+                      <!-- 价值层快照：与等级快照配套 —— 价值层边界同样是被调整的业务假设 -->
+                      <div style="grid-column: 1 / -1">
+                        <dt>价值层（建单时快照）</dt>
+                        <dd v-if="o.value_tier_snapshot" class="text-gray-400">
+                          {{ valueTierLabel(o.value_tier_snapshot) }} ·
+                          期望价值 ¥{{ Math.round(o.expected_value_snapshot || 0).toLocaleString() }}
+                        </dd>
+                        <dd v-else class="text-gray-600">该工单创建于快照功能上线前，无留存依据</dd>
+                      </div>
+                      <!-- 触达渠道与覆盖留痕 —— 渠道由价值层硬定，偏离需留原因 -->
+                      <div style="grid-column: 1 / -1">
+                        <dt>触达渠道</dt>
+                        <dd class="text-gray-400">
+                          {{ o.channel ? channelLabel(o.channel) : '—' }}
+                          <span v-if="o.channel_overridden" class="text-amber-400 ml-2">
+                            ⚠ 人工覆盖
+                          </span>
+                        </dd>
+                        <dd v-if="o.channel_overridden && o.override_reason"
+                            class="text-xs text-gray-500 mt-1">
+                          覆盖原因：{{ o.override_reason }}
+                        </dd>
+                      </div>
                     </div>
                     <div class="flex gap-2 mt-4">
                       <button v-if="o.status === 'pending'" class="btn btn-sm" style="background:#1d4ed8;color:#fff" @click="changeStatus(o, 'in_progress')">▶ 开始处理</button>
@@ -151,7 +199,7 @@
             <div class="form-group">
               <label>风险等级</label>
               <select v-model="form.risk_level">
-                <option value="CRITICAL">🔴 紧急 CRITICAL</option>
+                <option value="CRITICAL">🔴 极高 CRITICAL</option>
                 <option value="HIGH">🟠 高危 HIGH</option>
                 <option value="MEDIUM">🟡 中等 MEDIUM</option>
                 <option value="LOW">🟢 低风险 LOW</option>
@@ -208,6 +256,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import api from '../api'
+import { riskLabel, riskBadgeClass, riskColor, probColor, fmtPercent, valueTierLabel, channelLabel, fmtWan } from '../utils/risk'
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
@@ -215,6 +264,9 @@ const orders = ref([])
 const stats = reactive({ total: 0, pending: 0, in_progress: 0, completed: 0, lost: 0 })
 const currentFilter = ref('all')
 const searchText = ref('')
+// 按负责人筛选 —— 组长看「小李手上有多少单」用得到
+const assigneeFilter = ref('')
+const assignees = ref([])
 const page = ref(1)
 const totalPages = ref(1)
 const expandedId = ref(null)
@@ -224,7 +276,11 @@ const editingId = ref(null)
 const form = reactive({
   customer_id: '', customer_name: '', geography: '',
   risk_level: 'MEDIUM', probability: 0, balance: 0,
-  risk_factors: [], strategy: '', assignee: '', note: ''
+  risk_factors: [], strategy: '', assignee: '', note: '',
+  // 阈值快照 —— 建单时固化分级依据（后端在缺省时也会兜底补齐）
+  thresholds_snapshot: null, model_used: null,
+  // 价值层快照 —— 与 risk_level 快照配套
+  value_tier_snapshot: null, expected_value_snapshot: null,
 })
 
 const toastMsg = ref('')
@@ -248,31 +304,12 @@ const filters = [
 ]
 
 // ── Methods ─────────────────────────────────────────
-function riskColor(level) {
-  const m = { CRITICAL: '#ef4444', HIGH: '#f97316', MEDIUM: '#eab308', LOW: '#22d3ee' }
-  return m[level] || '#94a3b8'
-}
-function riskLabel(level) {
-  const m = { CRITICAL: '紧急', HIGH: '高危', MEDIUM: '中等', LOW: '低风险' }
-  return m[level] || level
-}
-function riskBadgeClass(level) {
-  return 'badge-' + (level || 'medium').toLowerCase()
-}
+// riskLabel / riskBadgeClass / riskColor / probColor / fmtPercent
+// 已抽到 src/utils/risk.js —— 全局唯一口径。
+// 注意 riskColor 现在由 utils 提供，调用点不再用本地定义。
 function statusLabel(s) {
   const m = { pending: '待处理', in_progress: '处理中', completed: '已完成', lost: '已流失' }
   return m[s] || s
-}
-function probColor(p) {
-  if (!p) return '#94a3b8'
-  if (p >= 0.7) return '#ef4444'
-  if (p >= 0.3) return '#f97316'
-  if (p >= 0.1) return '#eab308'
-  return '#22d3ee'
-}
-function fmtPercent(p) {
-  if (p == null) return '0%'
-  return (p * 100).toFixed(1) + '%'
 }
 function fmtDate(d) {
   if (!d) return ''
@@ -282,6 +319,12 @@ function fmtDate(d) {
 
 function setFilter(f) {
   currentFilter.value = f
+  page.value = 1
+  fetchOrders()
+}
+
+/** 下拉类筛选变更：重置到第一页再查 */
+function onFilterChange() {
   page.value = 1
   fetchOrders()
 }
@@ -314,6 +357,11 @@ function openEdit(o) {
     strategy: o.strategy || '',
     assignee: o.assignee || '',
     note: o.note || '',
+    // 编辑不走创建分支，清空以免残留上一次新建时的快照被误提交
+    thresholds_snapshot: null,
+    model_used: null,
+    value_tier_snapshot: null,
+    expected_value_snapshot: null,
   })
   modalOpen.value = true
 }
@@ -330,6 +378,10 @@ function resetForm(preset) {
     strategy: preset?.strategy || '',
     assignee: '',
     note: '',
+    thresholds_snapshot: preset?.thresholds_snapshot || null,
+    model_used: preset?.model_used || null,
+    value_tier_snapshot: preset?.value_tier_snapshot || null,
+    expected_value_snapshot: preset?.expected_value_snapshot ?? null,
   })
 }
 
@@ -393,6 +445,7 @@ async function fetchStats() {
   try {
     const { data } = await api.get('/work-orders/stats')
     Object.assign(stats, data)
+    assignees.value = data.assignees || []
   } catch (_) {}
 }
 
@@ -400,6 +453,7 @@ async function fetchOrders() {
   try {
     const params = { page: page.value, page_size: 20 }
     if (currentFilter.value !== 'all') params.status = currentFilter.value
+    if (assigneeFilter.value) params.assignee = assigneeFilter.value
     if (searchText.value) params.search = searchText.value
     const { data } = await api.get('/work-orders', { params })
     orders.value = data.items
@@ -449,13 +503,7 @@ defineExpose({ openCreate })
 .btn-xs { padding: 4px 10px; font-size: 11px; border-radius: 5px; }
 
 /* ── Search ── */
-.search-input {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
-  border-radius: 10px; padding: 8px 14px; color: #e2e8f0; font-size: 13px;
-  width: 220px; outline: none; transition: .2s;
-}
-.search-input:focus { border-color: #6366f1; }
-.search-input::placeholder { color: #64748b; }
+/* .search-input 已全局化到 style.css（原先两个页面各写一份，宽度还不一致） */
 
 /* ── Table ── */
 table { width: 100%; border-collapse: collapse; }
@@ -471,14 +519,8 @@ tbody td {
 tbody tr { transition: .15s; }
 tbody tr:hover { background: rgba(255,255,255,.02); }
 
-/* ── Badge ── */
-.badge {
-  display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600;
-}
-.badge-critical { background: rgba(239,68,68,.15); color: #f87171; }
-.badge-high     { background: rgba(249,115,22,.15); color: #fb923c; }
-.badge-medium   { background: rgba(250,204,21,.12); color: #facc15; }
-.badge-low      { background: rgba(34,211,238,.12); color: #22d3ee; }
+/* ── 徽章 ──
+   .risk-badge / .risk-* 已移至 style.css（全局），类名由 utils/risk.js 生成。 */
 
 /* ── Status ── */
 .status-tag {
@@ -496,10 +538,7 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 .status-dot.lost        { background: #f87171; }
 
 /* ── Risk tags ── */
-.risk-tag {
-  font-size: 11px; padding: 2px 7px; border-radius: 4px;
-  background: rgba(248,113,113,.1); color: #f87171; margin-right: 3px;
-}
+/* .risk-tag 已全局化到 style.css（原先三个视图各写一份，内容不一致） */
 
 /* ── Detail Panel ── */
 .detail-panel {

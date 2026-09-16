@@ -42,32 +42,6 @@ def _load_best_model():
     return joblib.load(model_path), best_name
 
 
-FACTOR_STRATEGY_MAP = [
-    (["投诉记录", "投诉"], "专属客户经理一对一挽留"),
-    (["产品数", "产品超载", "产品"], "产品整合推荐"),
-    (["余额", "余额为零"], "专属费率激活"),
-    (["活跃", "活跃状态", "非活跃"], "主动外呼关怀"),
-    (["满意度"], "满意度回访"),
-    (["信用"], "定制化产品优惠方案"),
-    (["在网时长"], "VIP费率优惠"),
-    (["年龄", "高龄"], "定期回访关怀"),
-    (["地区", "德国"], "定制化挽留方案"),
-    (["积分"], "积分奖励计划"),
-]
-
-
-def _recommend_strategy(risk_factors: list) -> str:
-    """根据风险因素推荐最优先的干预策略"""
-    if not risk_factors:
-        return ""
-    for keywords, strategy in FACTOR_STRATEGY_MAP:
-        for factor in risk_factors:
-            for kw in keywords:
-                if kw in factor:
-                    return strategy
-    return "满意度回访"  # 默认
-
-
 SHAP_FEATURE_LABELS = {
     "satisfaction_score": "满意度评分",
     "num_products": "持有产品数",
@@ -83,16 +57,6 @@ SHAP_FEATURE_LABELS = {
     "gender": "性别",
     "complain": "投诉记录",
 }
-
-
-def _risk_level(prob: float) -> str:
-    if prob >= 0.7:
-        return "CRITICAL"
-    elif prob >= 0.3:
-        return "HIGH"
-    elif prob >= 0.1:
-        return "MEDIUM"
-    return "LOW"
 
 
 def _risk_factors(c: Customer) -> list:
@@ -164,19 +128,23 @@ def batch_score_task(self, top_n: int = 100) -> dict:
 
                 # 保留 Top N（记录 + 特征向量，稍后用 SHAP 归因）
                 row = chunk.iloc[i]
+                bal = round(float(row["balance"]), 2)
                 record = {
                     "id": int(row["id"]),
                     "customer_id": str(row["customer_id"]),
                     "surname": str(row["surname"]),
                     "geography": str(row["geography"]),
                     "age": int(row["age"]),
-                    "balance": round(float(row["balance"]), 2),
+                    "balance": bal,
                     "estimated_salary": round(float(row["estimated_salary"]), 2),
                     "num_products": int(row["num_products"]),
                     "is_active_member": int(row["is_active_member"]),
                     "complain": int(row["complain"]),
                     "probability": round(prob, 4),
                     "risk_level": level,
+                    # 期望价值维度 —— 见下方排序说明
+                    "value_tier": risk_scoring.value_tier(bal),
+                    "expected_value": risk_scoring.expected_value(prob, bal),
                 }
                 top_records.append((prob, record, X[i]))
 
@@ -188,8 +156,17 @@ def batch_score_task(self, top_n: int = 100) -> dict:
                 "processed": processed,
             })
 
-        # Top N 排序
-        top_records.sort(key=lambda x: x[0], reverse=True)
+        # ── Top N 排序：按期望价值 ──
+        # 本任务已对**全量**客户打分（上面的循环遍历了每一行），候选集就是全体，
+        # 因此无需截断。实测：任何按概率预先截断的池子都会漏掉真正的 EV 头部 ——
+        # EV Top10 的概率在 0.97~0.99，在概率榜上排在 100~700 名，
+        # 3 倍池命中 0/10，50 倍池才 6/10，只有全量池是 10/10。
+        #
+        # 排序键用期望价值而非概率：概率在 0.97 以上已无区分度（500 个 CRITICAL
+        # 客户全挤在 1.0 附近），此时余额是唯一能拉开差距的维度。实测按概率取
+        # Top10 有 4 人余额为 0（打电话也无资产可留），按 EV 取则余额合计为前者
+        # 的 3.35 倍。
+        top_records.sort(key=lambda x: x[1]["expected_value"], reverse=True)
         top_n_records = top_records[:top_n]
 
         # ── SHAP 归因：为 Top N 客户生成带贡献度的风险因素 ──
@@ -247,7 +224,7 @@ def _enrich_with_shap(model, top_records: list) -> None:
                 for f, v in pairs[:6]
                 if abs(v) > 0.003  # 过滤贡献极小的特征
             ]
-            record["strategy"] = _recommend_strategy(record["risk_factors"])
+            _apply_strategy(record)
 
     except Exception:
         # 回退：模型不支持 TreeExplainer（如 LogisticRegression），用硬阈值
@@ -255,7 +232,22 @@ def _enrich_with_shap(model, top_records: list) -> None:
         traceback.print_exc()
         for prob, record, _ in top_records:
             record["risk_factors"] = _risk_factors_from_row(record)
-            record["strategy"] = _recommend_strategy(record["risk_factors"])
+            _apply_strategy(record)
+
+
+def _apply_strategy(record: dict) -> None:
+    """就地写入策略三字段 —— 渠道/动作/理由，全部来自 risk_scoring 的唯一来源。
+
+    必须在 record 已带 value_tier 与 risk_level 之后调用。
+    """
+    rec = risk_scoring.recommend_action(
+        record.get("value_tier"), record.get("risk_level"), record.get("risk_factors")
+    )
+    record["channel"] = rec["channel"]
+    # strategy 保留旧名，语义等同 action；建单弹窗仍读它
+    record["strategy"] = rec["action"]
+    record["action"] = rec["action"]
+    record["reason"] = rec["reason"]
 
 
 def _risk_factors_from_row(row) -> list:
@@ -280,41 +272,3 @@ def _risk_factors_from_row(row) -> list:
     if row.get("tenure", 99) <= 2:
         factors.append(f"在网时长较短（{int(row['tenure'])} 年）")
     return factors
-
-
-# ── 单条预测（同步，但走独立函数方便复用）───────────────
-
-def predict_single_sync(customer_data: dict) -> dict:
-    """单客户预测 — 同步版本，供 API 直接调用（轻量，不需要走 Celery）。"""
-    model, best_name = _load_best_model()
-    if model is None:
-        return {"error": "模型尚未训练，请先调用 train 接口"}
-
-    features = np.array([[
-        customer_data.get("credit_score", 650),
-        customer_data.get("age", 39),
-        customer_data.get("tenure", 5),
-        customer_data.get("balance", 76000),
-        customer_data.get("num_products", 2),
-        customer_data.get("has_credit_card", 1),
-        customer_data.get("is_active_member", 1),
-        customer_data.get("estimated_salary", 100000),
-        customer_data.get("satisfaction_score", 3),
-        customer_data.get("points_earned", 500),
-        GEOGRAPHY_MAP.get(customer_data.get("geography", "France"), 0),
-        GENDER_MAP.get(customer_data.get("gender", "Male"), 0),
-    ]])
-
-    prediction = int(model.predict(features)[0])
-    probability = float(model.predict_proba(features)[0][1])
-    level = _risk_level(probability)
-
-    risk_color = {"CRITICAL": "#ff4444", "HIGH": "#ffaa00", "MEDIUM": "#ffdd00", "LOW": "#44ff44"}[level]
-
-    return {
-        "prediction": prediction,
-        "probability": round(probability, 4),
-        "risk_level": level,
-        "risk_color": risk_color,
-        "model_used": best_name,
-    }

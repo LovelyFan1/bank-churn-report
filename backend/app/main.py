@@ -9,7 +9,7 @@ from app.database import engine, Base, get_db
 from app.models.customer import Customer
 from app.models.work_order import WorkOrder
 from app.services.data_generator import get_data_generator
-from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers
+from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers, portfolio
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -33,6 +33,7 @@ app.include_router(models.router)        # /api/model/*
 app.include_router(cost_benefit.router)  # /api/cost-benefit/*
 app.include_router(work_orders.router)  # /api/work-orders/*
 app.include_router(customers.router)   # /api/customers/*
+app.include_router(portfolio.router)   # /api/portfolio/* — 价值层 × 风险等级矩阵
 
 # 允许查询的字段列表
 ALLOWED_FIELDS = [

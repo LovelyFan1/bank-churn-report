@@ -1,15 +1,26 @@
 <script setup>
-import { ref, shallowRef, onBeforeUnmount } from 'vue'
+import { ref, shallowRef, onMounted, onBeforeUnmount } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
+import { riskLabel, probColor, LEGACY_THRESHOLDS } from '../utils/risk'
 
 const loading = ref(false)
 const predicting = ref(false)
 const result = ref(null)
 const shapResult = ref(null)
+// 风险分级阈值 —— 与其余页面同源（GET /api/model/risk-info），
+// 仪表盘的色带必须用它，否则会出现「指针在绿区、徽章写高危」。
+const thresholds = ref(LEGACY_THRESHOLDS)
 const gaugeChart = shallowRef(null)
 const chartInstances = []
 let gaugeInstance = null
+
+onMounted(async () => {
+  try {
+    const { data } = await api.get('/model/risk-info')
+    if (data?.thresholds) thresholds.value = data.thresholds
+  } catch (_) { /* 引擎未就绪时沿用 LEGACY_THRESHOLDS */ }
+})
 
 const LABELS = {
   credit_score: '信用评分', geography: '地区', gender: '性别',
@@ -59,7 +70,8 @@ function updateGauge(probability) {
     window.addEventListener('resize', handleResize)
   }
   const chart = gaugeInstance
-  const color = probability >= 0.7 ? '#ef4444' : probability >= 0.3 ? '#f59e0b' : '#22c55e'
+  const t = thresholds.value
+  const color = probColor(probability, t)
 
   chart.setOption({
     series: [{
@@ -70,13 +82,14 @@ function updateGauge(probability) {
       max: 1,
       splitNumber: 5,
       radius: '90%',
+      // 色带边界 = 后端的 L/M/H/C 阈值（P35/P70/P95），与等级判定同源
       axisLine: {
         lineStyle: {
           width: 16,
           color: [
-            [0.1, '#22c55e'],
-            [0.3, '#84cc16'],
-            [0.7, '#f59e0b'],
+            [t.medium, '#22d3ee'],
+            [t.high, '#facc15'],
+            [t.critical, '#fb923c'],
             [1, '#ef4444']
           ]
         }
@@ -103,7 +116,7 @@ const riskColors = {
   CRITICAL: { bg: 'bg-red-500/15', border: 'border-red-500/30', text: 'text-red-400' },
   HIGH: { bg: 'bg-orange-500/15', border: 'border-orange-500/30', text: 'text-orange-400' },
   MEDIUM: { bg: 'bg-yellow-500/15', border: 'border-yellow-500/30', text: 'text-yellow-400' },
-  LOW: { bg: 'bg-green-500/15', border: 'border-green-500/30', text: 'text-green-400' },
+  LOW: { bg: 'bg-cyan-500/15', border: 'border-cyan-500/30', text: 'text-cyan-400' },
 }
 
 function handleResize() {
@@ -133,37 +146,37 @@ onBeforeUnmount(() => {
           <div>
             <label class="block text-xs text-gray-500 mb-1">信用评分</label>
             <input v-model.number="form.credit_score" type="number"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">年龄</label>
             <input v-model.number="form.age" type="number"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">任期(年)</label>
             <input v-model.number="form.tenure" type="number"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">余额</label>
             <input v-model.number="form.balance" type="number"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">产品数量</label>
             <input v-model.number="form.num_products" type="number" min="1" max="4"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">预估薪资</label>
             <input v-model.number="form.estimated_salary" type="number"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">地区</label>
             <select v-model="form.geography"
-                    class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none">
+                    class="select w-full">
               <option value="France">France (法国)</option>
               <option value="Germany">Germany (德国)</option>
               <option value="Spain">Spain (西班牙)</option>
@@ -172,7 +185,7 @@ onBeforeUnmount(() => {
           <div>
             <label class="block text-xs text-gray-500 mb-1">性别</label>
             <select v-model="form.gender"
-                    class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none">
+                    class="select w-full">
               <option value="Male">Male (男)</option>
               <option value="Female">Female (女)</option>
             </select>
@@ -180,7 +193,7 @@ onBeforeUnmount(() => {
           <div>
             <label class="block text-xs text-gray-500 mb-1">是否有信用卡</label>
             <select v-model.number="form.has_credit_card"
-                    class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none">
+                    class="select w-full">
               <option :value="1">是</option>
               <option :value="0">否</option>
             </select>
@@ -188,7 +201,7 @@ onBeforeUnmount(() => {
           <div>
             <label class="block text-xs text-gray-500 mb-1">是否活跃会员</label>
             <select v-model.number="form.is_active_member"
-                    class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none">
+                    class="select w-full">
               <option :value="1">是</option>
               <option :value="0">否</option>
             </select>
@@ -196,12 +209,12 @@ onBeforeUnmount(() => {
           <div>
             <label class="block text-xs text-gray-500 mb-1">满意度评分</label>
             <input v-model.number="form.satisfaction_score" type="number" min="1" max="5"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
           <div>
             <label class="block text-xs text-gray-500 mb-1">积分</label>
             <input v-model.number="form.points_earned" type="number"
-                   class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:border-indigo-500 focus:outline-none" />
+                   class="input w-full" />
           </div>
         </div>
 
@@ -228,7 +241,8 @@ onBeforeUnmount(() => {
             <div class="flex items-center justify-between">
               <span class="text-sm text-gray-400">风险等级</span>
               <span class="text-lg font-bold" :class="riskColors[result.risk_level]?.text">
-                {{ result.risk_level }}
+                {{ riskLabel(result.risk_level) }}
+                <span class="text-xs font-normal text-gray-500 ml-1">{{ result.risk_level }}</span>
               </span>
             </div>
             <div class="flex items-center justify-between mt-2">
