@@ -19,6 +19,24 @@ class Settings(BaseSettings):
     NUM_CUSTOMERS: int = 10000
     CHURN_RATE: float = 0.2037
 
+    # ── 数据来源（第四个独立配置，决定系统启动时灌哪份数据）──────
+    #
+    # "generator" = 用 data_generator 现算合成数据（默认；无条件可跑，
+    #               不依赖任何外部文件，适合离线/演示兜底）
+    # "csv"       = 从 DATA_CSV_PATH 读一份 external CSV（标定数据 10 万条）
+    #
+    # 换成 csv 前必须知道的两件事：
+    #   1) 客户编号会在两套数据间**完全重叠但指向不同的人**
+    #      （都是 C000001~C0xxxxx，但不是同一批客户）。所以切换数据源时
+    #      必须清空 customers 表，否则会出现「同一 ID 两套记录混在一起」。
+    #   2) 已有的 work_orders 会因客户被换掉而变成悬空引用
+    #      （工单上写着张三，点进去是李四）。startup 会检查并报警。
+    DATA_SOURCE: str = "generator"
+    DATA_CSV_PATH: str = ""
+    # CSV 导出的列若多于 Customer 模型，只取模型认识的列（其余忽略）；
+    # 若少于模型所需，缺的列填空。两条都不会报错 —— 但会在日志里说明。
+    DATA_SOURCE_NAME: str = ""
+
     # CORS
     CORS_ORIGINS: list = ["http://localhost:5173", "http://localhost:3000"]
 

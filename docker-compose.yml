@@ -34,9 +34,23 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - CORS_ORIGINS=["http://localhost:5173","http://localhost:3000","http://192.168.1.12:5173","http://192.168.1.12:8000"]
+      # ── 数据来源 ────────────────────────────────────────────
+      # generator = 启动时现算合成数据（默认，不依赖外部文件）
+      # csv       = 读挂载进来的标定数据（customers_simulated.csv，10 万客户）
+      #
+      # ⚠ 切换数据源前必须清空 customers 表：两套数据的 customer_id
+      #   完全重叠（都是 C000001~）但指向不同的人，叠加会出现
+      #   「同一编号两套记录」，且不会报任何错。
+      #   清空命令见 README 或：docker exec churn-backend python -c "..."
+      - DATA_SOURCE=${DATA_SOURCE:-csv}
+      - DATA_CSV_PATH=/data-source/customers_simulated.csv
     volumes:
       - ./backend:/app
       - backend_data:/app/data
+      # 外部数据源，只读挂载。目录不存在时 compose 会建一个空目录，
+      # 此时 DATA_SOURCE=csv 会在启动时报「文件不存在」并退出 —— 这是
+      # 刻意的：静默回退到合成数据会让人误以为在用标定数据。
+      - ./../模拟仿真客户数据:/data-source:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -57,9 +71,14 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      # 与 backend 保持一致 —— Celery 训练/批量打分会读同一份配置，
+      # 两处不一致会导致「接口说在用标定数据、训练却在用合成数据」。
+      - DATA_SOURCE=${DATA_SOURCE:-csv}
+      - DATA_CSV_PATH=/data-source/customers_simulated.csv
     volumes:
       - ./backend:/app
       - backend_data:/app/data
+      - ./../模拟仿真客户数据:/data-source:ro
     depends_on:
       redis:
         condition: service_healthy

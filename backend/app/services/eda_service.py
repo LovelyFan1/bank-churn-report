@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sqlalchemy.orm import Session
 from app.models.customer import Customer
+from app.services.data_loader import get_cached_customer_df
 from typing import Dict, List, Any
 
 
@@ -10,33 +11,17 @@ class EDAService:
 
     def __init__(self, db: Session):
         self.db = db
-        self._df = None
 
     def _get_dataframe(self) -> pd.DataFrame:
-        if self._df is None:
-            customers = self.db.query(Customer).all()
-            self._df = pd.DataFrame([{
-                "row_number": c.row_number,
-                "customer_id": c.customer_id,
-                "credit_score": c.credit_score,
-                "geography": c.geography,
-                "gender": c.gender,
-                "age": c.age,
-                "tenure": c.tenure,
-                "balance": c.balance,
-                "num_products": c.num_products,
-                "has_credit_card": c.has_credit_card,
-                "is_active_member": c.is_active_member,
-                "estimated_salary": c.estimated_salary,
-                "exited": c.exited,
-                "complain": c.complain,
-                "satisfaction_score": c.satisfaction_score,
-                "card_type": c.card_type,
-                "points_earned": c.points_earned,
-                "age_group": c.age_group,
-                "balance_salary_ratio": c.balance_salary_ratio,
-            } for c in customers])
-        return self._df
+        """取全量客户 DataFrame —— 走进程级共享缓存。
+
+        此前是本类自己 `db.query(Customer).all()` 重建一份（10 万行实测 2.8 秒），
+        而 instance 由 `get_eda_service(db)` 每请求新建，self._df 缓存形同虚设。
+        改为共享 `data_loader` 的缓存后，与风险引擎读的是同一份数据。
+
+        ⚠ 返回的是共享对象，**调用方不得原地修改**（见 get_age_distribution）。
+        """
+        return get_cached_customer_df(self.db)
 
     def get_correlation_matrix(self) -> Dict[str, Any]:
         """计算相关性矩阵"""
@@ -112,12 +97,17 @@ class EDAService:
 
         bins = [0, 25, 35, 45, 55, 100]
         labels = ["18-25", "26-35", "36-45", "46-55", "56+"]
-        df["age_group"] = pd.cut(df["age"], bins=bins, labels=labels)
+        # ⚠ 此前写的是 `df["age_group"] = pd.cut(...)`，会**原地修改**传入的
+        # DataFrame。改为本地变量后，_get_dataframe() 才能安全地返回共享缓存
+        # —— 否则这个接口一被调用，就会把共享表的 age_group 列覆盖掉，
+        # 影响同时读这张表的 EDA 其他接口 / 成本收益 / 风险引擎。
+        age_group = pd.cut(df["age"], bins=bins, labels=labels)
 
-        result = df.groupby("age_group", observed=True).agg(
+        result = df.groupby(age_group, observed=True).agg(
             total=("exited", "count"),
             churned=("exited", "sum")
         ).reset_index()
+        result = result.rename(columns={"age": "age_group"})
 
         result["churn_rate"] = round(result["churned"] / result["total"] * 100, 2)
 

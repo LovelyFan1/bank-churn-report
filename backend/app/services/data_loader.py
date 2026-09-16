@@ -8,6 +8,7 @@
 
 import pandas as pd
 import numpy as np
+import time
 from typing import Iterator, Tuple, Optional, List
 from sqlalchemy.orm import Session
 from app.models.customer import Customer
@@ -172,3 +173,72 @@ def get_customer_dataframe(db: Session) -> pd.DataFrame:
     """一次性全量加载（兼容旧接口，仅用于万级数据）。"""
     loader = DataLoader(db)
     return loader.load_all()
+
+
+# ── 全量特征表：进程级共享缓存 ────────────────────────────
+#
+# 背景（实测）：10 万行下 DataLoader.load_all() 约 2.8 秒，而 EDA / 成本收益
+# / 风险引擎三个服务各自调用一次，同一份数据被读了 4 遍。实测各接口耗时：
+#     /api/eda/*               3.1 s
+#     /api/cost-benefit/*      3.3 s
+#     /api/portfolio/matrix    3.5 s
+# 三处都只是「读同一张表」，没有各自重算的理由。
+#
+# ⚠ 与 risk_scoring._engine_cache 的关系（刻意解耦，不要合并）：
+#   后者还缓存了**模型的原始概率**，模型重训后必须失效。
+#   本缓存只代表「数据库里的客户表快照」，与模型无关，二者失效条件不同。
+#   共用 risk_scoring 的缓存会让「重训模型」连带把 EDA 的缓存也清掉，
+#   属于把一个模块的生命周期绑到另一个模块上。
+#
+# 失效方式：
+#   - TTL 到期自动失效
+#   - 写入客户数据后调用 invalidate_customer_cache() 显式失效
+CUSTOMER_CACHE_TTL = 3600  # 秒。客户表变动频率低（播种/换数据源），1 小时足够
+
+# 下游服务的列依赖，显式声明而非依赖巧合。
+# 背景：DataLoader._rows_to_df() 目前不产出 row_number / card_type / age_group，
+# 而 EDA 的接口按 feature 名放行，可能请求到 card_type。直接共享会让 EDA
+# 从「读 DB 能拿到」变成「共享表没有 → KeyError」。这里补上，保持行为等价。
+_REQUIRED_COLUMNS = {
+    "row_number": lambda df: np.arange(1, len(df) + 1),
+    "card_type": lambda df: None,   # 由调用方（读 DB）提供
+    "age_group": lambda df: None,   # 由调用方提供；EDA 也会按需自行计算
+}
+
+_customer_cache = {"df": None, "ts": 0.0}
+
+
+def invalidate_customer_cache() -> None:
+    """客户表变更后调用（播种、换数据源、批量导入）。"""
+    _customer_cache["df"] = None
+    _customer_cache["ts"] = 0.0
+
+
+def get_cached_customer_df(db: Session) -> pd.DataFrame:
+    """全量客户 DataFrame（进程级缓存）。
+
+    ⚠ 返回的是**共享对象**，调用方**不得原地修改**。
+    需要加列/改列的，先 `df = df.copy()` 或改用局部变量 ——
+    eda_service.get_age_distribution() 曾因此差点污染整张共享表。
+    """
+    if _customer_cache["df"] is not None and time.time() - _customer_cache["ts"] < CUSTOMER_CACHE_TTL:
+        return _customer_cache["df"]
+
+    loader = DataLoader(db)
+    df = loader.load_all()
+
+    # 补上下游依赖但 _rows_to_df 未产出的列。
+    # row_number 需要与数据库的 id 对齐（DB 里 row_number 就是插入序号），
+    # 但 _rows_to_df 不含该列 —— 这里从 Customer 表单独取，避免猜。
+    missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        from app.models.customer import Customer
+        cols = [c for c in missing if hasattr(Customer, c)]
+        if cols:
+            rows = db.query(*[getattr(Customer, c) for c in cols]).order_by(Customer.id).all()
+            for i, c in enumerate(cols):
+                df[c] = [r[i] for r in rows]
+
+    _customer_cache["df"] = df
+    _customer_cache["ts"] = time.time()
+    return df

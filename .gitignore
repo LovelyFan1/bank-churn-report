@@ -9,6 +9,9 @@ build/
 
 # Saved models
 saved_models/
+# 换数据源时留下的模型备份（换回去用得上，但不该进仓库）
+saved_models.bak-*/
+*.joblib
 
 # Database
 *.db

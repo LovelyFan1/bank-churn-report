@@ -30,7 +30,7 @@ import numpy as np
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.services.data_loader import DataLoader, prepare_features
+from app.services.data_loader import prepare_features, get_cached_customer_df
 
 MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
@@ -43,6 +43,28 @@ P_HIGH = 70       # top 30%
 P_MEDIUM = 35     # top 65%
 
 CACHE_TTL = 600  # 秒
+
+# ⚠ 已知行为（预先存在，非本次改动引入）：模型重训后本模块的缓存不会立即失效。
+#   Celery worker 是**独立进程**，它写的 saved_models/ 与本进程的缓存互不可见，
+#   且 _best_model_cache 没有 TTL。故重训完成后最多需等 CACHE_TTL(10 分钟)
+#   才会用上新模型；期间界面显示的仍是旧模型的分级。
+#   若要立即生效：重启 backend 容器，或调用下方 reset_caches()。
+#   （本次性能改动**没有**触碰这段逻辑 —— 它涉及模型切换语义，属另一个话题。）
+
+
+def reset_caches() -> None:
+    """清空本进程的全部评分缓存，使下次请求重新加载模型、重新全量打分。
+
+    供「重训完成后需要立即生效」的场景调用。跨进程无法自动触发
+    （Celery worker 与 API 不是一个进程），故留作显式接口。
+    """
+    global _engine_cache, _scored_cache
+    _best_model_cache["name"] = None
+    _best_model_cache["model"] = None
+    _engine_cache = {"df": None, "raw": None, "thresholds": None,
+                     "optimal_threshold": None, "name": None, "ts": 0.0}
+    _scored_cache = {"data": None, "name": None, "ts": 0.0}
+
 
 # ── 进程级缓存 ───────────────────────────────────────────
 _best_model_cache = {"name": None, "model": None}
@@ -137,8 +159,9 @@ def _ensure_engine(db: Session):
     if model is None:
         return None
 
-    loader = DataLoader(db)
-    df = loader.load_all()
+    # 走共享缓存 —— 与 EDA / 成本收益读同一份表，避免三处各读一遍
+    # （10 万行实测每次约 2.8 秒）。⚠ 该函数返回共享对象，此处只读不改。
+    df = get_cached_customer_df(db)
     X, y, _ = prepare_features(df)
     raw = model.predict_proba(X)[:, 1]
 

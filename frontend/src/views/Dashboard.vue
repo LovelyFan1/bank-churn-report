@@ -2,7 +2,6 @@
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
-import { pollTask } from '../api/taskPoller'
 import { riskLabel, riskBadgeClass, probColor, fmtPercent, channelLabel } from '../utils/risk'
 
 const loading = ref(true)
@@ -82,19 +81,35 @@ onMounted(async () => {
     }
 
     // 批量预测（异步任务 → 轮询）
+    //
+    // ⚠ 这里此前是：
+    //     const { data: batchSubmit } = await api.get('/model/batch-score?top_n=10')
+    //     batchResult = await pollTask(batchSubmit.task_id)     // 阻塞 12~13 秒
+    //
+    // 换 10 万数据源后暴露出问题：batch-score 会把**全量 10 万行**重新打一遍分
+    // （Celery worker 是独立进程，享受不到 API 进程的打分缓存），实测 12~13 秒，
+    // 而页面 onMounted 里 await 了它 —— 整个数据概览页空白转圈 24 秒。
+    //
+    // 实测确认它换来的两个数在别处**已经有了**且完全相等：
+    //   risk_distribution  → /api/customers 的 summary.risk_distribution（同源统计）
+    //   top_customers      → /api/customers?sort_by=expected_value 的前 10 条
+    // 后者命中缓存仅 0.2~0.4 秒。故改为直接取，不再触发那次重算。
+    //
+    // batch-score 接口本身保留（风险预测页仍在使用），只是本页不再依赖它。
     let batchResult = null
     let summaryResult = null
+
     try {
-      const { data: batchSubmit } = await api.get('/model/batch-score?top_n=10')
-      if (batchSubmit.task_id) {
-        batchResult = await pollTask(batchSubmit.task_id)
-      } else if (batchSubmit.error) {
-        console.warn('batch-score not available:', batchSubmit.error)
-      } else {
-        batchResult = batchSubmit  // 兼容直接返回
-      }
+      const { data: topRes } = await api.get('/customers', {
+        params: { page: 1, page_size: 10, sort_by: 'expected_value', sort_order: 'desc' },
+      })
+      const dist = topRes?.summary?.risk_distribution
+      const items = topRes?.items || []
+      if (dist) riskDist.value = dist
+      topCustomers.value = items
+      batchResult = { top_customers: items, risk_distribution: dist }
     } catch (e) {
-      console.warn('batch-score failed:', e)
+      console.warn('top customers failed:', e)
     }
 
     try {
@@ -109,8 +124,6 @@ onMounted(async () => {
 
     if (batchResult) {
       batchData.value = batchResult
-      topCustomers.value = batchResult.top_customers || []
-      riskDist.value = batchResult.risk_distribution || { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }
     }
 
     // Compute metrics

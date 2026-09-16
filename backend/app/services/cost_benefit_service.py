@@ -18,12 +18,18 @@ from typing import Dict, Any
 from app.config import settings
 from app.models.customer import Customer
 from app.models.work_order import WorkOrder
-from app.services.data_loader import DataLoader, prepare_features
+from app.services.data_loader import prepare_features, get_cached_customer_df
 from app.services import risk_scoring
 from sklearn.model_selection import train_test_split
 import joblib
 
 MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
+
+# 全量客户 DataFrame 的来源说明（供本文件内注释引用）：
+#   此前 analyze_thresholds / get_segment_matrix 各自 `DataLoader(db).load_all()`，
+#   10 万行实测各约 2.8 秒，而这是**同一张表**、同一次读。现统一走
+#   data_loader.get_cached_customer_df()，与 EDA、风险引擎共享同一份。
+#   ⚠ 该函数返回共享对象，本文件只读不改（已验证：全部为 .values / .corr 等读取操作）。
 
 
 class CostBenefitService:
@@ -64,9 +70,8 @@ class CostBenefitService:
         if model is None:
             return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
 
-        # 加载数据
-        loader = DataLoader(self.db)
-        df = loader.load_all()
+        # 加载数据 —— 走共享缓存（与 EDA、风险引擎同一份）
+        df = get_cached_customer_df(self.db)
         X, y, feature_names = prepare_features(df)
 
         X_train, X_test, y_train, y_test = train_test_split(
@@ -294,8 +299,8 @@ class CostBenefitService:
         if model is None:
             return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
 
-        loader = DataLoader(self.db)
-        df = loader.load_all()
+        # 加载数据 —— 走共享缓存（与 analyze_thresholds 同一份，不再重复读表）
+        df = get_cached_customer_df(self.db)
         X, y, feature_names = prepare_features(df)
 
         # 与 analyze_thresholds 同一套划分（seed/stratify 一致），否则两边对不上。

@@ -2,12 +2,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+import sys
 import threading
 
 from app.config import settings
 from app.database import engine, Base, get_db
 from app.models.customer import Customer
 from app.models.work_order import WorkOrder
+from app.services import data_source
 from app.services.data_generator import get_data_generator
 from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers, portfolio
 
@@ -46,17 +48,28 @@ ALLOWED_FIELDS = [
 
 @app.on_event("startup")
 async def startup_event():
-    """启动时建表 + 种子数据生成（仅首次）。"""
+    """启动时建表 + 播种数据（仅首次）。
+
+    数据来源由 settings.DATA_SOURCE 决定（generator / csv），
+    见 app/services/data_source.py。失败时**不静默回退** —— 回退会让人
+    以为在用标定数据，实际在用合成数据。
+    """
     Base.metadata.create_all(bind=engine)
 
     db = next(get_db())
     try:
-        count = db.query(Customer).count()
-        if count == 0:
-            generator = get_data_generator()
-            df = generator.generate()
-            generator.save_to_db(db, df)
-            print(f"Generated {len(df)} customer records")
+        info = data_source.seed(db)
+        if info.get("seeded"):
+            print(
+                f"[startup] 已播种 {info['rows']} 条客户 "
+                f"（来源: {info['source']}），流失率 {info['churn_rate']}%"
+            )
+        else:
+            print(f"[startup] {info.get('reason')}，现有 {info.get('existing')} 条")
+        settings.DATA_SOURCE_NAME = info.get("source", "")
+    except Exception as e:
+        print(f"[startup] 数据播种失败: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
     finally:
         db.close()
 

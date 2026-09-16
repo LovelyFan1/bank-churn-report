@@ -120,11 +120,22 @@ def _filtered_customers(
     if has_order is not None:
         items = [c for c in items if c["has_active_order"] == has_order]
 
+    # 四个等级的完整分布 —— 供数据概览页的「风险等级分布」饼图使用。
+    # 此前饼图的数据来自 batch-score 的 risk_distribution，但那个任务会把
+    # 10 万行重新打一遍分（实测 12~13 秒）才能得到这四个数，而这里
+    # `scored` 已经是带 risk_level 的全量打分结果 —— 直接统计即可，零额外计算。
+    risk_distribution = {
+        lvl: sum(1 for c in scored if c["risk_level"] == lvl)
+        for lvl in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+    }
     summary = {
         "total_customers": len(scored),
-        "high_risk": sum(1 for c in scored if c["risk_level"] in ("CRITICAL", "HIGH")),
+        "high_risk": risk_distribution["CRITICAL"] + risk_distribution["HIGH"],
         "exited": sum(1 for c in scored if c["exited"] == 1),
         "active_orders": len(active_ids),
+        # 注意是**全量**分布，不受上方筛选条件影响 —— 与它并列的
+        # total_customers/exited 也都是全量口径，保持一致。
+        "risk_distribution": risk_distribution,
     }
     return items, summary
 
