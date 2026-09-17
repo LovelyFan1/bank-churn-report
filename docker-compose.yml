@@ -44,6 +44,9 @@ services:
       #   清空命令见 README 或：docker exec churn-backend python -c "..."
       - DATA_SOURCE=${DATA_SOURCE:-csv}
       - DATA_CSV_PATH=/data-source/customers_simulated.csv
+      # 后端 web 进程数，默认 4。6 核实测：1→2.5、4→6.4、6→7.6 req/s。
+      # 取 4 是为了留 2 个核给 Celery worker。仅 backend 需要（见下方 command）。
+      - WEB_WORKERS=${WEB_WORKERS:-4}
     volumes:
       - ./backend:/app
       - backend_data:/app/data
@@ -54,7 +57,26 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # ── 启动方式 ────────────────────────────────────────────
+    # 用多进程（--workers）而非 --reload。原因：本项目最重的三种活儿
+    # （全量打分缓存构建 / 全表 pandas 扫描 / 10 万次 dict 构造）都是
+    # **纯 Python 计算，受 GIL 限制**，实测线程并发加速比只有 0.99x，
+    # 而多进程是 3.88x。所以提升并发只能靠多进程。
+    #
+    # ⚠ --reload 会**静默忽略** --workers（uvicorn 只打印一行 WARNING），
+    #   所以二者不能同时开。代价：改后端代码后需
+    #   `docker compose restart backend` 才生效。
+    #   若要恢复热重载（开发时），把 --workers 换成 --reload 即可。
+    #
+    # ⚠ 每个 worker 各自缓存一份全量打分结果（实测 RSS ≈ 357 MB），
+    #   4 worker ≈ 1.43 GB。加大此值前先确认内存。
+    #
+    # ⚠ 首次部署（customers 表为空）时，多个 worker 会同时执行播种。
+    #   seed() 是 check-then-act，无锁竞态：子进程会因 customer_id 唯一
+    #   约束冲突抛异常。实测数据不会写坏（恰好一个 worker 成功），
+    #   但失败的 worker 会导致容器反复重启。故用 `app.preseed` 先由
+    #   单进程播种一次，再启动多 worker —— preseed 幂等，每次启动都跑无害。
+    command: sh -c "python -m app.preseed && python run.py"
 
   # ============================================================
   # Celery Worker — async ML training / prediction

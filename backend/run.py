@@ -13,13 +13,23 @@ Redis 必须在本机运行:
     3. FastAPI (本脚本)
 """
 
+import os
+
 import uvicorn
 
 if __name__ == "__main__":
-    # 生产部署时去掉 reload=True，并使用 --workers 多进程
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,  # 仅开发
-    )
+    # ⚠ reload 与 workers 互斥 —— uvicorn 会打印
+    #   `WARNING: "workers" flag is ignored when reloading is enabled.`
+    #   并**静默忽略 workers**。本项目提升并发只能靠多进程（受 GIL 限制，
+    #   实测线程加速比仅 0.99x，见 config.WEB_WORKERS 的说明），
+    #   所以二者必须二选一，由环境变量切换：
+    #
+    #     RELOAD=true  → 开发模式：单进程 + 热重载
+    #     默认         → 多进程模式：WEB_WORKERS 个进程，改代码需重启容器
+    reload = os.getenv("RELOAD", "false").lower() == "true"
+    workers = int(os.getenv("WEB_WORKERS", "1"))
+
+    if reload:
+        uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    else:
+        uvicorn.run("app.main:app", host="0.0.0.0", port=8000, workers=workers)

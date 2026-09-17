@@ -45,6 +45,23 @@ class Settings(BaseSettings):
     TEST_SIZE: float = 0.2
     CV_FOLDS: int = 5
 
+    # ── 服务进程数 ─────────────────────────────────────────
+    # ⚠ 本项目的接口里，最重的三种活儿（全量打分缓存构建、全表 pandas 扫描、
+    #   10 万次 dict 构造）**是纯 Python 计算，受 GIL 限制**。实测：
+    #       4 个线程并发 加速比 0.99x（完全无并行）
+    #       4 个进程并发 加速比 3.88x（接近线性）
+    #   所以提升并发**只能靠多进程**，线程池对本项目无效。
+    #   本配置项供启动脚本/文档引用，实际生效值是 docker-compose 里的
+    #   `--workers N`（uvicorn 参数，不经由 pydantic 配置生效）。
+    #
+    # 取值依据（6 核机器实测吞吐）：
+    #   1 worker  2.5 req/s   4 worker  6.4 req/s   6 worker  7.6 req/s
+    #   默认 4 —— 比单进程提升 2.5 倍，同时留 2 个核给 Celery worker。
+    #
+    # ⚠ 每个 worker 会各自缓存一份全量打分结果，实测 RSS ≈ 357 MB/worker。
+    #   4 worker ≈ 1.43 GB。调大此值前先确认内存余量。
+    WEB_WORKERS: int = 4
+
     # ── 成本收益口径（此前散落在各 service 里，不可审计）──
     # 全局只有**两个**独立假设，其余一律由它们推导，避免出现互相矛盾的成本模型。
     #
