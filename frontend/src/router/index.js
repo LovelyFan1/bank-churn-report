@@ -44,12 +44,6 @@ const routes = [
     meta: { title: '模型对比', icon: 'models' }
   },
   {
-    path: '/risk',
-    name: 'RiskPrediction',
-    component: () => import('../views/RiskPrediction.vue'),
-    meta: { title: '风险预测', icon: 'risk' }
-  },
-  {
     path: '/intervention',
     name: 'InterventionStrategy',
     component: () => import('../views/InterventionStrategy.vue'),
@@ -60,6 +54,15 @@ const routes = [
     name: 'WorkOrders',
     component: () => import('../views/WorkOrders.vue'),
     meta: { title: '工单管理', icon: 'work-orders' }
+  },
+  {
+    // 智能助手 —— 后端 /api/agent/* 上线前的占位页。
+    // 页面自带「即将上线」态，不做任何接口调用，
+    // 后端就绪后替换为真正的对话界面即可。
+    path: '/assistant',
+    name: 'Assistant',
+    component: () => import('../views/Assistant.vue'),
+    meta: { title: '智能助手', icon: 'assistant', badge: 'Beta' }
   }
 ]
 

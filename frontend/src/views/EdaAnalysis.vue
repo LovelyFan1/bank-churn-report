@@ -58,10 +58,28 @@ async function fetchSafe(url) {
 }
 
 /**
+ * 等待某个 ref 对应的元素真正挂载且具有非零尺寸。
+ * 图表容器在 <template v-else> 里由 v-if="loading" 控制，
+ * 一次 nextTick 不保证 DOM 补丁完成，ECharts 在尺寸为 0 的
+ * 容器上初始化会得到空白画布。
+ */
+async function waitForEl(refObj, timeout = 1500) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const el = refObj.value
+    if (el && el.clientWidth > 0 && el.clientHeight > 0) return el
+    await nextTick()
+    await new Promise((r) => requestAnimationFrame(r))
+  }
+  return refObj.value && refObj.value.clientWidth > 0 ? refObj.value : null
+}
+
+/**
  * 单张图的容错渲染。任一张图构造 option 或 setOption 抛错，
  * 只把错误记到这张图上，其余图照常显示。
  */
-function renderSafely(key, el, buildOption) {
+async function renderSafely(key, refObj, buildOption) {
+  const el = await waitForEl(refObj)
   if (!el) {
     errors.value[key] = '图表容器未就绪'
     return
@@ -90,23 +108,23 @@ function optionCorrelation(data) {
   }
   return {
     tooltip: {
-      backgroundColor: 'rgba(15,15,35,0.9)',
-      borderColor: 'rgba(99,102,241,0.3)',
-      textStyle: { color: '#e0e0e0' },
+      backgroundColor: '#ffffff',
+      borderColor: '#d5dce8',
+      textStyle: { color: '#1f2937' },
       formatter: (p) => `${fmtLabel(features[p.value[1]])} vs ${fmtLabel(features[p.value[0]])}: ${p.value[2].toFixed(3)}`,
     },
     grid: { left: 80, right: 40, top: 10, bottom: 60 },
     xAxis: {
       type: 'category',
       data: features.map(fmtLabel),
-      axisLabel: { color: '#9ca3af', fontSize: 10, rotate: 45 },
-      axisLine: { lineStyle: { color: '#374151' } },
+      axisLabel: { color: '#7c8aa5', fontSize: 10, rotate: 45 },
+      axisLine: { lineStyle: { color: '#d5dce8' } },
     },
     yAxis: {
       type: 'category',
       data: features.map(fmtLabel),
-      axisLabel: { color: '#9ca3af', fontSize: 10 },
-      axisLine: { lineStyle: { color: '#374151' } },
+      axisLabel: { color: '#7c8aa5', fontSize: 10 },
+      axisLine: { lineStyle: { color: '#d5dce8' } },
     },
     visualMap: {
       min: -1, max: 1,
@@ -115,7 +133,7 @@ function optionCorrelation(data) {
       left: 'center',
       bottom: 0,
       inRange: { color: ['#3b82f6', '#1e1b4b', '#ef4444'] },
-      textStyle: { color: '#9ca3af' },
+      textStyle: { color: '#7c8aa5' },
     },
     series: [{
       type: 'heatmap',
@@ -129,11 +147,11 @@ function optionCorrelation(data) {
 function optionChurnByGender(data) {
   const d = data.data
   return {
-    tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+    tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => item.gender), axisLine: { lineStyle: { color: '#374151' } }, axisLabel: { color: '#9ca3af' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
+    xAxis: { type: 'category', data: d.map((item) => item.gender), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
     series: [
       { name: '留存', type: 'bar', stack: 'total', data: d.map((item) => item.total - item.churned), itemStyle: { color: '#22c55e', borderRadius: [0, 0, 0, 0] } },
       { name: '流失', type: 'bar', stack: 'total', data: d.map((item) => item.churned), itemStyle: { color: '#ef4444', borderRadius: [4, 4, 0, 0] } },
@@ -144,11 +162,11 @@ function optionChurnByGender(data) {
 function optionChurnByGeo(data) {
   const d = data.data
   return {
-    tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+    tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => item.geography), axisLine: { lineStyle: { color: '#374151' } }, axisLabel: { color: '#9ca3af' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
+    xAxis: { type: 'category', data: d.map((item) => item.geography), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
     series: [
       { name: '留存', type: 'bar', stack: 'total', data: d.map((item) => item.total - item.churned), itemStyle: { color: '#6366f1' } },
       { name: '流失', type: 'bar', stack: 'total', data: d.map((item) => item.churned), itemStyle: { color: '#f59e0b' } },
@@ -159,10 +177,10 @@ function optionChurnByGeo(data) {
 function optionProductOverload(data) {
   const d = data.data
   return {
-    tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+    tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     grid: { left: 12, right: 12, top: 30, bottom: 24, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => item.num_products + '个产品'), axisLine: { lineStyle: { color: '#374151' } }, axisLabel: { color: '#9ca3af' } },
-    yAxis: { type: 'value', axisLabel: { color: '#9ca3af', formatter: '{value}%' }, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } } },
+    xAxis: { type: 'category', data: d.map((item) => item.num_products + '个产品'), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
+    yAxis: { type: 'value', axisLabel: { color: '#9ca3af', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#eef1f6' } } },
     series: [{
       type: 'bar',
       data: d.map((item) => ({
@@ -170,7 +188,7 @@ function optionProductOverload(data) {
         itemStyle: { color: item.churn_rate > 40 ? '#ef4444' : item.churn_rate > 20 ? '#f59e0b' : '#22c55e' },
       })),
       barWidth: 40,
-      label: { show: true, position: 'top', color: '#d1d5db', formatter: '{c}%' },
+      label: { show: true, position: 'top', color: '#374151', formatter: '{c}%' },
       itemStyle: { borderRadius: [6, 6, 0, 0] },
     }],
   }
@@ -179,11 +197,11 @@ function optionProductOverload(data) {
 function optionSatisfaction(data) {
   const d = data.data
   return {
-    tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+    tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => '评分' + item.satisfaction_score), axisLine: { lineStyle: { color: '#374151' } }, axisLabel: { color: '#9ca3af' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
+    xAxis: { type: 'category', data: d.map((item) => '评分' + item.satisfaction_score), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
     series: [
       { name: '留存', type: 'bar', stack: 't', data: d.map((item) => item.total - item.churned), itemStyle: { color: '#22c55e' } },
       { name: '流失', type: 'bar', stack: 't', data: d.map((item) => item.churned), itemStyle: { color: '#ef4444', borderRadius: [4, 4, 0, 0] } },
@@ -220,9 +238,10 @@ async function loadAll() {
   if (token !== loadToken || !scope.isActive()) return
 
   loading.value = false
-  await nextTick()
 
   // 逐图独立渲染：数据缺失或渲染异常都只影响这一张
+  // renderSafely 是 async（内部 waitForEl 等待容器就绪），
+  // 不 await 全部——各图独立等待、独立渲染，先就绪的先显示。
   CHARTS.forEach((c, i) => {
     const { data, error, canceled } = results[i]
     if (canceled) return          // 页面已离开，无需处理
@@ -230,7 +249,7 @@ async function loadAll() {
       errors.value[c.key] = error
       return
     }
-    renderSafely(c.key, c.el.value, () => c.build(data))
+    renderSafely(c.key, c.el, () => c.build(data))
   })
 }
 
@@ -242,8 +261,7 @@ async function retryOne(chart) {
     errors.value[chart.key] = error
     return
   }
-  await nextTick()
-  renderSafely(chart.key, chart.el.value, () => chart.build(data))
+  await renderSafely(chart.key, chart.el, () => chart.build(data))
 }
 
 onMounted(loadAll)
@@ -344,9 +362,9 @@ onBeforeUnmount(() => {
   padding: 14px 16px;
   border-radius: 10px;
   font-size: 12.5px;
-  color: #fca5a5;
-  background: rgba(239, 68, 68, 0.08);
-  border: 1px dashed rgba(239, 68, 68, 0.35);
+  color: #c81e1e;
+  background: #fdf0f0;
+  border: 1px dashed #f0b4b4;
 }
 .chart-error button {
   flex-shrink: 0;
@@ -355,12 +373,12 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  color: #fecaca;
-  background: rgba(239, 68, 68, 0.16);
-  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #1d4ed8;
+  background: #f0f5fd;
+  border: 1px solid #c7d6ee;
   transition: background 0.15s;
 }
-.chart-error button:hover { background: rgba(239, 68, 68, 0.3); }
+.chart-error button:hover { background: #e0ebfb; }
 
 .btn-refresh {
   padding: 6px 14px;
@@ -368,10 +386,10 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  color: #cbd5e1;
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #5b6b83;
+  background: #ffffff;
+  border: 1px solid #d5dce8;
   transition: 0.15s;
 }
-.btn-refresh:hover { border-color: rgba(255, 255, 255, 0.25); background: rgba(255, 255, 255, 0.04); }
+.btn-refresh:hover { border-color: #a8bcd9; background: #f8fafc; }
 </style>

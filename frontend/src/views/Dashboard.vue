@@ -12,7 +12,6 @@ const scope = useRequestScope()
 
 const loading = ref(true)
 const overview = ref(null)
-const batchData = ref(null)
 const businessSummary = ref(null)
 const topCustomers = ref([])
 const activeCustomerIds = ref(new Set())
@@ -21,28 +20,12 @@ const riskInfo = ref(null)
 const modelMetrics = ref(null)
 
 // Chart refs
-const trendChart = shallowRef(null)
 const riskChart = shallowRef(null)
-const roiChart = shallowRef(null)
 const chartInstances = []
 
-// ⚠ 示例数据：系统数据无时间维度字段（customers 表无日期列），
-// 后端 /api/data/overview 也不返回时间序列，故趋势图为固定示意值。
-// 图表标题已标注「示例数据」，不得据此做任何业务判断。
-const monthlyTrend = [
-  { month: '1月', churned: 210, retained: 80 },
-  { month: '2月', churned: 185, retained: 72 },
-  { month: '3月', churned: 198, retained: 95 },
-  { month: '4月', churned: 215, retained: 110 },
-  { month: '5月', churned: 178, retained: 85 },
-  { month: '6月', churned: 192, retained: 100 },
-  { month: '7月', churned: 203, retained: 120 },
-  { month: '8月', churned: 188, retained: 98 },
-  { month: '9月', churned: 195, retained: 105 },
-  { month: '10月', churned: 220, retained: 115 },
-  { month: '11月', churned: 210, retained: 108 },
-  { month: '12月', churned: 203, retained: 135 },
-]
+// 挽留战报 —— 实测口径，来自 work_orders 真实执行结果
+// （/api/cost-benefit/retention-summary，空表时 has_data=false，显示空态）
+const retention = ref(null)
 
 const insights = ref([])
 // Top10 列表的错误态 —— 后端在模型未就绪时返回 200 + {"items":[], "error":...}，
@@ -60,28 +43,70 @@ const riskDist = ref({ CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 })
 const confRows = ref([])
 
 onMounted(async () => {
+  // ── 分两批加载：核心 4 个先渲染骨架，次要 4 个后台异步补齐 ──
+  //
+  // 为什么拆批（实测数据）：
+  //   Docker Desktop 的 Windows 用户态转发链路在并发 8 个请求时，
+  //   单请求从 ~200ms 膨胀到 1.5~2.5s（容器内并发 8 个仅 226ms），
+  //   8 个全部 await 完才渲染 → 首屏白屏 9~20 秒。
+  //   拆成 4+4 后，首屏只等核心 4 个（~2-3s 可渲染），
+  //   次要数据到位后局部更新，不阻塞首屏。
+  //
+  // 「数值消失」的连锁根因：并发排队 → 超时 → 连接被重置 →
+  // axios Network Error → 对应 ref 未赋值 → 界面显示空/0。
+  const withFallback = (p, fallback) => p.catch(() => ({ data: fallback }))
+
+  // ── 第一批：首屏聚合接口（1 请求替代原 4 并发，绕开 Docker 转发瓶颈）──
   try {
-    // 先加载不需要模型的结果
-    // 走 scope：离开页面时这些在途请求会被取消（本页并发最多，占连接槽最严重）。
-    // 取消产生的错误由 scope.getSafe 归一化，不会冒成 Network Error。
-    const withFallback = (p, fallback) => p.catch(() => ({ data: fallback }))
-    const [overviewRes, insightsRes, activeRes, riskInfoRes, comparisonRes] = await Promise.all([
-      scope.get('/data/overview'),
-      scope.get('/eda/key-insights'),
-      withFallback(scope.get('/work-orders/active-customers'), { customer_ids: [] }),
-      withFallback(scope.get('/model/risk-info'), null),
-      withFallback(scope.get('/model/comparison'), null),
-    ])
-    // 页面已卸载则不再写状态（避免对已销毁组件赋值 + 无谓渲染）
+    const { data: dash } = await scope.get('/dashboard/summary')
     if (!scope.isActive()) return
 
-    activeCustomerIds.value = new Set(activeRes.data?.customer_ids || [])
-    riskInfo.value = riskInfoRes.data
+    overview.value = dash.overview
+    riskInfo.value = dash.risk_info
 
-    overview.value = overviewRes.data
+    // Top10 与风险分布
+    if (dash.model_error) {
+      topError.value = dash.model_error
+    } else {
+      topError.value = ''
+      riskDist.value = dash.risk_distribution
+      topCustomers.value = dash.top_customers || []
+    }
+
+    // 成本收益指标
+    const summaryResult = dash.business_summary
+    businessSummary.value = summaryResult
+    churnRate.value = dash.overview.churn_rate
+    lossAmount.value = summaryResult ? Math.round(summaryResult.annual_loss / 10000) : 0
+    recoverable.value = summaryResult ? Math.round(summaryResult.reduced_loss / 10000) : 0
+    roi.value = summaryResult ? summaryResult.roi : 0
+
+    if (!scope.isActive()) return
+    loading.value = false
+    initCharts()
+  } catch (e) {
+    if (isCanceled(e) || !scope.isActive()) return
+    console.error('Dashboard core load error:', e)
+    loading.value = false
+    return
+  }
+
+  // ── 第二批：次要 4 个，后台异步补齐（不阻塞首屏）──
+  loadSecondaryData()
+
+  async function loadSecondaryData() {
+    const [insightsRes, activeRes, comparisonRes, retentionRes] = await Promise.all([
+      withFallback(scope.get('/eda/key-insights'), { insights: [] }),
+      withFallback(scope.get('/work-orders/active-customers'), { customer_ids: [] }),
+      withFallback(scope.get('/model/comparison'), null),
+      withFallback(scope.get('/cost-benefit/retention-summary'), null),
+    ])
+    if (!scope.isActive()) return
+
     insights.value = insightsRes.data?.insights || []
+    activeCustomerIds.value = new Set(activeRes.data?.customer_ids || [])
 
-    // 模型可信度：取最优模型那一行，不做任何前端加工
+    // 模型可信度
     const comparison = comparisonRes.data
     if (comparison?.best_model && comparison.models?.length) {
       const best = comparison.models.find(m => m.model_name === comparison.best_model)
@@ -95,96 +120,8 @@ onMounted(async () => {
       ]
     }
 
-    // 批量预测（异步任务 → 轮询）
-    //
-    // ⚠ 这里此前是：
-    //     const { data: batchSubmit } = await api.get('/model/batch-score?top_n=10')
-    //     batchResult = await pollTask(batchSubmit.task_id)     // 阻塞 12~13 秒
-    //
-    // 换 10 万数据源后暴露出问题：batch-score 会把**全量 10 万行**重新打一遍分
-    // （Celery worker 是独立进程，享受不到 API 进程的打分缓存），实测 12~13 秒，
-    // 而页面 onMounted 里 await 了它 —— 整个数据概览页空白转圈 24 秒。
-    //
-    // 实测确认它换来的两个数在别处**已经有了**且完全相等：
-    //   risk_distribution  → /api/customers 的 summary.risk_distribution（同源统计）
-    //   top_customers      → /api/customers?sort_by=expected_value 的前 10 条
-    // 后者命中缓存仅 0.2~0.4 秒。故改为直接取，不再触发那次重算。
-    //
-    // batch-score 接口本身保留（风险预测页仍在使用），只是本页不再依赖它。
-    let batchResult = null
-    let summaryResult = null
-
-    // ⚠ /api/customers 在模型未就绪时返回 HTTP 200，但 body 是
-    //   {"items": [], "total": 0, "error": "模型尚未训练..."}。
-    //   旧代码只取 items，于是「Top10」渲染成一张空表 —— 用户看到"只有框"，
-    //   完全不知道是模型没就绪还是真没数据。这里显式消费 error 字段。
-    try {
-      const { data: topRes } = await scope.get('/customers', {
-        params: { page: 1, page_size: 10, sort_by: 'expected_value', sort_order: 'desc' },
-      })
-      if (!scope.isActive()) return
-      if (topRes?.error) {
-        topError.value = topRes.error
-      } else {
-        topError.value = ''
-      }
-      const dist = topRes?.summary?.risk_distribution
-      const items = topRes?.items || []
-      if (dist) riskDist.value = dist
-      topCustomers.value = items
-      batchResult = { top_customers: items, risk_distribution: dist }
-    } catch (e) {
-      if (scope.isActive()) {
-        topError.value = e.response?.data?.detail || e.message || '加载失败'
-      }
-      console.warn('top customers failed:', e)
-    }
-
-    try {
-      const summaryRes = await scope.get('/cost-benefit/summary')
-      if (!scope.isActive()) return
-      if (summaryRes.data && !summaryRes.data.error) {
-        businessSummary.value = summaryRes.data
-        summaryResult = summaryRes.data
-      }
-    } catch (e) {
-      console.warn('cost-benefit not available:', e)
-    }
-
-    if (!scope.isActive()) return
-
-    if (batchResult) {
-      batchData.value = batchResult
-    }
-
-    // Compute metrics
-    const churned = overviewRes.data.churned_customers
-    churnRate.value = overviewRes.data.churn_rate
-
-    // 损失口径统一走 cost-benefit —— 与干预策略页同源。
-    // 旧写法是 churned × avg_balance（全量客户的平均余额），既用错了均值对象
-    // （应为流失客户而非全体），又与干预策略页的 annual_loss 给出不同数字
-    // （实测 15,629万 vs 10,185万），两页都叫「年度流失损失」。
-    //
-    // ⚠ 这个数用的是**历史**流失数（exited=1 的计数），不是模型预测的未来流失。
-    // 所以文案一律写「年流失损失（历史口径）」，不写「预估」——
-    // 否则被问「这 2037 是预测的还是已发生的」会答不上来。
-    lossAmount.value = summaryResult ? Math.round(summaryResult.annual_loss / 10000) : 0
-    recoverable.value = summaryResult ? Math.round(summaryResult.reduced_loss / 10000) : 0
-    roi.value = summaryResult ? summaryResult.roi : 0
-
-    if (!scope.isActive()) return
-
-    loading.value = false
-    // 图表初始化不再让整页 await —— 数据已就绪即可渲染，
-    // 图表各自异步等待容器出现（见 initCharts 的说明）。
-    initCharts()
-  } catch (e) {
-    // 页面已卸载导致的取消是**正常行为**（不是错误），不刷 console.error，
-    // 否则频繁切换时控制台会被 "CanceledError" 淹没，掩盖真实问题。
-    if (isCanceled(e) || !scope.isActive()) return
-    console.error('Dashboard load error:', e)
-    loading.value = false
+    // 挽留战报：只在有真实工单数据时展示
+    retention.value = retentionRes.data?.has_data ? retentionRes.data : null
   }
 })
 
@@ -227,9 +164,7 @@ async function initOne(refObj, label, initFn) {
 
 async function initCharts() {
   await Promise.all([
-    initOne(trendChart, '月度流失趋势', initTrendChart),
     initOne(riskChart, '客户风险分布', initRiskChart),
-    initOne(roiChart, '干预效果追踪', initRoiChart),
   ])
 }
 
@@ -248,89 +183,22 @@ onBeforeUnmount(() => {
   chartInstances.length = 0
 })
 
-function initTrendChart(el) {
-  const chart = echarts.init(el)
-  chart.setOption({
-    // ⚠ 图内水印：避免截图/投影时角标被裁掉后失去「示例数据」标识
-    graphic: [{
-      type: 'text', right: 12, top: 6,
-      style: { text: '示例数据 · 非真实统计', fill: 'rgba(251,191,36,0.75)', fontSize: 11, fontWeight: 'bold' },
-    }],
-    tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.95)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-    legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 } },
-    grid: { left: 50, right: 50, top: 10, bottom: 40 },
-    xAxis: {
-      type: 'category',
-      data: monthlyTrend.map(d => d.month),
-      axisLine: { lineStyle: { color: '#374151' } }, axisLabel: { color: '#9ca3af' }
-    },
-    yAxis: [
-      { type: 'value', name: '流失人数', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af' } },
-      { type: 'value', name: '挽留成功', splitLine: { show: false }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af' } }
-    ],
-    series: [
-      {
-        name: '预测流失', type: 'bar', barWidth: 18,
-        data: monthlyTrend.map(d => d.churned),
-        itemStyle: { borderRadius: [4, 4, 0, 0], color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: '#ef4444' }, { offset: 1, color: '#991b1b' }]) },
-      },
-      {
-        name: '挽留成功', type: 'line', yAxisIndex: 1, symbol: 'circle', symbolSize: 6,
-        data: monthlyTrend.map(d => d.retained),
-        lineStyle: { color: '#22c55e', width: 2 }, itemStyle: { color: '#22c55e' },
-      }
-    ]
-  })
-  chartInstances.push(chart)
-}
-
 function initRiskChart(el) {
   const chart = echarts.init(el)
   const dist = riskDist.value
   chart.setOption({
-    tooltip: { trigger: 'item', backgroundColor: 'rgba(15,15,35,0.95)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+    tooltip: { trigger: 'item', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 } },
     series: [{
       type: 'pie', radius: ['40%', '65%'], center: ['50%', '44%'],
-      itemStyle: { borderRadius: 6, borderColor: '#0a0a1a', borderWidth: 3 },
-      label: { show: true, color: '#d1d5db', fontSize: 12, formatter: '{b}\n{c}人 ({d}%)' },
+      itemStyle: { borderRadius: 6, borderColor: '#ffffff', borderWidth: 3 },
+      label: { show: true, color: '#374151', fontSize: 12, formatter: '{b}\n{c}人 ({d}%)' },
       data: [
         { value: dist.CRITICAL, name: '极高风险', itemStyle: { color: '#ef4444' } },
         { value: dist.HIGH, name: '高风险', itemStyle: { color: '#f59e0b' } },
         { value: dist.MEDIUM, name: '中风险', itemStyle: { color: '#84cc16' } },
         { value: dist.LOW, name: '低风险', itemStyle: { color: '#22c55e' } },
       ]
-    }]
-  })
-  chartInstances.push(chart)
-}
-
-function initRoiChart(el) {
-  const chart = echarts.init(el)
-  chart.setOption({
-    // ⚠ 图内水印：同上，不依赖卡片角标是否被裁切
-    graphic: [{
-      type: 'text', right: 8, top: 2,
-      style: { text: '示例数据', fill: 'rgba(251,191,36,0.75)', fontSize: 11, fontWeight: 'bold' },
-    }],
-    tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.95)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-    grid: { left: 50, right: 20, top: 10, bottom: 30 },
-    xAxis: {
-      type: 'category', data: ['1月', '2月', '3月', '4月', '5月', '6月', '7月'],
-      axisLine: { lineStyle: { color: '#374151' } }, axisLabel: { color: '#9ca3af' }
-    },
-    yAxis: { type: 'value', name: '万元', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af' } },
-    series: [{
-      type: 'line', symbol: 'circle', symbolSize: 8, smooth: true,
-      data: [520, 610, 780, 850, 920, 890, 1020],
-      lineStyle: { color: '#6366f1', width: 3 },
-      itemStyle: { color: '#6366f1' },
-      areaStyle: {
-        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(99,102,241,0.25)' },
-          { offset: 1, color: 'rgba(99,102,241,0)' }
-        ])
-      }
     }]
   })
   chartInstances.push(chart)
@@ -424,7 +292,7 @@ function showOrderToast(msg) {
     <template v-else>
       <!-- Hero Summary -->
       <div class="hero-banner">
-        <div class="hero-label">📊 客户流失概览</div>
+        <div class="hero-label">客户流失概览</div>
         <div class="hero-text">
           当前在管客户 <span class="hl-white">{{ overview?.total_customers?.toLocaleString() }}</span> 人，
           其中历史上已流失 <span class="hl-red">{{ overview?.churned_customers?.toLocaleString() }} 人</span>，
@@ -457,11 +325,39 @@ function showOrderToast(msg) {
         </div>
       </div>
 
+      <!-- 挽留战报：实测口径，来自 work_orders 真实执行结果。
+           工单表为空时不显示（retention 为 null），不用推算值顶替。 -->
+      <div v-if="retention" class="glass-card p-5 retention-strip">
+        <div class="retention-title">挽留战报 <span class="badge">实测口径</span></div>
+        <div class="retention-items">
+          <div class="retention-item">
+            <div class="retention-num">{{ retention.total_completed }}</div>
+            <div class="retention-label">已办结工单</div>
+          </div>
+          <div class="retention-item">
+            <div class="retention-num" style="color:#0f766e">{{ retention.retained }} 人</div>
+            <div class="retention-label">挽留成功</div>
+          </div>
+          <div class="retention-item">
+            <div class="retention-num">{{ (retention.success_rate * 100).toFixed(1) }}%</div>
+            <div class="retention-label">挽留成功率</div>
+          </div>
+          <div class="retention-item">
+            <div class="retention-num" style="color:#0f766e">¥{{ Math.round(retention.benefit / 10000) }}万</div>
+            <div class="retention-label">实际挽回金额</div>
+          </div>
+          <div class="retention-item">
+            <div class="retention-num">{{ retention.roi }}x</div>
+            <div class="retention-label">实际 ROI</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Key Insights + Top Customers -->
       <div class="grid grid-cols-1 lg:grid-cols-10 gap-5">
         <!-- Left: Key Insights (30%) -->
         <div class="lg:col-span-3 glass-card p-5">
-          <div class="section-title">💡 关键发现</div>
+          <div class="section-title">关键发现</div>
           <div class="insight-list">
             <div v-for="(item, i) in insights" :key="i" class="insight-item">
               <div class="insight-icon" :style="{ background: item.bg }">{{ item.icon }}</div>
@@ -477,13 +373,12 @@ function showOrderToast(msg) {
         <!-- Right: Top Customers (70%) -->
         <div class="lg:col-span-7 glass-card p-5">
           <div class="section-title">
-            <span>🎯 优先干预 Top 10 <span class="badge">按期望价值排序</span></span>
+            <span>
+              优先干预 Top 10 <span class="badge">按期望价值排序</span>
+              <span class="info-tip" title="期望价值 = 流失概率 × 余额。高风险客户概率趋同，此时余额决定干预优先级。">ⓘ</span>
+            </span>
             <router-link to="/customers" class="view-all-link">查看全部 →</router-link>
           </div>
-          <p class="text-xs text-gray-500 mb-2">
-            期望价值 = 流失概率 × 余额。500 个极高风险客户的概率都挤在 1.0 附近，
-            此时余额是唯一还能拉开优先级的维度 —— 按概率排会混入余额为 0 的客户。
-          </p>
           <!-- 错误态：明确告知原因，不留空表 -->
           <div v-if="topError" class="dash-error">
             <span>⚠ {{ topError }}</span>
@@ -550,90 +445,41 @@ function showOrderToast(msg) {
         </div>
       </div>
 
-      <!-- Charts Row -->
+      <!-- Charts Row：风险分布（真实数据）+ 模型可信度（真实指标） -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
         <div class="glass-card p-5">
-          <div class="section-title">📈 月度流失趋势 <span class="badge badge-demo">⚠ 示例数据</span></div>
-          <div ref="trendChart" class="chart-box"></div>
-          <p class="demo-note">系统数据无时间维度字段（customers 表无日期列），此图为固定示意值，非真实统计。</p>
-        </div>
-        <div class="glass-card p-5">
-          <div class="section-title">🎯 客户风险分布 <span class="badge">当前在管</span></div>
+          <div class="section-title">客户风险分布 <span class="badge">当前在管</span></div>
           <div ref="riskChart" class="chart-box"></div>
         </div>
-      </div>
 
-      <!-- Model Confidence + ROI -->
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
         <!-- Model Confidence -->
         <div class="glass-card p-5">
           <div class="section-title">
-            🔬 模型可信度
+            模型可信度
             <span v-if="modelMetrics" class="badge">{{ modelMetrics.model_name }}</span>
           </div>
-          <div class="text-xs text-gray-500 mb-4">模型预测 vs 实际流失（测试集验证）</div>
+          <div class="text-xs mb-4" style="color:#7c8aa5">模型预测 vs 实际流失（测试集验证）</div>
 
           <template v-if="confRows.length">
             <div class="conf-row" v-for="item in confRows" :key="item.label">
               <div class="conf-label">{{ item.label }}</div>
               <div class="conf-bar">
-                <div class="conf-fill" :style="{ width: Math.min(item.val, 100) + '%', background: 'linear-gradient(90deg, #6366f1, #a855f7)' }"></div>
+                <div class="conf-fill" :style="{ width: Math.min(item.val, 100) + '%', background: '#1d4ed8' }"></div>
               </div>
-              <div class="conf-val" style="color:#a5b4fc">{{ item.val.toFixed(1) }}%</div>
+              <div class="conf-val" style="color:#1d4ed8">{{ item.val.toFixed(1) }}%</div>
             </div>
           </template>
-          <div v-else class="text-xs text-gray-600 py-4">模型指标不可用（尚未训练）</div>
+          <div v-else class="text-xs py-4" style="color:#9aa7bd">模型指标不可用（尚未训练）</div>
 
           <div class="model-status">
-            <span style="color:#86efac">✅ 模型状态：健康</span>
-            <span v-if="modelMetrics" class="text-xs text-gray-500 mt-1">
+            <span v-if="modelMetrics" class="text-xs" style="color:#7c8aa5">
               AUC {{ modelMetrics.auc?.toFixed(4) }} · 5 折 CV {{ modelMetrics.cv_auc_mean?.toFixed(4) }} ± {{ modelMetrics.cv_auc_std?.toFixed(4) }}
             </span>
-            <span v-else class="text-xs text-gray-500 mt-1">暂无指标</span>
+            <span v-else class="text-xs" style="color:#9aa7bd">暂无指标</span>
+            <span class="text-xs mt-1" style="color:#9aa7bd">
+              口径：损失基于历史流失标签（exited=1）与客单价假设折算，属推算值而非预测。
+            </span>
           </div>
-        </div>
-
-        <!-- Intervention ROI -->
-        <div class="glass-card p-5">
-          <div class="section-title">💰 干预效果追踪 <span class="badge badge-demo">⚠ 示例数据</span></div>
-          <div ref="roiChart" class="chart-box-sm"></div>
-          <p class="demo-note">ROI 趋势无时间维度数据支撑，为固定示意值；下方三项统计为真实计算值。</p>
-          <div class="roi-stats">
-            <div class="roi-stat">
-              <div class="roi-val" style="color:#86efac">¥{{ recoverable }}万</div>
-              <div class="roi-label">预计可挽回</div>
-            </div>
-            <div class="roi-stat">
-              <div class="roi-val" style="color:#fdba74">{{ (riskDist.CRITICAL + riskDist.HIGH).toLocaleString() }} 人</div>
-              <div class="roi-label">高风险客户</div>
-            </div>
-            <div class="roi-stat">
-              <div class="roi-val" style="color:#a5b4fc">{{ roi }}x</div>
-              <div class="roi-label">投资回报率</div>
-            </div>
-          </div>
-          <p class="demo-note">
-            口径说明：ROI 分母为估算人工成本（非真实工单结算）；损失基于数据集
-            <b class="text-gray-400">历史流失标签</b>（exited=1）与
-            平均客单价 ¥{{ businessSummary?.avg_customer_value?.toLocaleString() || '—' }} 的假设值折算，
-            是历史口径的推算，不是对未来的预测。
-          </p>
-        </div>
-      </div>
-
-      <!-- Bottom Strip -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
-        <div class="bottom-card">
-          <div class="bottom-num" style="color:#fca5a5">¥{{ lossAmount }}万</div>
-          <div class="bottom-label">年流失损失（历史口径）</div>
-        </div>
-        <div class="bottom-card">
-          <div class="bottom-num" style="color:#86efac">¥{{ recoverable }}万</div>
-          <div class="bottom-label">模型干预可挽回</div>
-        </div>
-        <div class="bottom-card">
-          <div class="bottom-num" style="color:#a5b4fc">{{ roi }}x</div>
-          <div class="bottom-label">投资回报率 ROI</div>
         </div>
       </div>
     </template>
@@ -724,226 +570,218 @@ function showOrderToast(msg) {
 </template>
 
 <style scoped>
-/* Hero Banner */
+/* Hero Banner —— 浅色银行风：白底 + 左侧蓝色边条 */
 .hero-banner {
-  background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #1e1b4b 100%);
-  border: 1px solid rgba(99,102,241,0.2);
-  border-radius: 16px; padding: 28px 32px;
-  position: relative; overflow: hidden;
+  background: #ffffff;
+  border: 1px solid #e5e9f0;
+  border-left: 4px solid #1d4ed8;
+  border-radius: 10px; padding: 24px 28px;
+  box-shadow: 0 1px 3px rgba(15,40,80,0.05);
 }
-.hero-banner::before {
-  content: ''; position: absolute; top: -50%; right: -10%; width: 400px; height: 400px;
-  background: radial-gradient(circle, rgba(99,102,241,0.08) 0%, transparent 70%);
-  pointer-events: none;
-}
-.hero-label { font-size: 13px; color: #a5b4fc; margin-bottom: 8px; font-weight: 500; }
-.hero-text { font-size: 18px; color: #e0e0e0; font-weight: 500; line-height: 1.7; margin-bottom: 20px; max-width: 800px; }
-.hl-white { color: #fff; font-weight: 600; }
-.hl-red { color: #fca5a5; font-weight: 600; }
-.hl-green { color: #86efac; font-weight: 600; }
-.hl-orange { color: #fdba74; font-weight: 600; }
+.hero-label { font-size: 13px; color: #1d4ed8; margin-bottom: 8px; font-weight: 600; }
+.hero-text { font-size: 15px; color: #374151; font-weight: 500; line-height: 1.8; margin-bottom: 18px; max-width: 800px; }
+.hl-white { color: #17335c; font-weight: 700; }
+.hl-red { color: #c81e1e; font-weight: 700; }
+.hl-green { color: #0f766e; font-weight: 700; }
+.hl-orange { color: #b45309; font-weight: 700; }
 
-.hero-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.hero-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
 .hero-card {
-  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 12px; padding: 16px 18px;
+  background: #f8fafc; border: 1px solid #e5e9f0;
+  border-radius: 8px; padding: 14px 16px;
 }
-.hero-card-label { font-size: 11px; color: #9ca3af; margin-bottom: 6px; }
-.hero-card-value { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; }
-.hero-card-sub { font-size: 11px; color: #6b7280; margin-top: 2px; }
+.hero-card-label { font-size: 11px; color: #7c8aa5; margin-bottom: 6px; }
+.hero-card-value { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; color: #17335c; }
+.hero-card-sub { font-size: 11px; color: #9aa7bd; margin-top: 2px; }
+
+/* 挽留战报横条 */
+.retention-strip {
+  border-left: 4px solid #0f766e;
+}
+.retention-title {
+  font-size: 13px; color: #374151; font-weight: 600; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+.retention-items { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
+.retention-item { text-align: center; }
+.retention-num { font-size: 22px; font-weight: 700; color: #17335c; }
+.retention-label { font-size: 11px; color: #7c8aa5; margin-top: 3px; }
 
 /* Section Title */
 .section-title {
-  font-size: 13px; color: #9ca3af; font-weight: 500; margin-bottom: 14px;
+  font-size: 13px; color: #374151; font-weight: 600; margin-bottom: 14px;
   display: flex; justify-content: space-between; align-items: center;
 }
 .badge {
   font-size: 10px; padding: 2px 10px; border-radius: 20px;
-  background: rgba(99,102,241,0.12); color: #a5b4fc;
+  background: #e8f0fe; color: #1d4ed8;
 }
-.badge-demo {
-  background: rgba(251,191,36,0.14); color: #fbbf24;
-  border: 1px solid rgba(251,191,36,0.3);
-}
-.demo-note {
-  font-size: 10.5px; color: #b45309; margin-top: 8px; line-height: 1.5;
+.info-tip {
+  font-size: 12px; color: #9aa7bd; cursor: help; margin-left: 4px;
 }
 .view-all-link {
-  font-size: 11px; color: #a5b4fc; text-decoration: none;
-  padding: 2px 12px; border-radius: 20px; border: 1px solid rgba(99,102,241,0.3);
-  background: rgba(99,102,241,0.08); transition: .2s; white-space: nowrap;
+  font-size: 11px; color: #1d4ed8; text-decoration: none;
+  padding: 2px 12px; border-radius: 20px; border: 1px solid #c7d6ee;
+  background: #f0f5fd; transition: .2s; white-space: nowrap;
 }
-.view-all-link:hover { background: rgba(99,102,241,0.18); }
+.view-all-link:hover { background: #e0ebfb; }
 
 /* Top10 错误态 / 空态 —— 不留空白表格 */
 .dash-error {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 14px 16px; border-radius: 10px; font-size: 12.5px; color: #fca5a5;
-  background: rgba(239,68,68,.08); border: 1px dashed rgba(239,68,68,.35);
+  padding: 14px 16px; border-radius: 10px; font-size: 12.5px; color: #c81e1e;
+  background: #fdf0f0; border: 1px dashed #f0b4b4;
 }
 .dash-error-link {
-  flex-shrink: 0; font-size: 12px; color: #a5b4fc; text-decoration: none;
+  flex-shrink: 0; font-size: 12px; color: #1d4ed8; text-decoration: none;
   padding: 4px 12px; border-radius: 7px;
-  border: 1px solid rgba(99,102,241,.3); background: rgba(99,102,241,.1);
+  border: 1px solid #c7d6ee; background: #f0f5fd;
 }
-.dash-error-link:hover { background: rgba(99,102,241,.2); }
+.dash-error-link:hover { background: #e0ebfb; }
 .dash-empty {
-  padding: 24px 16px; text-align: center; font-size: 12.5px; color: #6b7280;
-  border: 1px dashed rgba(255,255,255,.1); border-radius: 10px;
-  background: rgba(255,255,255,.012);
+  padding: 24px 16px; text-align: center; font-size: 12.5px; color: #9aa7bd;
+  border: 1px dashed #e5e9f0; border-radius: 10px;
+  background: #f8fafc;
 }
 
 /* Insights */
 .insight-list { display: flex; flex-direction: column; gap: 10px; }
 .insight-item {
   display: flex; gap: 10px; align-items: flex-start;
-  padding: 12px; border-radius: 10px; background: rgba(255,255,255,0.015);
-  border: 1px solid rgba(255,255,255,0.03);
+  padding: 12px; border-radius: 8px; background: #f8fafc;
+  border: 1px solid #e5e9f0;
 }
 .insight-icon {
   width: 32px; height: 32px; border-radius: 8px;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0; font-size: 14px;
 }
-.insight-title { font-size: 13px; color: #e5e7eb; font-weight: 500; margin-bottom: 2px; }
+.insight-title { font-size: 13px; color: #374151; font-weight: 600; margin-bottom: 2px; }
 .insight-body { flex: 1; }
-.insight-value { font-size: 22px; font-weight: 700; color: #fff; margin-bottom: 2px; }
-.insight-sub { font-size: 11px; color: #9ca3af; }
-.insight-desc { font-size: 11px; color: #6b7280; line-height: 1.5; }
+.insight-value { font-size: 20px; font-weight: 700; color: #17335c; margin-bottom: 2px; }
+.insight-sub { font-size: 11px; color: #7c8aa5; }
+.insight-desc { font-size: 11px; color: #9aa7bd; line-height: 1.5; }
 
 /* Action Table */
 .action-table { width: 100%; border-collapse: collapse; }
 .action-table th {
-  text-align: left; padding: 8px 10px; font-size: 11px; color: #6b7280;
-  font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.06);
+  text-align: left; padding: 8px 10px; font-size: 11px; color: #7c8aa5;
+  font-weight: 600; border-bottom: 1px solid #e5e9f0;
 }
 .action-table td {
-  padding: 10px; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,0.03);
+  padding: 10px; font-size: 13px; border-bottom: 1px solid #f0f3f8;
+  color: #374151;
 }
-.action-table tr:hover { background: rgba(255,255,255,0.02); }
-.cust-name { color: #fff; font-weight: 500; font-size: 13px; }
-.cust-id { color: #6b7280; font-size: 11px; }
+.action-table tr:hover { background: #f8fafc; }
+.cust-name { color: #17335c; font-weight: 600; font-size: 13px; }
+.cust-id { color: #9aa7bd; font-size: 11px; }
 
-/* .risk-badge / .risk-* 已移至 style.css（全局）。
-   注意：scoped 选择器带 [data-v-*] 属性，特异性高于全局同名类，若在此保留
-   会静默覆盖全局配色 —— 这正是原先四个视图等级颜色不一致的成因。 */
+/* .risk-badge / .risk-* 已移至 style.css（全局）。 */
 
 .prob-cell { display: flex; align-items: center; gap: 8px; }
-.prob-bar { width: 60px; height: 5px; background: rgba(255,255,255,0.05); border-radius: 3px; overflow: hidden; }
+.prob-bar { width: 60px; height: 5px; background: #eef1f6; border-radius: 3px; overflow: hidden; }
 .prob-fill { height: 100%; border-radius: 3px; }
 
 .risk-factors { display: flex; flex-wrap: wrap; gap: 4px; }
 .factor-tag {
   font-size: 10px; padding: 1px 6px; border-radius: 4px;
-  background: rgba(239,68,68,0.08); color: #fca5a5;
+  background: #fdf0f0; color: #b91c1c;
 }
 
 .btn-action {
-  padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(99,102,241,0.3);
-  background: rgba(99,102,241,0.1); color: #a5b4fc; font-size: 12px; cursor: pointer;
+  padding: 4px 12px; border-radius: 6px; border: 1px solid #c7d6ee;
+  background: #f0f5fd; color: #1d4ed8; font-size: 12px; cursor: pointer;
   transition: all 0.2s; white-space: nowrap;
 }
-.btn-action:hover { background: rgba(99,102,241,0.25); border-color: #6366f1; }
+.btn-action:hover { background: #dbe7fa; border-color: #1d4ed8; }
 .btn-action-done {
-  padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(52,211,153,0.2);
-  background: rgba(52,211,153,0.08); color: #6ee7b7; font-size: 12px;
+  padding: 4px 12px; border-radius: 6px; border: 1px solid #bfe3dd;
+  background: #eefaf7; color: #0f766e; font-size: 12px;
   white-space: nowrap; cursor: default;
 }
 
 /* Charts */
 .chart-box { width: 100%; height: 260px; }
-.chart-box-sm { width: 100%; height: 200px; }
 
 /* Model Confidence */
 .conf-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.conf-label { font-size: 12px; color: #9ca3af; width: 120px; flex-shrink: 0; }
-.conf-bar { flex: 1; height: 7px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; }
+.conf-label { font-size: 12px; color: #7c8aa5; width: 120px; flex-shrink: 0; }
+.conf-bar { flex: 1; height: 7px; background: #eef1f6; border-radius: 4px; overflow: hidden; }
 .conf-fill { height: 100%; border-radius: 4px; transition: width 1s ease; }
 .conf-val { font-size: 13px; font-weight: 600; width: 50px; text-align: right; }
 
 .model-status {
   margin-top: 14px; padding: 10px 14px; border-radius: 8px;
-  background: rgba(34,197,94,0.04); border: 1px solid rgba(34,197,94,0.1);
+  background: #f8fafc; border: 1px solid #e5e9f0;
   display: flex; flex-direction: column; font-size: 12px;
 }
-
-/* ROI Stats */
-.roi-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
-.roi-stat { text-align: center; padding: 12px; border-radius: 8px; background: rgba(255,255,255,0.015); }
-.roi-val { font-size: 20px; font-weight: 700; }
-.roi-label { font-size: 11px; color: #6b7280; margin-top: 2px; }
-
-/* Bottom Strip */
-.bottom-card {
-  background: rgba(255,255,255,0.015); border: 1px solid rgba(255,255,255,0.05);
-  border-radius: 12px; padding: 20px; text-align: center;
-}
-.bottom-num { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
-.bottom-label { font-size: 12px; color: #6b7280; }
 
 /* Responsive */
 @media (max-width: 1024px) {
   .hero-grid { grid-template-columns: repeat(2, 1fr); }
+  .retention-items { grid-template-columns: repeat(3, 1fr); }
 }
 
 /* ── 创建工单 Modal ── */
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1000;
+  position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1000;
   display: flex; align-items: center; justify-content: center;
   animation: modal-fade .2s ease;
 }
 @keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
 .modal-card {
-  background: #13132b; border: 1px solid rgba(255,255,255,.08);
-  border-radius: 20px; width: 540px; max-height: 85vh; overflow-y: auto;
+  background: #ffffff; border: 1px solid #e5e9f0;
+  border-radius: 12px; width: 540px; max-height: 85vh; overflow-y: auto;
+  box-shadow: 0 20px 60px rgba(15,23,42,.18);
   animation: modal-up .25s ease;
 }
 @keyframes modal-up { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 .modal-header {
-  padding: 20px 26px; border-bottom: 1px solid rgba(255,255,255,.06);
+  padding: 18px 24px; border-bottom: 1px solid #e5e9f0;
   display: flex; align-items: center; justify-content: space-between;
 }
-.modal-header h2 { font-size: 17px; font-weight: 700; }
+.modal-header h2 { font-size: 16px; font-weight: 700; color: #17335c; }
 .modal-close {
-  width: 30px; height: 30px; border-radius: 8px; background: rgba(255,255,255,.04);
-  border: none; color: #94a3b8; cursor: pointer; font-size: 14px; transition: .2s;
+  width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9;
+  border: none; color: #7c8aa5; cursor: pointer; font-size: 14px; transition: .2s;
 }
-.modal-close:hover { background: rgba(255,255,255,.1); color: #fff; }
-.modal-body { padding: 22px 26px; }
+.modal-close:hover { background: #e5e9f0; color: #374151; }
+.modal-body { padding: 20px 24px; }
 .modal-footer {
-  padding: 16px 26px; border-top: 1px solid rgba(255,255,255,.06);
+  padding: 14px 24px; border-top: 1px solid #e5e9f0;
   display: flex; justify-content: flex-end; gap: 10px;
 }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form-group { display: flex; flex-direction: column; gap: 5px; }
-.form-group label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+.form-group label { font-size: 12px; color: #7c8aa5; font-weight: 600; }
 .form-group input, .form-group select, .form-group textarea {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
-  border-radius: 9px; padding: 9px 12px; color: #e2e8f0; font-size: 13px;
+  background: #ffffff; border: 1px solid #d5dce8;
+  border-radius: 8px; padding: 9px 12px; color: #1f2937; font-size: 13px;
   outline: none; transition: .2s; font-family: inherit;
 }
 .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
-  border-color: #6366f1;
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29,78,216,0.08);
 }
 .form-group textarea { resize: vertical; min-height: 60px; }
 .form-group select { cursor: pointer; }
-.form-group select option { background: #13132b; color: #e2e8f0; }
-.form-group .readonly { background: rgba(255,255,255,.015); border-style: dashed; cursor: default; color: #94a3b8; }
+.form-group select option { background: #ffffff; color: #1f2937; }
+.form-group .readonly { background: #f8fafc; border-style: dashed; cursor: default; color: #7c8aa5; }
 .modal-btn-cancel {
-  padding: 9px 20px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12);
-  background: transparent; color: #cbd5e1; font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s;
+  padding: 9px 20px; border-radius: 8px; border: 1px solid #d5dce8;
+  background: #ffffff; color: #5b6b83; font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s;
 }
-.modal-btn-cancel:hover { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.04); }
+.modal-btn-cancel:hover { border-color: #a8bcd9; background: #f8fafc; }
 .modal-btn-submit {
-  padding: 9px 20px; border-radius: 10px; border: none; background: #6366f1; color: #fff;
+  padding: 9px 20px; border-radius: 8px; border: none; background: #1d4ed8; color: #fff;
   font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s;
 }
-.modal-btn-submit:hover { background: #4f46e5; box-shadow: 0 4px 18px rgba(99,102,241,.35); }
+.modal-btn-submit:hover { background: #1e40af; box-shadow: 0 4px 14px rgba(29,78,216,.28); }
 .dash-toast {
   position: fixed; top: 24px; right: 24px; z-index: 2000;
-  padding: 12px 22px; border-radius: 12px; font-size: 13px; font-weight: 600;
-  background: #065f46; color: #6ee7b7; border: 1px solid rgba(52,211,153,.3);
-  box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  padding: 12px 22px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  background: #f0fdf6; color: #0f766e; border: 1px solid #bfe3dd;
+  box-shadow: 0 8px 30px rgba(15,23,42,.12);
   animation: toast-in .3s ease;
 }
 @keyframes toast-in { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }

@@ -133,13 +133,13 @@ async function loadAll() {
         { xAxis: nearestIdx(data, t.medium),   label: `中等 ${fmtPercent(t.medium)}` },
       ] : []
       chart.setOption({
-        tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-        legend: { top: 0, textStyle: { color: '#9ca3af', fontSize: 11 }, itemGap: 14 },
+        tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
+        legend: { top: 0, textStyle: { color: '#7c8aa5', fontSize: 11 }, itemGap: 14 },
         grid: { left: 50, right: 50, top: 36, bottom: 20 },
-        xAxis: { type: 'category', data: data.map(d => d.threshold), axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } } },
+        xAxis: { type: 'category', data: data.map(d => d.threshold), axisLabel: { color: '#7c8aa5' }, axisLine: { lineStyle: { color: '#d5dce8' } } },
         yAxis: [
-          { type: 'value', name: '数量', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } },
-          { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#9ca3af' }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } }
+          { type: 'value', name: '数量', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } },
+          { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#7c8aa5' }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } }
         ],
         series: [
           { name: 'TP(挽留成功)', type: 'bar', stack: 'count', data: data.map(d => d.tp), itemStyle: { color: '#22c55e' } },
@@ -326,7 +326,7 @@ onBeforeUnmount(() => {
         <div class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
-              <tr class="text-xs text-gray-500 border-b border-white/5">
+              <tr class="text-xs text-gray-500 border-b border-[#e5e9f0]">
                 <th class="text-left py-2 pr-3 font-medium">价值层</th>
                 <th v-for="lv in LEVEL_ORDER" :key="lv" class="text-left py-2 px-3 font-medium">
                   {{ LEVEL_TITLES[lv] }}
@@ -334,7 +334,7 @@ onBeforeUnmount(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="row in matrixRows" :key="row.tier" class="border-b border-white/5 last:border-0">
+              <tr v-for="row in matrixRows" :key="row.tier" class="border-b border-[#e5e9f0] last:border-0">
                 <!-- 价值层 + 渠道 -->
                 <td class="py-3 pr-3 align-top whitespace-nowrap">
                   <div class="font-medium" :style="{ color: row.color }">{{ row.label }}</div>
@@ -366,7 +366,7 @@ onBeforeUnmount(() => {
                     样本不足（&lt;{{ matrix.min_cell_sample }}），不给统计量
                   </div>
 
-                  <div class="text-xs text-gray-500 mt-2 pt-2 border-t border-white/5">
+                  <div class="text-xs text-gray-500 mt-2 pt-2 border-t border-[#e5e9f0]">
                     {{ c.action }}
                   </div>
                 </td>
@@ -375,7 +375,7 @@ onBeforeUnmount(() => {
           </table>
         </div>
 
-        <div class="mt-4 pt-3 border-t border-white/5 text-xs text-gray-600 leading-relaxed">
+        <div class="mt-4 pt-3 border-t border-[#e5e9f0] text-xs text-gray-600 leading-relaxed">
           <span class="text-gray-500">口径：</span>
           人数 / 历史流失率 / 平均余额 / 可挽回金额均为测试集实测（描述性统计，不外推未来收益）。
           可挽回金额 = 该格流失客户余额合计 × 全局召回率 {{ fmtPercent(matrix.recall_used) }}。
@@ -421,36 +421,36 @@ onBeforeUnmount(() => {
 /* 口径来源标注 —— 让「推算值」与「实测值」在视觉上不可混淆 */
 .src-note {
   font-size: 11.5px; line-height: 1.65;
-  padding: 10px 14px; border-radius: 10px;
-  border-left: 3px solid #6366f1;
-  background: rgba(99,102,241,.07);
-  color: #a5b4fc;
+  padding: 10px 14px; border-radius: 8px;
+  border-left: 3px solid #1d4ed8;
+  background: #eef3fb;
+  color: #1d4ed8;
 }
-.src-note b { color: #c7d2fe; }
+.src-note b { color: #17335c; }
 
 .mini-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .mini-table th {
-  text-align: left; padding: 6px 10px; color: #64748b; font-weight: 600;
-  border-bottom: 1px solid rgba(255,255,255,.06);
+  text-align: left; padding: 6px 10px; color: #7c8aa5; font-weight: 600;
+  border-bottom: 1px solid #e5e9f0;
 }
 .mini-table td {
-  padding: 6px 10px; color: #cbd5e1;
-  border-bottom: 1px solid rgba(255,255,255,.03);
+  padding: 6px 10px; color: #374151;
+  border-bottom: 1px solid #f0f3f8;
 }
 .mini-table .r { text-align: right; }
 
 .empty-state {
   text-align: center; padding: 28px 16px;
-  border: 1px dashed rgba(255,255,255,.1); border-radius: 12px;
-  background: rgba(255,255,255,.012);
+  border: 1px dashed #e5e9f0; border-radius: 10px;
+  background: #f8fafc;
 }
 .btn-retry {
   margin-top: 14px; padding: 7px 18px; border-radius: 8px;
   font-size: 12.5px; font-weight: 600; cursor: pointer;
-  color: #cbd5e1; background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.12); transition: .15s;
+  color: #5b6b83; background: #ffffff;
+  border: 1px solid #d5dce8; transition: .15s;
 }
-.btn-retry:hover { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.04); }
+.btn-retry:hover { border-color: #a8bcd9; background: #f8fafc; }
 
 /* 矩阵格可点进客户列表 —— 给出指针与悬停反馈，否则用户不知道能点 */
 .cell-link {
@@ -458,5 +458,5 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   transition: background .15s;
 }
-.cell-link:hover { background: rgba(99,102,241,.09); }
+.cell-link:hover { background: #eef3fb; }
 </style>

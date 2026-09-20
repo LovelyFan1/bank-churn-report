@@ -81,7 +81,7 @@
                 <td><span class="risk-badge" :class="riskBadgeClass(o.risk_level)">{{ riskLabel(o.risk_level) }}</span></td>
                 <td>
                   <div class="flex items-center gap-2">
-                    <div class="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
+                    <div class="w-16 h-1.5 rounded-full bg-[#eef1f6] overflow-hidden">
                       <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(o.probability), background: probColor(o.probability, o.thresholds_snapshot) }"></div>
                     </div>
                     <span class="text-xs font-semibold" :style="{ color: probColor(o.probability, o.thresholds_snapshot) }">{{ fmtPercent(o.probability) }}</span>
@@ -480,128 +480,119 @@ defineExpose({ openCreate })
 </script>
 
 <style scoped>
-/* ── Reusing project patterns ── */
+/* ── 卡片覆盖：本页局部用更浅的圆角（全局 .glass-card 已是白卡） ── */
 .glass-card {
-  background: rgba(255,255,255,.02);
-  border: 1px solid rgba(255,255,255,.06);
-  border-radius: 16px;
+  border-radius: 10px;
 }
 
 /* ── Buttons ── */
 .btn {
-  padding: 10px 20px; border-radius: 10px; border: none; font-size: 14px; font-weight: 600;
+  padding: 10px 20px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600;
   cursor: pointer; transition: .2s; display: inline-flex; align-items: center; gap: 6px;
 }
-.btn-primary { background: #6366f1; color: #fff; }
-.btn-primary:hover { background: #4f46e5; box-shadow: 0 4px 18px rgba(99,102,241,.35); }
+.btn-primary { background: #1d4ed8; color: #fff; }
+.btn-primary:hover { background: #1e40af; box-shadow: 0 4px 14px rgba(29,78,216,.28); }
 .btn-outline {
-  background: transparent; border: 1px solid rgba(255,255,255,.12); color: #cbd5e1;
+  background: #ffffff; border: 1px solid #d5dce8; color: #5b6b83;
 }
-.btn-outline:hover { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.04); }
-.btn-outline.active { background: rgba(99,102,241,.15); border-color: #6366f1; color: #a5b4fc; }
+.btn-outline:hover { border-color: #a8bcd9; background: #f8fafc; }
+.btn-outline.active { background: #eef3fb; border-color: #1d4ed8; color: #1d4ed8; }
 .btn-sm { padding: 6px 14px; font-size: 12px; border-radius: 7px; }
 .btn-xs { padding: 4px 10px; font-size: 11px; border-radius: 5px; }
-
-/* ── Search ── */
-/* .search-input 已全局化到 style.css（原先两个页面各写一份，宽度还不一致） */
 
 /* ── Table ── */
 table { width: 100%; border-collapse: collapse; }
 thead th {
   text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 600;
-  color: #94a3b8; text-transform: uppercase; letter-spacing: .5px;
-  border-bottom: 1px solid rgba(255,255,255,.06); background: rgba(255,255,255,.015);
+  color: #7c8aa5; text-transform: uppercase; letter-spacing: .5px;
+  border-bottom: 1px solid #e5e9f0; background: #f8fafc;
 }
 tbody td {
-  padding: 12px 16px; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,.03);
-  vertical-align: middle;
+  padding: 12px 16px; font-size: 13px; border-bottom: 1px solid #f0f3f8;
+  vertical-align: middle; color: #374151;
 }
 tbody tr { transition: .15s; }
-tbody tr:hover { background: rgba(255,255,255,.02); }
-
-/* ── 徽章 ──
-   .risk-badge / .risk-* 已移至 style.css（全局），类名由 utils/risk.js 生成。 */
+tbody tr:hover { background: #f8fafc; }
 
 /* ── Status ── */
 .status-tag {
   display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 20px;
   font-size: 11px; font-weight: 600;
 }
-.status-tag.pending     { background: rgba(251,191,36,.1); color: #fbbf24; }
-.status-tag.in_progress { background: rgba(96,165,250,.1); color: #60a5fa; }
-.status-tag.completed   { background: rgba(52,211,153,.1); color: #34d399; }
-.status-tag.lost        { background: rgba(248,113,113,.1); color: #f87171; }
+.status-tag.pending     { background: #fef9c3; color: #a16207; }
+.status-tag.in_progress { background: #e8f0fe; color: #1d4ed8; }
+.status-tag.completed   { background: #e0f2f1; color: #0f766e; }
+.status-tag.lost        { background: #fde8e8; color: #c81e1e; }
 .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
-.status-dot.pending     { background: #fbbf24; }
-.status-dot.in_progress { background: #60a5fa; }
-.status-dot.completed   { background: #34d399; }
-.status-dot.lost        { background: #f87171; }
-
-/* ── Risk tags ── */
-/* .risk-tag 已全局化到 style.css（原先三个视图各写一份，内容不一致） */
+.status-dot.pending     { background: #a16207; }
+.status-dot.in_progress { background: #1d4ed8; }
+.status-dot.completed   { background: #0f766e; }
+.status-dot.lost        { background: #c81e1e; }
 
 /* ── Detail Panel ── */
 .detail-panel {
-  background: rgba(255,255,255,.015); border: 1px solid rgba(255,255,255,.05);
-  border-radius: 12px; padding: 18px 22px; margin: 4px 16px 12px;
+  background: #f8fafc; border: 1px solid #e5e9f0;
+  border-radius: 10px; padding: 18px 22px; margin: 4px 16px 12px;
 }
-.detail-panel dt { font-size: 11px; color: #64748b; margin-bottom: 2px; }
-.detail-panel dd { font-size: 13px; }
+.detail-panel dt { font-size: 11px; color: #9aa7bd; margin-bottom: 2px; }
+.detail-panel dd { font-size: 13px; color: #374151; }
 
 /* ── Modal ── */
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1000;
+  position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1000;
   display: flex; align-items: center; justify-content: center;
   animation: fadeIn .2s ease;
 }
 .modal {
-  background: #13132b; border: 1px solid rgba(255,255,255,.08);
-  border-radius: 20px; width: 560px; max-height: 85vh; overflow-y: auto;
+  background: #ffffff; border: 1px solid #e5e9f0;
+  border-radius: 12px; width: 560px; max-height: 85vh; overflow-y: auto;
   animation: slideUp .25s ease;
+  box-shadow: 0 20px 60px rgba(15,23,42,.18);
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 .modal-header {
-  padding: 20px 26px; border-bottom: 1px solid rgba(255,255,255,.06);
+  padding: 18px 24px; border-bottom: 1px solid #e5e9f0;
   display: flex; align-items: center; justify-content: space-between;
 }
-.modal-header h2 { font-size: 17px; font-weight: 700; }
+.modal-header h2 { font-size: 16px; font-weight: 700; color: #17335c; }
 .modal-close {
-  width: 30px; height: 30px; border-radius: 8px; background: rgba(255,255,255,.04);
-  border: none; color: #94a3b8; cursor: pointer; font-size: 14px; transition: .2s;
+  width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9;
+  border: none; color: #7c8aa5; cursor: pointer; font-size: 14px; transition: .2s;
 }
-.modal-close:hover { background: rgba(255,255,255,.1); color: #fff; }
-.modal-body { padding: 22px 26px; }
+.modal-close:hover { background: #e5e9f0; color: #374151; }
+.modal-body { padding: 20px 24px; }
 .modal-footer {
-  padding: 16px 26px; border-top: 1px solid rgba(255,255,255,.06);
+  padding: 14px 24px; border-top: 1px solid #e5e9f0;
   display: flex; justify-content: flex-end; gap: 10px;
 }
 
 /* ── Form ── */
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form-group { display: flex; flex-direction: column; gap: 5px; }
-.form-group label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+.form-group label { font-size: 12px; color: #7c8aa5; font-weight: 600; }
 .form-group input, .form-group select, .form-group textarea {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
-  border-radius: 9px; padding: 9px 12px; color: #e2e8f0; font-size: 13px;
+  background: #ffffff; border: 1px solid #d5dce8;
+  border-radius: 8px; padding: 9px 12px; color: #1f2937; font-size: 13px;
   outline: none; transition: .2s; font-family: inherit;
 }
 .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
-  border-color: #6366f1;
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29,78,216,.08);
 }
 .form-group textarea { resize: vertical; min-height: 70px; }
 .form-group select { cursor: pointer; }
-.form-group select option { background: #13132b; color: #e2e8f0; }
+.form-group select option { background: #ffffff; color: #1f2937; }
 .form-group .readonly {
-  background: rgba(255,255,255,.015); border-style: dashed; cursor: default; color: #94a3b8;
+  background: #f8fafc; border-style: dashed; cursor: default; color: #7c8aa5;
 }
 
 /* ── Toast ── */
 .toast {
   position: fixed; top: 24px; right: 24px; z-index: 2000;
-  padding: 12px 22px; border-radius: 12px; font-size: 13px; font-weight: 600;
-  background: #065f46; color: #6ee7b7; border: 1px solid rgba(52,211,153,.3);
-  box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  padding: 12px 22px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  background: #f0fdf6; color: #0f766e; border: 1px solid #bfe3dd;
+  box-shadow: 0 8px 30px rgba(15,23,42,.12);
   animation: slideIn .3s ease;
 }
 @keyframes slideIn { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }

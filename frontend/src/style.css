@@ -1,29 +1,31 @@
 @import "tailwindcss";
 
+/* ── 滚动条（浅色适配）── */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #0f0f23;
+  background: #f1f5f9;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #3a3a5c;
+  background: #cbd5e1;
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #5a5a7c;
+  background: #94a3b8;
 }
 
 body {
   margin: 0;
   padding: 0;
-  background: #0a0a1a;
-  color: #e0e0e0;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #f4f6fa;          /* 浅灰蓝底 —— 银行管理台常用底色 */
+  color: #1f2937;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+               'PingFang SC', 'Microsoft YaHei', sans-serif;
 }
 
 #app {
@@ -31,74 +33,75 @@ body {
   min-height: 100vh;
 }
 
+/* ── 卡片：白卡 + 轻投影，替代毛玻璃 ── */
 .glass-card {
-  background: rgba(255, 255, 255, 0.03);
-  backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
+  background: #ffffff;
+  border: 1px solid #e5e9f0;
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(15, 40, 80, 0.05);
 }
 
 .glass-card:hover {
-  border-color: rgba(99, 102, 241, 0.3);
-  box-shadow: 0 0 30px rgba(99, 102, 241, 0.08);
+  border-color: #c7d6ee;
+  box-shadow: 0 4px 16px rgba(15, 40, 80, 0.08);
 }
 
 .metric-card {
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(168, 85, 247, 0.05) 100%);
-  border: 1px solid rgba(99, 102, 241, 0.15);
-  border-radius: 16px;
+  background: #ffffff;
+  border: 1px solid #e5e9f0;
+  border-radius: 10px;
   padding: 24px;
-  transition: all 0.3s ease;
+  transition: all 0.2s ease;
 }
 
 .metric-card:hover {
   transform: translateY(-2px);
-  border-color: rgba(99, 102, 241, 0.4);
-  box-shadow: 0 8px 32px rgba(99, 102, 241, 0.15);
+  box-shadow: 0 6px 20px rgba(15, 40, 80, 0.08);
 }
 
+/* ── 侧边栏链接（浅色侧栏）── */
 .sidebar-link {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 16px;
+  padding: 11px 14px;
   border-radius: 8px;
-  color: #9ca3af;
+  color: #5b6b83;
   text-decoration: none;
-  transition: all 0.2s ease;
+  transition: all 0.15s ease;
   font-size: 14px;
 }
 
 .sidebar-link:hover {
-  background: rgba(99, 102, 241, 0.1);
-  color: #e0e0e0;
+  background: #eef3fb;
+  color: #1d4ed8;
 }
 
 .sidebar-link.active {
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.2) 0%, rgba(168, 85, 247, 0.1) 100%);
-  color: #a5b4fc;
-  border-left: 3px solid #6366f1;
+  background: #e8f0fe;
+  color: #1d4ed8;
+  border-left: 3px solid #1d4ed8;   /* 银行标准蓝 */
+  font-weight: 600;
 }
 
+/* ── 页面标题（深色实色，替代渐变文字）── */
 .page-title {
-  font-size: 28px;
+  font-size: 22px;
   font-weight: 700;
-  background: linear-gradient(135deg, #a5b4fc 0%, #c084fc 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  margin-bottom: 8px;
+  color: #17335c;
+  margin-bottom: 6px;
 }
 
 .page-subtitle {
-  color: #6b7280;
-  font-size: 14px;
+  color: #7c8aa5;
+  font-size: 13px;
 }
 
 /* ── 风险徽章（全局统一）──────────────────────────────────
    四个视图原先各自 <style scoped> 定义了一套 .risk-* / .badge-*，
    且颜色不一致。现收敛到全局一处，类名由 utils/risk.js 的
-   riskBadgeClass() 生成，配色与等级语义一一对应。          */
+   riskBadgeClass() 生成，配色与等级语义一一对应。
+   浅色底适配：语义色（红/橙/黄/绿）保留，加深一档保证对比度。 */
 .risk-badge {
   display: inline-block;
   padding: 2px 10px;
@@ -108,74 +111,74 @@ body {
   white-space: nowrap;
 }
 
-.risk-critical { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
-.risk-high     { background: rgba(249, 115, 22, 0.15); color: #fdba74; }
-.risk-medium   { background: rgba(250, 204, 21, 0.12); color: #facc15; }
-.risk-low      { background: rgba(34, 211, 238, 0.12); color: #22d3ee; }
+.risk-critical { background: #fde8e8; color: #c81e1e; }
+.risk-high     { background: #fdf0e2; color: #b45309; }
+.risk-medium   { background: #fef9c3; color: #a16207; }
+.risk-low      { background: #e0f2f1; color: #0f766e; }
 
-/* 风险因素标签 —— 与 .risk-badge 同理，原先在 CustomerManagement / WorkOrders /
-   Dashboard 三个视图各自 scoped 定义（内容还不一致），现收敛到这里一处。 */
+/* 风险因素标签 —— 与 .risk-badge 同理，收敛到全局一处。 */
 .risk-tag {
   display: inline-block;
   font-size: 11px;
   padding: 2px 7px;
   border-radius: 4px;
-  background: rgba(248, 113, 113, 0.1);
-  color: #f87171;
+  background: #fde8e8;
+  color: #b91c1c;
   margin-right: 3px;
   margin-bottom: 3px;
 }
 
-/* ── 工具栏控件（全局统一）────────────────────────────────
-   这两个类原先只定义在 CustomerManagement.vue 的 <style scoped> 里，
-   别的页面写 class="select" / "search-input" 拿不到样式，落回浏览器默认外观
-   —— 于是同一个工具栏里，原生下拉和自定义按钮放一起明显不搭。
-   与 .risk-badge / .risk-tag 同样的收敛做法。                    */
+/* ── 工具栏控件（全局统一，浅色表单）───────────────────── */
 .select {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid #d5dce8;
+  border-radius: 8px;
   padding: 8px 12px;
-  color: #e2e8f0;
+  color: #1f2937;
   font-size: 13px;
   outline: none;
   cursor: pointer;
-  /* 跟随暗色主题，否则 Windows/Chrome 会按系统亮色渲染下拉箭头与弹层 */
-  color-scheme: dark;
 }
-.select:hover { border-color: rgba(255, 255, 255, 0.16); }
-.select:focus { border-color: rgba(99, 102, 241, 0.5); }
-/* 下拉弹层是原生控件，背景需显式指定，否则在暗色页面上是刺眼的白 */
-.select option { background: #13132b; color: #e2e8f0; }
+.select:hover { border-color: #a8bcd9; }
+.select:focus {
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.08);
+}
+.select option { background: #ffffff; color: #1f2937; }
 
-/* 文本 / 数字输入框 —— 与 .select 同一套配色，避免同一表单里两种外观 */
 .input {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid #d5dce8;
+  border-radius: 8px;
   padding: 8px 12px;
-  color: #e2e8f0;
+  color: #1f2937;
   font-size: 13px;
   outline: none;
-  color-scheme: dark;
 }
-.input:hover { border-color: rgba(255, 255, 255, 0.16); }
-.input:focus { border-color: rgba(99, 102, 241, 0.5); }
-.input::placeholder { color: #6b7280; }
+.input:hover { border-color: #a8bcd9; }
+.input:focus {
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.08);
+}
+.input::placeholder { color: #9aa7bd; }
 
 .search-input {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid #d5dce8;
+  border-radius: 8px;
   padding: 8px 12px;
-  color: #e2e8f0;
+  color: #1f2937;
   font-size: 13px;
   outline: none;
   min-width: 220px;
 }
-.search-input::placeholder { color: #6b7280; }
-.search-input:focus { border-color: rgba(99, 102, 241, 0.5); }
+.search-input::placeholder { color: #9aa7bd; }
+.search-input:focus {
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.08);
+}
 
+/* ── 过渡动画 ── */
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.25s ease;

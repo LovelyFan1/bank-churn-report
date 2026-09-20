@@ -170,7 +170,7 @@
               <td><span class="risk-badge" :class="riskBadgeClass(c.risk_level)">{{ riskLabel(c.risk_level) }}</span></td>
               <td>
                 <div class="flex items-center gap-2">
-                  <div class="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
+                  <div class="w-16 h-1.5 rounded-full bg-[#eef1f6] overflow-hidden">
                     <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(c.probability), background: probColor(c.probability, riskInfo?.thresholds) }"></div>
                   </div>
                   <span class="text-xs font-semibold" :style="{ color: probColor(c.probability, riskInfo?.thresholds) }">{{ fmtPercent(c.probability) }}</span>
@@ -644,121 +644,107 @@ watch(() => route.query, () => {
 /* ── 风险分级标准 ── */
 .risk-banner {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  padding: 10px 16px; border-radius: 12px; font-size: 12px; color: #a5b4fc;
-  background: rgba(99,102,241,.08); border: 1px solid rgba(99,102,241,.2);
+  padding: 10px 16px; border-radius: 8px; font-size: 12px; color: #1d4ed8;
+  background: #eef3fb; border: 1px solid #c7d6ee;
 }
 .risk-banner-item { font-weight: 700; }
 
-/* ── 搜索 / 下拉 ── */
-/* .search-input 已全局化到 style.css */
-
-/* ── 徽章 ──
-   .badge 已移除：列表里的风险徽章改用全局 .risk-badge（见 style.css），
-   避免 scoped 与全局两套同名类互相覆盖。 */
-
 /* ── Tabs ── */
-.tabs { display: flex; gap: 4px; background: rgba(255,255,255,.03); padding: 4px; border-radius: 10px; }
+.tabs { display: flex; gap: 4px; background: #f1f5f9; padding: 4px; border-radius: 8px; }
 .tab {
-  padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600;
-  color: #94a3b8; cursor: pointer; transition: .15s; border: none; background: transparent;
+  padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  color: #7c8aa5; cursor: pointer; transition: .15s; border: none; background: transparent;
   white-space: nowrap;
 }
-.tab:hover { color: #e2e8f0; }
-.tab.active { background: rgba(99,102,241,.18); color: #a5b4fc; }
-
-/* .select 已全局化到 style.css（原先只在本页 scoped 定义，其他页面用不到） */
+.tab:hover { color: #1d4ed8; }
+.tab.active { background: #ffffff; color: #1d4ed8; box-shadow: 0 1px 3px rgba(15,40,80,.08); }
 
 /* ── Table ── */
 table { width: 100%; border-collapse: collapse; }
 thead th {
   text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 600;
-  color: #94a3b8; text-transform: uppercase; letter-spacing: .5px;
-  border-bottom: 1px solid rgba(255,255,255,.06); background: rgba(255,255,255,.015);
+  color: #7c8aa5; text-transform: uppercase; letter-spacing: .5px;
+  border-bottom: 1px solid #e5e9f0; background: #f8fafc;
   white-space: nowrap;
 }
 tbody td {
-  padding: 12px 16px; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,.03);
-  vertical-align: middle;
+  padding: 12px 16px; font-size: 13px; border-bottom: 1px solid #f0f3f8;
+  vertical-align: middle; color: #374151;
 }
 tbody tr { transition: .15s; }
-tbody tr:hover { background: rgba(255,255,255,.02); }
+tbody tr:hover { background: #f8fafc; }
 /* 整行可点进详情 —— 给出指针与悬停反馈，否则用户不知道能点 */
 .row-clickable { cursor: pointer; }
-.row-clickable:hover { background: rgba(99,102,241,.07) !important; }
+.row-clickable:hover { background: #eef3fb !important; }
 
 /* 批量操作条 —— 选中时出现 */
 .batch-bar {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-  padding: 10px 16px; border-radius: 12px;
-  background: rgba(99,102,241,.1); border: 1px solid rgba(99,102,241,.28);
+  padding: 10px 16px; border-radius: 8px;
+  background: #eef3fb; border: 1px solid #c7d6ee;
 }
 .batch-result {
-  padding: 12px 16px; border-radius: 12px; font-size: 13px;
-  background: rgba(34,197,94,.08); border: 1px solid rgba(34,197,94,.25); color: #86efac;
+  padding: 12px 16px; border-radius: 8px; font-size: 13px;
+  background: #eefaf7; border: 1px solid #bfe3dd; color: #0f766e;
 }
 .batch-result.has-fail {
-  background: rgba(245,158,11,.08); border-color: rgba(245,158,11,.28); color: #fcd34d;
+  background: #fef9e7; border-color: #f0dfa8; color: #a16207;
 }
-.fail-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #fca5a5; }
+.fail-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #c81e1e; }
 .fail-list li { margin-top: 2px; }
 
-/* ── Badge ──
-   .risk-badge / .risk-* 已移至 style.css（全局），由 utils/risk.js 的
-   riskBadgeClass() 生成类名，四个视图共用一套配色。 */
-
-/* ── Mini tags ── */
 /* ── Mini tags ── */
 .tag-mini { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 11px; }
-.tag-active   { background: rgba(52,211,153,.12); color: #34d399; }
-.tag-inactive { background: rgba(148,163,184,.12); color: #94a3b8; }
-.tag-order    { background: rgba(96,165,250,.12); color: #60a5fa; }
+.tag-active   { background: #e0f2f1; color: #0f766e; }
+.tag-inactive { background: #f1f5f9; color: #64748b; }
+.tag-order    { background: #e8f0fe; color: #1d4ed8; }
 
 /* ── Buttons ── */
-.btn { padding: 10px 20px; border-radius: 10px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: .2s; display: inline-flex; align-items: center; gap: 6px; }
-.btn-primary { background: #6366f1; color: #fff; }
-.btn-primary:hover { background: #4f46e5; box-shadow: 0 4px 18px rgba(99,102,241,.35); }
-.btn-outline { background: transparent; border: 1px solid rgba(255,255,255,.12); color: #cbd5e1; }
-.btn-outline:hover { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.04); }
+.btn { padding: 10px 20px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: .2s; display: inline-flex; align-items: center; gap: 6px; }
+.btn-primary { background: #1d4ed8; color: #fff; }
+.btn-primary:hover { background: #1e40af; box-shadow: 0 4px 14px rgba(29,78,216,.28); }
+.btn-outline { background: #ffffff; border: 1px solid #d5dce8; color: #5b6b83; }
+.btn-outline:hover { border-color: #a8bcd9; background: #f8fafc; }
 .btn-outline:disabled { opacity: .35; cursor: not-allowed; }
 .btn-sm { padding: 6px 14px; font-size: 12px; border-radius: 7px; }
-.btn-disabled { padding: 6px 14px; font-size: 12px; border-radius: 7px; background: rgba(255,255,255,.04); color: #64748b; cursor: not-allowed; border: none; }
-
-/* ── Risk tag ── */
-/* .risk-tag 已全局化到 style.css（原先三个视图各写一份，内容不一致） */
+.btn-disabled { padding: 6px 14px; font-size: 12px; border-radius: 7px; background: #f1f5f9; color: #9aa7bd; cursor: not-allowed; border: none; }
 
 /* ── Modal ── */
-.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn .2s ease; }
-.modal { background: #13132b; border: 1px solid rgba(255,255,255,.08); border-radius: 20px; width: 560px; max-height: 88vh; overflow-y: auto; animation: slideUp .25s ease; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn .2s ease; }
+.modal { background: #ffffff; border: 1px solid #e5e9f0; border-radius: 12px; width: 560px; max-height: 88vh; overflow-y: auto; animation: slideUp .25s ease; box-shadow: 0 20px 60px rgba(15,23,42,.18); }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-.modal-header { padding: 20px 26px; border-bottom: 1px solid rgba(255,255,255,.06); display: flex; align-items: center; justify-content: space-between; }
-.modal-header h2 { font-size: 17px; font-weight: 700; }
-.modal-close { width: 30px; height: 30px; border-radius: 8px; background: rgba(255,255,255,.04); border: none; color: #94a3b8; cursor: pointer; font-size: 14px; transition: .2s; }
-.modal-close:hover { background: rgba(255,255,255,.1); color: #fff; }
-.modal-body { padding: 22px 26px; }
-.modal-footer { padding: 16px 26px; border-top: 1px solid rgba(255,255,255,.06); display: flex; justify-content: flex-end; gap: 10px; }
+.modal-header { padding: 18px 24px; border-bottom: 1px solid #e5e9f0; display: flex; align-items: center; justify-content: space-between; }
+.modal-header h2 { font-size: 16px; font-weight: 700; color: #17335c; }
+.modal-close { width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9; border: none; color: #7c8aa5; cursor: pointer; font-size: 14px; transition: .2s; }
+.modal-close:hover { background: #e5e9f0; color: #374151; }
+.modal-body { padding: 20px 24px; }
+.modal-footer { padding: 14px 24px; border-top: 1px solid #e5e9f0; display: flex; justify-content: flex-end; gap: 10px; }
 
 /* ── Form ── */
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form-group { display: flex; flex-direction: column; gap: 5px; }
 .form-group.full { grid-column: 1 / -1; }
-.form-group label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+.form-group label { font-size: 12px; color: #7c8aa5; font-weight: 600; }
 .form-group input, .form-group select, .form-group textarea {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
-  border-radius: 9px; padding: 9px 12px; color: #e2e8f0; font-size: 13px;
+  background: #ffffff; border: 1px solid #d5dce8;
+  border-radius: 8px; padding: 9px 12px; color: #1f2937; font-size: 13px;
   outline: none; transition: .2s; font-family: inherit;
 }
-.form-group input:focus, .form-group select:focus, .form-group textarea:focus { border-color: #6366f1; }
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29,78,216,.08);
+}
 .form-group textarea { resize: vertical; min-height: 60px; }
-.form-group select option { background: #13132b; color: #e2e8f0; }
-.readonly { background: rgba(255,255,255,.015); border-style: dashed; cursor: default; color: #94a3b8; }
+.form-group select option { background: #ffffff; color: #1f2937; }
+.readonly { background: #f8fafc; border-style: dashed; cursor: default; color: #7c8aa5; }
 
 /* ── Toast ── */
 .toast {
   position: fixed; top: 24px; right: 24px; z-index: 2000;
-  padding: 12px 22px; border-radius: 12px; font-size: 13px; font-weight: 600;
-  background: #065f46; color: #6ee7b7; border: 1px solid rgba(52,211,153,.3);
-  box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  padding: 12px 22px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  background: #f0fdf6; color: #0f766e; border: 1px solid #bfe3dd;
+  box-shadow: 0 8px 30px rgba(15,23,42,.12);
   animation: slideIn .3s ease;
 }
 @keyframes slideIn { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }

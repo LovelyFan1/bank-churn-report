@@ -174,7 +174,7 @@ function back() {
           <div v-else class="space-y-2.5">
             <div v-for="b in shapBars" :key="b.name" class="flex items-center gap-3">
               <span class="text-xs text-gray-400 w-20 shrink-0 text-right">{{ b.name }}</span>
-              <div class="flex-1 h-3 rounded-full bg-white/5 overflow-hidden">
+              <div class="flex-1 h-3 rounded-full bg-[#eef1f6] overflow-hidden">
                 <div class="h-full rounded-full transition-all"
                      :style="{ width: b.width + '%', background: b.positive ? 'rgba(239,68,68,.75)' : 'rgba(34,211,238,.7)' }"></div>
               </div>
@@ -212,7 +212,7 @@ function back() {
             </div>
           </div>
 
-          <div class="mt-5 pt-4 border-t border-white/5 grid grid-cols-3 gap-3 text-xs">
+          <div class="mt-5 pt-4 border-t border-[#e5e9f0] grid grid-cols-3 gap-3 text-xs">
             <div><span class="text-gray-500">产品数</span> <span class="text-gray-300">{{ c.num_products }}</span></div>
             <div><span class="text-gray-500">活跃</span> <span class="text-gray-300">{{ c.is_active_member ? '是' : '否' }}</span></div>
             <div><span class="text-gray-500">在网</span> <span class="text-gray-300">{{ c.tenure }} 年</span></div>
@@ -234,7 +234,7 @@ function back() {
         </div>
         <table v-else class="w-full text-sm">
           <thead>
-            <tr class="text-xs text-gray-500 border-b border-white/5">
+            <tr class="text-xs text-[#7c8aa5] border-b border-[#e5e9f0]">
               <th class="text-left py-2 font-medium">工单号</th>
               <th class="text-left py-2 font-medium">状态</th>
               <th class="text-left py-2 font-medium">渠道</th>
@@ -243,7 +243,7 @@ function back() {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="o in orders" :key="o.id" class="border-b border-white/5 last:border-0">
+            <tr v-for="o in orders" :key="o.id" class="border-b border-[#f0f3f8] last:border-0">
               <td class="py-2 text-gray-400">#{{ o.id }}</td>
               <td class="py-2 text-gray-300">{{ o.status }}</td>
               <td class="py-2 text-gray-400">
@@ -261,11 +261,11 @@ function back() {
 </template>
 
 <style scoped>
-.stat { padding: 12px; border-radius: 12px; background: rgba(255,255,255,.03); }
-.stat-label { font-size: 12px; color: #6b7280; margin-bottom: 4px; }
-.stat-val { font-size: 18px; font-weight: 600; color: #e5e7eb; }
+.stat { padding: 12px; border-radius: 8px; background: #f8fafc; border: 1px solid #e5e9f0; }
+.stat-label { font-size: 12px; color: #7c8aa5; margin-bottom: 4px; }
+.stat-val { font-size: 18px; font-weight: 600; color: #17335c; }
 .action-box {
-  padding: 14px 16px; border-radius: 12px;
-  background: rgba(99,102,241,.08); border: 1px solid rgba(99,102,241,.2);
+  padding: 14px 16px; border-radius: 8px;
+  background: #eef3fb; border: 1px solid #c7d6ee;
 }
 </style>

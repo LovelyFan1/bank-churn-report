@@ -11,7 +11,8 @@
 export const RISK_LEVELS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
 
 const LABELS = { CRITICAL: '极高', HIGH: '高危', MEDIUM: '中等', LOW: '低风险' }
-const COLORS = { CRITICAL: '#ef4444', HIGH: '#fb923c', MEDIUM: '#facc15', LOW: '#22d3ee' }
+// 浅色底适配：语义色（红/橙/黄/绿）保留，加深一档保证对比度
+const COLORS = { CRITICAL: '#c81e1e', HIGH: '#b45309', MEDIUM: '#a16207', LOW: '#0f766e' }
 
 /** 模型未训练时的回退阈值 —— 与后端 risk_scoring._legacy_level 保持一致 */
 export const LEGACY_THRESHOLDS = { critical: 0.7, high: 0.3, medium: 0.1 }
@@ -83,7 +84,7 @@ export function fmtWan(v) {
 // 与阈值同理，边界（VALUE_TIER_HIGH）属后端业务假设。
 
 const TIER_LABELS = { HIGH: '高价值', LOW: '低价值', ZERO: '零余额' }
-const TIER_COLORS = { HIGH: '#a78bfa', LOW: '#60a5fa', ZERO: '#94a3b8' }
+const TIER_COLORS = { HIGH: '#6d28d9', LOW: '#1d4ed8', ZERO: '#64748b' }
 
 /** 触达渠道 —— 与后端 risk_scoring.CHANNEL_BY_TIER 对应 */
 const CHANNEL_LABELS = {

@@ -100,21 +100,58 @@ async function reload() {
   }
 }
 
-async function initCharts() {
-  await nextTick()
+/**
+ * 等待某个 ref 对应的元素真正挂载且具有非零尺寸。
+ * 与 Dashboard 同款竞态修复：图表容器在 <template v-else> 里，
+ * 由 v-if="loading" 控制，一次 nextTick 不保证 DOM 补丁完成，
+ * ECharts 在尺寸为 0 的容器上初始化会得到空白画布。
+ */
+async function waitForEl(refObj, timeout = 1500) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const el = refObj.value
+    if (el && el.clientWidth > 0 && el.clientHeight > 0) return el
+    await nextTick()
+    await new Promise((r) => requestAnimationFrame(r))
+  }
+  return refObj.value && refObj.value.clientWidth > 0 ? refObj.value : null
+}
 
-  // ROC Curves
-  if (rocChart.value && _rocRes) {
-    const chart = echarts.init(rocChart.value)
+/** 逐图容错初始化：一张图失败不影响其余图 */
+async function initOne(refObj, label, initFn) {
+  const el = await waitForEl(refObj)
+  if (!el) {
+    console.warn(`[Models] ${label} 容器未就绪，跳过渲染`)
+    return
+  }
+  try {
+    initFn(el)
+  } catch (e) {
+    console.error(`[Models] ${label} 渲染失败:`, e)
+  }
+}
+
+async function initCharts() {
+  await Promise.all([
+    initOne(rocChart, 'ROC曲线', initRocChart),
+    initOne(radarChart, '性能雷达图', initRadarChart),
+    initOne(featureChart, '特征重要性', initFeatureChart),
+    initOne(shapChart, 'SHAP贡献度', initShapChart),
+  ])
+}
+
+function initRocChart(el) {
+  if (!_rocRes) return
+  const chart = echarts.init(el)
     const curves = _rocRes.curves
     chart.setOption({
-      tooltip: { trigger: 'item', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-      legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 }, itemGap: 16 },
+      tooltip: { trigger: 'item', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
+      legend: { bottom: 0, textStyle: { color: '#7c8aa5', fontSize: 11 }, itemGap: 16 },
       grid: { left: 60, right: 20, top: 30, bottom: 50 },
-      xAxis: { name: 'FPR (假正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } },
-      yAxis: { name: 'TPR (真正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#374151' } }, nameTextStyle: { color: '#9ca3af', fontSize: 11 } },
+      xAxis: { name: 'FPR (假正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' }, axisLine: { lineStyle: { color: '#d5dce8' } }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } },
+      yAxis: { name: 'TPR (真正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' }, axisLine: { lineStyle: { color: '#d5dce8' } }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } },
       series: [
-        { type: 'line', data: [[0, 0], [1, 1]], lineStyle: { color: '#4b5563', type: 'dashed' }, symbol: 'none', silent: true },
+        { type: 'line', data: [[0, 0], [1, 1]], lineStyle: { color: '#d5dce8', type: 'dashed' }, symbol: 'none', silent: true },
         ...Object.entries(curves).map(([name, data], i) => ({
           name,
           type: 'line',
@@ -126,28 +163,28 @@ async function initCharts() {
       ]
     })
     chartInstances.push(chart)
-  }
+}
 
-  // Performance Radar
-  if (radarChart.value && comparison.value) {
-    const chart = echarts.init(radarChart.value)
+function initRadarChart(el) {
+  if (!comparison.value) return
+  const chart = echarts.init(el)
     const models = comparison.value.models
     const metrics = ['accuracy', 'precision', 'recall', 'f1_score', 'auc']
     const metricLabels = ['准确率\nAccuracy', '精确率\nPrecision', '召回率\nRecall', 'F1分数\nF1', 'AUC面积\nAUC']
 
     chart.setOption({
-      tooltip: { backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
-      legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 }, itemGap: 16 },
+      tooltip: { backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
+      legend: { bottom: 0, textStyle: { color: '#7c8aa5', fontSize: 11 }, itemGap: 16 },
       radar: {
         indicator: metricLabels.map(m => ({ name: m, max: 1 })),
         shape: 'polygon',
         splitNumber: 4,
         radius: '60%',
         center: ['50%', '46%'],
-        axisName: { color: '#9ca3af', fontSize: 10, lineHeight: 16 },
-        splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } },
-        splitArea: { areaStyle: { color: ['rgba(99,102,241,0.02)', 'rgba(99,102,241,0.04)'] } },
-        axisLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }
+        axisName: { color: '#7c8aa5', fontSize: 10, lineHeight: 16 },
+        splitLine: { lineStyle: { color: '#eef1f6' } },
+        splitArea: { areaStyle: { color: ['rgba(29,78,216,0.02)', 'rgba(29,78,216,0.04)'] } },
+        axisLine: { lineStyle: { color: '#eef1f6' } }
       },
       series: [{
         type: 'radar',
@@ -161,11 +198,11 @@ async function initCharts() {
       }]
     })
     chartInstances.push(chart)
-  }
+}
 
-  // Feature Importance
-  if (featureChart.value) {
-    const chart = echarts.init(featureChart.value)
+function initFeatureChart(el) {
+  if (!_featRes) return
+  const chart = echarts.init(el)
     const impData = _featRes
     const features = impData.features
     const importance = impData.importance
@@ -179,10 +216,10 @@ async function initCharts() {
       .sort((a, b) => b.value - a.value)
 
     chart.setOption({
-      tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+      tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
       grid: { left: 120, right: 30, top: 10, bottom: 20 },
-      xAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
-      yAxis: { type: 'category', data: sortedFeatures.map(f => fmtLabel(f.name)), axisLabel: { color: '#9ca3af', fontSize: 10 }, axisLine: { lineStyle: { color: '#374151' } } },
+      xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
+      yAxis: { type: 'category', data: sortedFeatures.map(f => fmtLabel(f.name)), axisLabel: { color: '#7c8aa5', fontSize: 10 }, axisLine: { lineStyle: { color: '#d5dce8' } } },
       series: [{
         type: 'bar',
         data: sortedFeatures.map((f, i) => ({
@@ -191,41 +228,40 @@ async function initCharts() {
         })),
         barWidth: 16,
         itemStyle: { borderRadius: [0, 4, 4, 0] },
-        label: { show: true, position: 'right', color: '#9ca3af', fontSize: 10, formatter: (p) => p.value.toFixed(3) }
+        label: { show: true, position: 'right', color: '#7c8aa5', fontSize: 10, formatter: (p) => p.value.toFixed(3) }
       }]
     })
     chartInstances.push(chart)
-  }
+}
 
-  // SHAP Global Importance
-  if (shapChart.value && _shapRes) {
-    const chart = echarts.init(shapChart.value)
+function initShapChart(el) {
+  if (!_shapRes) return
+  const chart = echarts.init(el)
     const bestModel = comparison.value?.best_model
     const shapImp = _shapRes.shap_importance[bestModel] || {}
     const sorted = Object.entries(shapImp)
       .sort((a, b) => b[1] - a[1])
 
     chart.setOption({
-      tooltip: { trigger: 'axis', backgroundColor: 'rgba(15,15,35,0.9)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
+      tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
       grid: { left: 130, right: 30, top: 10, bottom: 20 },
-      xAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }, axisLabel: { color: '#9ca3af' } },
-      yAxis: { type: 'category', data: sorted.map(([k]) => fmtLabel(k)), axisLabel: { color: '#9ca3af', fontSize: 10 }, axisLine: { lineStyle: { color: '#374151' } } },
+      xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
+      yAxis: { type: 'category', data: sorted.map(([k]) => fmtLabel(k)), axisLabel: { color: '#7c8aa5', fontSize: 10 }, axisLine: { lineStyle: { color: '#d5dce8' } } },
       series: [{
         type: 'bar',
         data: sorted.map(([k, v], i) => ({
           value: v,
           itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [
-            { offset: 0, color: '#6366f1' },
-            { offset: 1, color: '#a855f7' }
+            { offset: 0, color: '#1d4ed8' },
+            { offset: 1, color: '#3b82f6' }
           ]) }
         })),
         barWidth: 18,
         itemStyle: { borderRadius: [0, 6, 6, 0] },
-        label: { show: true, position: 'right', color: '#9ca3af', fontSize: 10, formatter: (p) => p.value.toFixed(4) }
+        label: { show: true, position: 'right', color: '#7c8aa5', fontSize: 10, formatter: (p) => p.value.toFixed(4) }
       }]
     })
     chartInstances.push(chart)
-  }
 }
 
 onMounted(async () => {
@@ -267,7 +303,7 @@ onBeforeUnmount(() => {
         <span v-if="training" class="text-xs text-indigo-300">{{ trainingMessage }}</span>
         <button @click="trainModels" :disabled="training"
                 class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50"
-                style="background: linear-gradient(135deg, #6366f1, #a855f7);">
+                style="background: #1d4ed8;">
           {{ training ? '训练中...' : '重新训练' }}
         </button>
       </div>
@@ -303,7 +339,7 @@ onBeforeUnmount(() => {
         <h3 class="text-sm font-medium text-gray-400 mb-4">模型性能对比</h3>
         <table v-if="comparison" class="w-full text-sm">
           <thead>
-            <tr class="text-gray-500 border-b border-white/5">
+            <tr class="text-gray-500 border-b border-[#e5e9f0]">
               <th class="text-left py-3 px-3">模型</th>
               <th class="text-right py-3 px-3" title="准确率">Accuracy<br><span class="text-[10px] text-gray-600">准确率</span></th>
               <th class="text-right py-3 px-3" title="精确率">Precision<br><span class="text-[10px] text-gray-600">精确率</span></th>
@@ -315,7 +351,7 @@ onBeforeUnmount(() => {
           </thead>
           <tbody>
             <tr v-for="(m, i) in comparison.models" :key="m.model_name"
-                :class="['border-b border-white/5', i === 0 ? 'bg-indigo-500/10' : 'hover:bg-white/5']">
+                :class="['border-b border-[#e5e9f0]', i === 0 ? 'bg-[#e8f0fe]' : 'hover:bg-[#f8fafc]']">
               <td class="py-3 px-3 font-medium flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full" :style="{ background: COLORS[i % COLORS.length] }"></span>
                 {{ m.model_name }}
@@ -362,7 +398,7 @@ onBeforeUnmount(() => {
         <h3 class="text-sm font-medium text-gray-400 mb-4">混淆矩阵</h3>
         <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <div v-for="(data, name) in confusionData" :key="name"
-               class="p-4 rounded-lg bg-white/3 border border-white/5">
+               class="p-4 rounded-lg bg-[#f8fafc] border border-[#e5e9f0]">
             <div class="text-xs text-gray-500 mb-3 text-center font-medium">{{ name }}</div>
             <div class="grid grid-cols-2 gap-1 text-center text-xs">
               <div class="p-2 rounded bg-green-500/10 text-green-400">
@@ -388,16 +424,16 @@ onBeforeUnmount(() => {
 <style scoped>
 /* 错误态按钮 —— 本页原本没有 style 块，为「模型未就绪」态补上 */
 .mc-btn {
-  padding: 8px 18px; border-radius: 9px; font-size: 13px; font-weight: 600;
+  padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600;
   cursor: pointer; transition: .15s;
-  color: #cbd5e1; background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #5b6b83; background: #ffffff;
+  border: 1px solid #d5dce8;
 }
-.mc-btn:hover { border-color: rgba(255, 255, 255, 0.25); background: rgba(255, 255, 255, 0.04); }
+.mc-btn:hover { border-color: #a8bcd9; background: #f8fafc; }
 .mc-btn-primary {
   color: #fff; border: none;
-  background: linear-gradient(135deg, #6366f1, #a855f7);
+  background: #1d4ed8;
 }
-.mc-btn-primary:hover { filter: brightness(1.1); }
+.mc-btn-primary:hover { background: #1e40af; }
 .mc-btn:disabled { opacity: .5; cursor: not-allowed; }
 </style>
