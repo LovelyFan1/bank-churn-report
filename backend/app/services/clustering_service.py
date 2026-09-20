@@ -18,7 +18,9 @@ from typing import Dict, Any, Optional
 
 from app.models.customer import Customer
 from app.config import settings
-from app.services.data_loader import DataLoader, CLUSTER_FEATURES, prepare_cluster_features
+from app.services.data_loader import (
+    CLUSTER_FEATURES, prepare_cluster_features, get_cached_customer_df,
+)
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -39,11 +41,28 @@ class ClusteringService:
         return self.db.query(Customer).filter(Customer.cluster_id.isnot(None)).first() is not None
 
     def _get_dataframe(self) -> pd.DataFrame:
-        """加载全量数据（仅用于画像分析，聚类标签已落在 DB 中）。"""
-        if self._df is None:
-            loader = DataLoader(self.db)
-            self._df = loader.load_all()
-        return self._df
+        """取全量客户 DataFrame —— 走**进程级共享缓存**。
+
+        ⚠ 这是「客群洞察页打不开」的性能根因，改前实测（10 万行）：
+            _get_dataframe() 内 DataLoader.load_all()  =  3130 ms   ← 99% 的时间
+            prepare_cluster_features                   =    47 ms
+            StandardScaler                             =     9 ms
+            PCA(3 维, 10 万行)                         =     8 ms   ← PCA 只要 8 毫秒
+        也就是说本页慢**根本不是 PCA/聚类计算**，而是每次请求都全量重查 10 万行。
+        `/api/cluster/profiles` 实测 3.0~3.5 秒、`/api/cluster/3d-scatter` 3.2~6.4 秒，
+        在 Docker Desktop 的 Windows 用户态转发链路上会因超长连接被中断
+        （浏览器报 ERR_CONTENT_LENGTH_MISMATCH / ERR_EMPTY_RESPONSE），
+        页面于是「结构在、内容全空」。
+
+        ⚠ 为什么原来的 self._df 缓存无效：
+            `get_clustering_service(db)` 每次请求都**新建 service 实例**，
+            所以 self._df 永远从 None 开始，等于没有缓存。
+
+        现改用 data_loader.get_cached_customer_df() —— EDA / 风险引擎 / 成本收益
+        早已在用同一份缓存（TTL 1 小时），只有本服务漏掉了。
+        ⚠ 该函数返回**共享对象**，本文件只读、不得原地修改。
+        """
+        return get_cached_customer_df(self.db)
 
     # ── 聚类元数据（从磁盘读取上次聚类结果）─────────────────
 
@@ -93,9 +112,19 @@ class ClusteringService:
             "total_customers": len(df),
         }
 
-    def get_cluster_names(self) -> Dict[int, str]:
-        """基于聚类特征自动命名。"""
-        profiles = self.get_cluster_profiles()
+    def get_cluster_names(self, profiles: Dict[str, Any] | None = None) -> Dict[int, str]:
+        """基于聚类特征自动命名。
+
+        ⚠ profiles 参数是可选的**复用入口**：
+          本函数原先第一行就是 `profiles = self.get_cluster_profiles()`，
+          而路由 `/api/cluster/profiles` 是这样写的：
+              profiles = service.get_cluster_profiles()   # 算一遍
+              names = service.get_cluster_names()         # 内部又算一遍
+          同一份数据被完整计算两次（每次含一次全量加载）。
+          传入 profiles 即可复用，路由层已改为传参。
+        """
+        if profiles is None:
+            profiles = self.get_cluster_profiles()
         names = {}
 
         for cluster in profiles.get("clusters", []):

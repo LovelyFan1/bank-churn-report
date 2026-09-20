@@ -16,15 +16,40 @@ const notClusteredYet = ref(false)     // 是否尚未执行聚类
 // 散点抽样元信息（total/plotted/sampled）—— 供标题标注「已抽样展示」，
 // 避免把抽样后的点数误当成客户总数
 const scatterMeta = ref(null)
+// 加载/渲染错误 —— 逐条展示，不留「结构在、内容空」的哑页面
+const errors = ref([])
 
 const COLORS = ['#6366f1', '#ef4444', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899']
 
 const totalCustomers = computed(() => profiles.value?.clusters?.reduce((s, c) => s + c.count, 0) || 0)
-const highRiskCount = computed(() => profiles.value?.clusters?.filter(c => c.churn_rate >= 40).reduce((s, c) => s + c.count, 0) || 0)
 const avgChurn = computed(() => {
   const clusters = profiles.value?.clusters
-  if (!clusters) return 0
-  return clusters.reduce((s, c) => s + c.churn_rate * c.count, 0) / totalCustomers.value
+  if (!clusters?.length) return 0
+  const total = totalCustomers.value
+  if (!total) return 0
+  return clusters.reduce((s, c) => s + c.churn_rate * c.count, 0) / total
+})
+// ⚠ 原先写死 churn_rate >= 40 判定「高风险」，而实际各簇流失率是 15~25%
+//   —— 没有一个能过 40，于是这个卡片**恒显示 0**，属于会误导人的假数字。
+//
+// 现改为「显著高于全体的簇」：churn_rate >= 全体加权均值 × 1.15。
+// 1.15 这个系数据当前数据实测校准（全体均值 20.42%）：
+//     簇0 15.17%(0.74x)  簇1 22.22%(1.09x)  簇2 25.06%(1.23x)
+//     簇3 20.33%(1.00x)  簇4 19.69%(0.96x)
+//   取 1.1~1.2 都能稳定选中簇2；取 1.5 则无人达标（又会退回"恒为 0"）。
+//   选 1.15 是为了留出余量、不贴边界（簇2 是 1.23x）。
+//
+// ⚠ 不用后端分位数阈值（P95/P70/P35）：那是**个体**风险等级口径，
+//   而聚类簇是**描述性分组**，强行套用会把「整簇略微偏高」误判成「个体极高」。
+const HIGH_RISK_MULTIPLIER = 1.15
+const highRiskCount = computed(() => {
+  const clusters = profiles.value?.clusters
+  if (!clusters?.length) return 0
+  const overall = avgChurn.value || 0
+  if (!overall) return 0
+  return clusters
+    .filter(c => c.churn_rate >= overall * HIGH_RISK_MULTIPLIER)
+    .reduce((s, c) => s + c.count, 0)
 })
 
 async function loadProfiles() {
@@ -36,6 +61,67 @@ async function loadProfiles() {
   }
   notClusteredYet.value = false
   return data
+}
+
+/**
+ * 依次加载 profiles 与 scatter（**串行**，不是 Promise.all）。
+ *
+ * ⚠ 为什么必须串行：
+ *   这两个接口都是重接口（各含一次 10 万行全量加载，改造前实测
+ *   /profiles 3.0~3.5s、/3d-scatter 3.2~6.4s）。原先用 Promise.all 同时发，
+ *   在 Docker Desktop 的 Windows 用户态转发链路上两条长连接互相挤占，
+ *   实测出现 ERR_CONTENT_LENGTH_MISMATCH / ERR_EMPTY_RESPONSE —— 连接被
+ *   中途掐断，三重退避重试也全部失败，页面表现为「结构在、内容全空」。
+ *   串行后同一时刻只有一条长连接，避开这个竞争。
+ *
+ * 后端已改为走进程级共享缓存（第二次起 ~0ms），这里的串行是双保险。
+ */
+async function loadAll() {
+  errors.value = []
+  loading.value = true
+  try {
+    // 1) 画像
+    let profilesData = null
+    try {
+      profilesData = await loadProfiles()
+    } catch (e) {
+      errors.value.push('聚类画像加载失败：' + (e.message || e))
+    }
+    if (notClusteredYet.value) {
+      loading.value = false
+      return
+    }
+
+    // 2) 散点（串行，等画像回来再发）
+    let scatterData = null
+    try {
+      scatterData = await loadScatter()
+    } catch (e) {
+      errors.value.push('散点数据加载失败：' + (e.message || e))
+    }
+
+    loading.value = false
+    if (!profilesData) return
+
+    await nextTick()
+    // 逐图容错初始化：一张图失败不影响其余
+    const jobs = [
+      ['散点图', () => initScatter(profilesData, scatterData)],
+      ['客群对比', () => initCompare(profilesData)],
+      ['人数分布', () => initChurnDist(profilesData)],
+      ['特征雷达', () => initRadar(profilesData)],
+    ]
+    for (const [label, fn] of jobs) {
+      try {
+        await fn()
+      } catch (e) {
+        console.error(`[Clustering] ${label} 渲染失败:`, e)
+        errors.value.push(`${label}渲染失败：${e.message || e}`)
+      }
+    }
+  } finally {
+    loading.value = false
+  }
 }
 
 // ====== 2D Scatter (PCA1 vs PCA2) ======
@@ -326,36 +412,14 @@ async function runClustering() {
       },
     })
 
-    // 3) 加载结果
-    const [profilesData, scatterData] = await Promise.all([loadProfiles(), loadScatter()])
-    profiles.value = profilesData
-    await Promise.all([
-      initScatter(profilesData, scatterData),
-      initCompare(profilesData),
-      initChurnDist(profilesData),
-      initRadar(profilesData),
-    ])
+    // 3) 加载结果 —— 走统一的 loadAll（串行 + 逐图容错 + 错误可见）
+    await loadAll()
   } finally {
     loading.value = false
   }
 }
 
-onMounted(async () => {
-  try {
-    const [profilesData, scatterData] = await Promise.all([loadProfiles(), loadScatter()])
-    loading.value = false
-    if (notClusteredYet.value) return  // 尚未聚类，不初始化图表
-    await Promise.all([
-      initScatter(profilesData, scatterData),
-      initCompare(profilesData),
-      initChurnDist(profilesData),
-      initRadar(profilesData),
-    ])
-  } catch (e) {
-    console.error('Clustering load error:', e)
-    loading.value = false
-  }
-})
+onMounted(loadAll)
 
 // 保留最后一次的散点原始数据，供窗口缩放后按新尺寸重绘
 // （renderScatter 内部依赖 explained_variance，重绘时需带上）
@@ -395,6 +459,20 @@ onBeforeUnmount(() => {
 
     <div v-if="loading" class="flex items-center justify-center h-64">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+
+    <!-- 加载失败：明确列出原因 + 重试，不留「结构在、内容空」的哑页面 -->
+    <div v-else-if="errors.length && !profiles?.clusters?.length" class="glass-card p-10 text-center">
+      <div class="text-3xl mb-3">⚠</div>
+      <h3 class="text-base font-medium text-[#17335c] mb-2">客群数据加载失败</h3>
+      <ul class="text-sm text-[#c81e1e] mb-5 space-y-1">
+        <li v-for="(e, i) in errors" :key="i">{{ e }}</li>
+      </ul>
+      <p class="text-xs text-[#7c8aa5] mb-5 max-w-lg mx-auto">
+        该页需要一次性读取全量客户数据（约 3 秒）。若网络不稳定导致连接中断，
+        可点击下方重试；后端已启用进程级缓存，重试会快得多。
+      </p>
+      <button @click="loadAll" class="btn-retry-cluster">↻ 重试</button>
     </div>
 
     <!-- 未聚类空状态提示 -->
@@ -581,3 +659,20 @@ onBeforeUnmount(() => {
     </template>
   </div>
 </template>
+
+<style scoped>
+/* 加载失败时的重试按钮 —— 本页原无 style 块，为错误态补上 */
+.btn-retry-cluster {
+  padding: 8px 22px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #fff;
+  border: none;
+  background: #1d4ed8;
+  transition: filter 0.15s;
+}
+.btn-retry-cluster:hover { filter: brightness(1.1); }
+</style>
+

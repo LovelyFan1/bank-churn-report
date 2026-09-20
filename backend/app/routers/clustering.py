@@ -65,10 +65,17 @@ async def submit_elbow():
 
 @router.get("/profiles")
 async def get_cluster_profiles(db: Session = Depends(get_db)):
-    """聚类画像 — 读取 DB 中的聚类标签。"""
+    """聚类画像 — 读取 DB 中的聚类标签。
+
+    ⚠ 名字复用同一份 profiles：此前是
+        profiles = service.get_cluster_profiles()
+        names = service.get_cluster_names()      # ← 内部又完整算了一遍
+    同一份数据被计算两次（每次各含一次全量加载，实测各约 3 秒）。
+    现把 profiles 传进去复用，只算一次。
+    """
     service = get_clustering_service(db)
     profiles = service.get_cluster_profiles()
-    names = service.get_cluster_names()
+    names = service.get_cluster_names(profiles)
 
     for cluster in profiles.get("clusters", []):
         cluster["name"] = names.get(cluster["cluster_id"], f"Cluster {cluster['cluster_id']}")
