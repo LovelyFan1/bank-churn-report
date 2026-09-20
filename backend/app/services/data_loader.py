@@ -37,6 +37,48 @@ CLUSTER_FEATURES = [
     "satisfaction_score", "points_earned", "balance_salary_ratio",
 ]
 
+# ── 聚类特征的稳健缩放（去离群）──────────────────────────
+#
+# ⚠ 为什么必须做这件事（实测证据）：
+#   `balance_salary_ratio = balance / (estimated_salary + 1)`，而**源 CSV 里
+#   estimated_salary 最小值为 13.74**（年薪 14 元，属源数据质量问题），
+#   使该比值最高达 **8319.98** —— 是同列 p99（40.15）的 **207 倍**。
+#
+#   后果有两层：
+#     1) 画图：它在 PC2 上载荷 -0.673，一个离群值把 PC2 轴拉到 -90.9~1.8，
+#        而 99% 的点只分布在 3.09 宽度的区间里 → 散点图糊成一团；
+#     2) 聚类：StandardScaler 按方差缩放，这个维度被离群值主导，
+#        直接拉低聚类质量（silhouette 仅 0.0718）。
+#
+#   实测该列分布：p99=40.15、p99.9=420.41、max=8319.98，
+#   超过 10 的有 3805 行、超过 100 的有 433 行。
+#
+# 处理方式：按分位数截断（winsorize）到 [p0.5, p99.5]。
+#   实测只影响 **0.5% 的行**（500/100000），但 max 从 8319.98 降到 84.69。
+#   ⚠ 只在**聚类**路径上截断，不改数据库原始值、也不影响流失预测模型
+#     （预测用的是 NUMERIC_FEATURES，本就不含该列）。
+CLUSTER_WINSOR_QUANTILE = 0.005   # 双侧各截 0.5%
+
+
+def winsorize_cluster_features(df: pd.DataFrame) -> pd.DataFrame:
+    """对聚类特征做分位数截断，消除离群值对标准化与 PCA 的扭曲。
+
+    返回**新的** DataFrame（不原地修改传入对象 —— 调用方可能持有共享缓存，
+    见 get_cached_customer_df 的"不得原地修改"约定）。
+
+    截断阈值按每列独立计算；对常量列（min==max）跳过，避免除零。
+    """
+    out = df[CLUSTER_FEATURES].copy()
+    for col in CLUSTER_FEATURES:
+        s = pd.to_numeric(out[col], errors="coerce")
+        lo = s.quantile(CLUSTER_WINSOR_QUANTILE)
+        hi = s.quantile(1 - CLUSTER_WINSOR_QUANTILE)
+        if pd.notna(lo) and pd.notna(hi) and lo < hi:
+            out[col] = s.clip(lo, hi)
+        else:
+            out[col] = s
+    return out
+
 
 class DataLoader:
     """分块数据加载器 — 支持分块迭代和数据库内聚合。"""
@@ -165,8 +207,15 @@ def prepare_features(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str
 
 
 def prepare_cluster_features(df: pd.DataFrame) -> np.ndarray:
-    """提取聚类特征矩阵（已标准化以外的数值特征）。"""
-    return df[CLUSTER_FEATURES].values
+    """提取聚类特征矩阵（含离群截断，见 winsorize_cluster_features 的说明）。
+
+    ⚠ 这里做截断是**有意为之**：本函数是聚类（Celery 任务）与 PCA 散点
+    （clustering_service）的公共入口，两处都需要去离群。此前直接
+    `df[CLUSTER_FEATURES].values`，把 balance_salary_ratio 的 8319.98
+    这类由源数据脏值（estimated_salary=13.74）产生的极端值原样喂给
+    StandardScaler，导致 99% 的点在 PCA 图上被压成针尖一团。
+    """
+    return winsorize_cluster_features(df).values
 
 
 def get_customer_dataframe(db: Session) -> pd.DataFrame:

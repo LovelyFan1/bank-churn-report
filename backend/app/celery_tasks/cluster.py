@@ -67,25 +67,30 @@ def run_kmeans_task(self, n_clusters: int = 5, save_to_db: bool = False) -> dict
             "message": "特征标准化...",
         })
 
-        # 分块加载 → 标准化 → 拼接
-        scaler = StandardScaler()
-        all_scaled_chunks = []
-
-        for chunk in loader.iter_chunks():
-            X_chunk = prepare_cluster_features(chunk)
-            X_scaled = scaler.partial_fit(X_chunk).transform(X_chunk) if len(all_scaled_chunks) == 0 else scaler.transform(X_chunk)
-            # Actually, partial_fit then transform each chunk with the progressively fitted scaler
-            # StandardScaler doesn't support partial_fit correctly; better to fit once on first chunk
-            # For MiniBatchKMeans scenarios, we accept approximate scaling
-
-        # 更好的策略: 用第一个 chunk 拟合 scaler（或批量估算）
-        first_chunk = loader.load_chunk(0)
-        X_first = prepare_cluster_features(first_chunk)
+        # ── 用前几个 chunk 拟合 StandardScaler ────────────────
+        #
+        # ⚠ 这里曾有一个导致「聚类功能从未成功过」的越界 bug：
+        #     先是一个 for chunk in loader.iter_chunks() 的循环，循环体内
+        #     `all_scaled_chunks` 始终为空、X_scaled 算完即丢 —— 它对 10 万行
+        #     **完整扫了一遍表却没有任何产出**，属死代码，已删除。
+        #     然后是取样拟合的偏移计算：
+        #         range(min(3, max(1, total // loader.chunksize + 1)))
+        #     当 total 能被 chunksize 整除时会**多算一个 chunk**：
+        #         total=100000, chunksize=50000 → 100000//50000+1 = 3 → 取 offset 0/50000/100000
+        #     而 load_chunk(100000) 返回**空 DataFrame（0 行 0 列）**，
+        #     prepare_cluster_features 取 df[CLUSTER_FEATURES] 立刻抛 KeyError：
+        #         "None of [Index(['credit_score', ...])] are in the [columns]"
+        #     该异常被本任务的 except 吞进返回值（Celery 状态仍是 SUCCESS），
+        #     前端 pollTask 只看 Celery 状态、不看 body.status，于是静默失败 ——
+        #     表现为「点聚类没反应，页面一直显示尚未执行聚类」。
+        #
+        # 改为按**实际存在的** offset 取样：range(0, total, chunksize) 天然不会越界。
+        sample_offsets = list(range(0, total, loader.chunksize))[:3]
         scaler = StandardScaler()
         scaler.fit(np.vstack([
-            prepare_cluster_features(loader.load_chunk(i * loader.chunksize))
-            for i in range(min(3, max(1, total // loader.chunksize + 1)))
-        ]))  # 用前 3 个 chunk 拟合 scaler
+            prepare_cluster_features(loader.load_chunk(offset))
+            for offset in sample_offsets
+        ]))  # 用前 3 个（或更少的）chunk 拟合 scaler
 
         # 分块训练聚类
         self.update_state(state="PROGRESS", meta={

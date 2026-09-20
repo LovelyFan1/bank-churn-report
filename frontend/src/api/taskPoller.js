@@ -38,7 +38,18 @@ export async function pollTask(taskId, options = {}) {
     const { data } = await api.get(`/tasks/${taskId}`)
 
     if (data.status === 'SUCCESS') {
-      return data.result
+      // ⚠ Celery 的 SUCCESS 只表示「任务函数正常返回了」，**不代表业务成功**。
+      //   本项目的重算力任务（train_all_models / run_kmeans / batch_score）都在
+      //   函数内用 try/except 把异常转成返回值：{"status": "failed", "error": ...}。
+      //   旧代码直接 return data.result，调用方拿到的是这个失败对象却当成结果用，
+      //   于是「任务失败」在前端完全不可见 —— 聚类功能因此坏了很久没人发现
+      //   （页面只是显示"尚未执行聚类"，像是没点按钮）。
+      //   这里把 result.status === 'failed' 提升为真正的异常。
+      const result = data.result
+      if (result && typeof result === 'object' && result.status === 'failed') {
+        throw new Error(`任务失败: ${result.error || '未知错误'}`)
+      }
+      return result
     }
 
     if (data.status === 'FAILURE') {
