@@ -1,13 +1,21 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
-import api from '../api'
+import api, { isCanceled } from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
+
+// 页面级请求作用域：本页并发 5 个请求（其中 roc-curves 响应体 525 KB），
+// 离开页面时取消在途请求，避免占用连接槽拖慢下一页。
+const scope = useRequestScope()
 
 const loading = ref(true)
 const training = ref(false)
 const trainingMessage = ref('')
 const comparison = ref(null)
+// 页面级错误态：这些接口用 HTTP 200 + body.error 表达「模型未就绪」，
+// 必须显式接住，否则只会渲染出一堆空框
+const loadError = ref('')
 const rocChart = shallowRef(null)
 const radarChart = shallowRef(null)
 const featureChart = shallowRef(null)
@@ -58,18 +66,38 @@ let _rocRes = null, _featRes = null, _shapRes = null
 
 async function loadData() {
   const [compRes, rocRes, featRes, cmRes, shapRes] = await Promise.all([
-    api.get('/model/comparison'),
-    api.get('/model/roc-curves'),
-    api.get('/model/feature-importance'),
-    api.get('/model/confusion-matrices'),
-    api.get('/model/shap-global'),
+    scope.get('/model/comparison'),
+    scope.get('/model/roc-curves'),
+    scope.get('/model/feature-importance'),
+    scope.get('/model/confusion-matrices'),
+    scope.get('/model/shap-global'),
   ])
-  comparison.value = compRes.data
-  confusionData.value = cmRes.data.matrices
-  _rocRes = rocRes.data
-  _featRes = featRes.data
-  _shapRes = shapRes.data
-  shapData.value = shapRes.data
+  // ⚠ 这些接口在「模型未就绪」或「meta.json 读取失败」时返回 **HTTP 200**，
+  //   body 形如 {"models": [], "best_model": null, "error": "模型尚未训练..."}。
+  //   旧代码直接把 compRes.data 赋给 comparison，于是模板里
+  //   `v-if="comparison"` 为真（对象是 truthy）→ 渲染表头但零行、
+  //   图表收到空数组 → 整页只剩空框，用户看不到任何原因。
+  //   这里显式把 error 提升为页面级错误态。
+  loadError.value = compRes.data?.error || ''
+  comparison.value = compRes.data?.error ? null : compRes.data
+  confusionData.value = cmRes.data?.error ? null : cmRes.data.matrices
+  _rocRes = rocRes.data?.error ? null : rocRes.data
+  _featRes = featRes.data?.error ? null : featRes.data
+  _shapRes = shapRes.data?.error ? null : shapRes.data
+  shapData.value = _shapRes
+}
+
+/** 重新拉取全部结果（错误态下的「刷新」按钮） */
+async function reload() {
+  loading.value = true
+  try {
+    await loadData()
+    loading.value = false
+    await initCharts()
+  } catch (e) {
+    loadError.value = e.message || '加载失败'
+    loading.value = false
+  }
 }
 
 async function initCharts() {
@@ -203,9 +231,12 @@ async function initCharts() {
 onMounted(async () => {
   try {
     await loadData()
+    if (!scope.isActive()) return
     loading.value = false
     await initCharts()
   } catch (e) {
+    // 页面卸载导致的取消属正常行为，不打 error 日志
+    if (isCanceled(e) || !scope.isActive()) return
     console.error('Models load error:', e)
     loading.value = false
   }
@@ -244,6 +275,26 @@ onBeforeUnmount(() => {
 
     <div v-if="loading" class="flex items-center justify-center h-64">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+
+    <!-- 模型未就绪：明确提示 + 提供训练入口，而不是渲染一堆空框 -->
+    <div v-else-if="loadError" class="glass-card p-10 text-center">
+      <div class="text-3xl mb-3">🧠</div>
+      <h3 class="text-base font-medium text-gray-300 mb-2">模型尚未就绪</h3>
+      <p class="text-sm text-gray-500 mb-5 max-w-lg mx-auto">
+        {{ loadError }}
+        <br>
+        <span class="text-xs text-gray-600">
+          若刚点过「重新训练」，训练期间模型文件正在被写入，稍等片刻后刷新即可。
+        </span>
+      </p>
+      <div class="flex items-center justify-center gap-3">
+        <button @click="reload" class="mc-btn">↻ 刷新</button>
+        <button @click="trainModels" :disabled="training" class="mc-btn mc-btn-primary">
+          {{ training ? '训练中...' : '开始训练' }}
+        </button>
+      </div>
+      <p v-if="training" class="text-xs text-indigo-300 mt-3">{{ trainingMessage }}</p>
     </div>
 
     <template v-else>
@@ -333,3 +384,20 @@ onBeforeUnmount(() => {
     </template>
   </div>
 </template>
+
+<style scoped>
+/* 错误态按钮 —— 本页原本没有 style 块，为「模型未就绪」态补上 */
+.mc-btn {
+  padding: 8px 18px; border-radius: 9px; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: .15s;
+  color: #cbd5e1; background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.mc-btn:hover { border-color: rgba(255, 255, 255, 0.25); background: rgba(255, 255, 255, 0.04); }
+.mc-btn-primary {
+  color: #fff; border: none;
+  background: linear-gradient(135deg, #6366f1, #a855f7);
+}
+.mc-btn-primary:hover { filter: brightness(1.1); }
+.mc-btn:disabled { opacity: .5; cursor: not-allowed; }
+</style>

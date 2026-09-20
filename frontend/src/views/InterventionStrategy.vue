@@ -2,14 +2,22 @@
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
-import api from '../api'
+import { isCanceled } from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import { fmtPercent, fmtWan, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
+
+// 页面级请求作用域：本页并发 5 个请求，离开时取消在途请求
+const scope = useRequestScope()
 
 const businessSummary = ref(null)
 const thresholdData = ref(null)
 // 风险分级口径 —— 来自后端，替代此前写死的 70% / 30% / 10%
 const riskInfo = ref(null)
 const retention = ref(null)   // 挽留效果复盘（来自工单真实 result）
+// 错误态 —— 后端用 HTTP 200 + body.error 表达「模型未就绪」，
+// 不接住就会渲染成空框（矩阵页曾因此"只有表头没有内容"）
+const matrixError = ref('')
+const summaryError = ref('')
 const thresholdChart = shallowRef(null)
 const chartInstances = []
 const loading = ref(true)
@@ -80,23 +88,41 @@ function drillDown(tier, level) {
   })
 }
 
-onMounted(async () => {
+onMounted(loadAll)
+
+/** 重新加载全部数据（错误态的「刷新」按钮 / 重试） */
+async function reloadAll() {
+  matrixError.value = ''
+  summaryError.value = ''
+  loading.value = true
+  await loadAll()
+}
+
+async function loadAll() {
   try {
     const [summaryRes, thresholdRes, riskInfoRes, retentionRes, matrixRes] = await Promise.all([
-      api.get('/cost-benefit/summary'),
-      api.get('/cost-benefit/thresholds'),
-      api.get('/model/risk-info').catch(() => ({ data: null })),
-      api.get('/cost-benefit/retention-summary').catch(() => ({ data: null })),
-      api.get('/portfolio/matrix').catch(() => ({ data: null })),
+      scope.get('/cost-benefit/summary').catch((e) => ({ data: { error: e.message } })),
+      scope.get('/cost-benefit/thresholds').catch((e) => ({ data: { error: e.message } })),
+      scope.get('/model/risk-info').catch(() => ({ data: null })),
+      scope.get('/cost-benefit/retention-summary').catch(() => ({ data: null })),
+      scope.get('/portfolio/matrix').catch((e) => ({ data: { error: e.message } })),
     ])
-    businessSummary.value = summaryRes.data
+    // 页面已卸载则不再写状态
+    if (!scope.isActive()) return
+    // ⚠ /cost-benefit/* 与 /portfolio/matrix 在模型未就绪时返回 HTTP 200，
+    //   body 是 {"error": "模型尚未训练..."}。旧代码直接赋给 matrix.value，
+    //   truthy 对象让 `v-if="!matrix"` 失效 → 渲染出表头但 matrixRows 为 []
+    //   → 矩阵只剩空框。这里把 error 提升为显式错误态。
     thresholdData.value = thresholdRes.data
     riskInfo.value = riskInfoRes.data
     retention.value = retentionRes.data
-    matrix.value = matrixRes.data
+    matrixError.value = matrixRes.data?.error || ''
+    matrix.value = matrixRes.data?.error ? null : matrixRes.data
+    summaryError.value = summaryRes.data?.error || ''
+    businessSummary.value = summaryRes.data?.error ? null : summaryRes.data
 
     await nextTick()
-    if (thresholdChart.value && thresholdRes.data.thresholds) {
+    if (thresholdChart.value && thresholdRes.data?.thresholds) {
       const chart = echarts.init(thresholdChart.value)
       const data = thresholdRes.data.thresholds
       // 分位数边界（P95/P70/P35）—— 与风险分级同一套口径，画在成本曲线上做对照
@@ -132,11 +158,13 @@ onMounted(async () => {
       chartInstances.push(chart)
     }
   } catch (e) {
+    // 页面卸载导致的取消属正常行为，不打 error 日志（否则频繁切换时刷屏）
+    if (isCanceled(e) || !scope.isActive()) return
     console.error('Cost-benefit load error:', e)
   } finally {
-    loading.value = false
+    if (scope.isActive()) loading.value = false
   }
-})
+}
 
 /** 在阈值序列里找与给定值最接近的下标，供 markLine 定位 */
 function nearestIdx(rows, value) {
@@ -280,7 +308,17 @@ onBeforeUnmount(() => {
         同样一个「高危」，高价值客户要客户经理上门，零余额客户一条 APP 推送即可。
       </p>
 
-      <div v-if="!matrix" class="empty-state">
+      <div v-if="matrixError" class="empty-state">
+        <div class="text-2xl mb-2">🧠</div>
+        <p class="text-sm text-red-300">{{ matrixError }}</p>
+        <p class="text-xs text-gray-600 mt-1">
+          矩阵依赖已训练模型；模型未就绪时无法给出分层策略。
+          若刚点过训练，稍等片刻后刷新。
+        </p>
+        <button class="btn-retry" @click="reloadAll">↻ 刷新</button>
+      </div>
+
+      <div v-else-if="!matrix" class="empty-state">
         <p class="text-sm text-gray-400">矩阵加载中…</p>
       </div>
 
@@ -406,6 +444,13 @@ onBeforeUnmount(() => {
   border: 1px dashed rgba(255,255,255,.1); border-radius: 12px;
   background: rgba(255,255,255,.012);
 }
+.btn-retry {
+  margin-top: 14px; padding: 7px 18px; border-radius: 8px;
+  font-size: 12.5px; font-weight: 600; cursor: pointer;
+  color: #cbd5e1; background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12); transition: .15s;
+}
+.btn-retry:hover { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.04); }
 
 /* 矩阵格可点进客户列表 —— 给出指针与悬停反馈，否则用户不知道能点 */
 .cell-link {

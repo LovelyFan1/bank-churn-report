@@ -1,8 +1,14 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
-import api from '../api'
+import api, { isCanceled } from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, probColor, fmtPercent, channelLabel } from '../utils/risk'
+
+// 页面级请求作用域：本页一次并发 7~9 个请求（全站最多），
+// 离开页面时自动取消在途请求，避免占用连接槽拖慢下一页。
+// 详见 api/useRequestScope.js 的说明（实测峰值 46 个在途请求）。
+const scope = useRequestScope()
 
 const loading = ref(true)
 const overview = ref(null)
@@ -39,6 +45,9 @@ const monthlyTrend = [
 ]
 
 const insights = ref([])
+// Top10 列表的错误态 —— 后端在模型未就绪时返回 200 + {"items":[], "error":...}，
+// 必须显式区分「没有数据」与「模型没就绪」，否则只会看到一个空表
+const topError = ref('')
 
 // Computed
 const churnRate = ref(0)
@@ -53,18 +62,24 @@ const confRows = ref([])
 onMounted(async () => {
   try {
     // 先加载不需要模型的结果
+    // 走 scope：离开页面时这些在途请求会被取消（本页并发最多，占连接槽最严重）。
+    // 取消产生的错误由 scope.getSafe 归一化，不会冒成 Network Error。
+    const withFallback = (p, fallback) => p.catch(() => ({ data: fallback }))
     const [overviewRes, insightsRes, activeRes, riskInfoRes, comparisonRes] = await Promise.all([
-      api.get('/data/overview'),
-      api.get('/eda/key-insights'),
-      api.get('/work-orders/active-customers').catch(() => ({ data: { customer_ids: [] } })),
-      api.get('/model/risk-info').catch(() => ({ data: null })),
-      api.get('/model/comparison').catch(() => ({ data: null })),
+      scope.get('/data/overview'),
+      scope.get('/eda/key-insights'),
+      withFallback(scope.get('/work-orders/active-customers'), { customer_ids: [] }),
+      withFallback(scope.get('/model/risk-info'), null),
+      withFallback(scope.get('/model/comparison'), null),
     ])
-    activeCustomerIds.value = new Set(activeRes.data.customer_ids)
+    // 页面已卸载则不再写状态（避免对已销毁组件赋值 + 无谓渲染）
+    if (!scope.isActive()) return
+
+    activeCustomerIds.value = new Set(activeRes.data?.customer_ids || [])
     riskInfo.value = riskInfoRes.data
 
     overview.value = overviewRes.data
-    insights.value = insightsRes.data.insights
+    insights.value = insightsRes.data?.insights || []
 
     // 模型可信度：取最优模型那一行，不做任何前端加工
     const comparison = comparisonRes.data
@@ -99,21 +114,35 @@ onMounted(async () => {
     let batchResult = null
     let summaryResult = null
 
+    // ⚠ /api/customers 在模型未就绪时返回 HTTP 200，但 body 是
+    //   {"items": [], "total": 0, "error": "模型尚未训练..."}。
+    //   旧代码只取 items，于是「Top10」渲染成一张空表 —— 用户看到"只有框"，
+    //   完全不知道是模型没就绪还是真没数据。这里显式消费 error 字段。
     try {
-      const { data: topRes } = await api.get('/customers', {
+      const { data: topRes } = await scope.get('/customers', {
         params: { page: 1, page_size: 10, sort_by: 'expected_value', sort_order: 'desc' },
       })
+      if (!scope.isActive()) return
+      if (topRes?.error) {
+        topError.value = topRes.error
+      } else {
+        topError.value = ''
+      }
       const dist = topRes?.summary?.risk_distribution
       const items = topRes?.items || []
       if (dist) riskDist.value = dist
       topCustomers.value = items
       batchResult = { top_customers: items, risk_distribution: dist }
     } catch (e) {
+      if (scope.isActive()) {
+        topError.value = e.response?.data?.detail || e.message || '加载失败'
+      }
       console.warn('top customers failed:', e)
     }
 
     try {
-      const summaryRes = await api.get('/cost-benefit/summary')
+      const summaryRes = await scope.get('/cost-benefit/summary')
+      if (!scope.isActive()) return
       if (summaryRes.data && !summaryRes.data.error) {
         businessSummary.value = summaryRes.data
         summaryResult = summaryRes.data
@@ -121,6 +150,8 @@ onMounted(async () => {
     } catch (e) {
       console.warn('cost-benefit not available:', e)
     }
+
+    if (!scope.isActive()) return
 
     if (batchResult) {
       batchData.value = batchResult
@@ -142,25 +173,74 @@ onMounted(async () => {
     recoverable.value = summaryResult ? Math.round(summaryResult.reduced_loss / 10000) : 0
     roi.value = summaryResult ? summaryResult.roi : 0
 
+    if (!scope.isActive()) return
+
     loading.value = false
-    await nextTick()
+    // 图表初始化不再让整页 await —— 数据已就绪即可渲染，
+    // 图表各自异步等待容器出现（见 initCharts 的说明）。
     initCharts()
   } catch (e) {
+    // 页面已卸载导致的取消是**正常行为**（不是错误），不刷 console.error，
+    // 否则频繁切换时控制台会被 "CanceledError" 淹没，掩盖真实问题。
+    if (isCanceled(e) || !scope.isActive()) return
     console.error('Dashboard load error:', e)
     loading.value = false
   }
 })
 
-function initCharts() {
-  initTrendChart()
-  initRiskChart()
-  initRoiChart()
-  window.addEventListener('resize', handleResize)
+/**
+ * 等待某个 ref 对应的元素真正挂载且具有非零尺寸。
+ *
+ * ⚠ 这修的是「图表有概率画不出来」的竞态：
+ *   图表容器写在 <template v-else> 里，由 v-if="loading" 控制。
+ *   旧代码是 loading=false 后 `await nextTick()` 一次就 echarts.init()，
+ *   但 Vue 的 DOM 补丁不保证一次 tick 就完成，且 ECharts 在尺寸为 0 的
+ *   容器上初始化会得到一张空白画布（且不会自己恢复）。
+ *   实测：频繁切换路由时出现 canvas 已创建但 0 像素绘制。
+ *
+ * 这里轮询等待容器可见（最多 ~1s），拿到尺寸后再交给 echarts。
+ */
+async function waitForEl(refObj, timeout = 1000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const el = refObj.value
+    if (el && el.clientWidth > 0 && el.clientHeight > 0) return el
+    await nextTick()
+    await new Promise((r) => requestAnimationFrame(r))
+  }
+  return refObj.value && refObj.value.clientWidth > 0 ? refObj.value : null
+}
+
+/** 逐图容错初始化：一张图失败不影响其余两张 */
+async function initOne(refObj, label, initFn) {
+  const el = await waitForEl(refObj)
+  if (!el) {
+    console.warn(`[Dashboard] ${label} 容器未就绪，跳过渲染`)
+    return
+  }
+  try {
+    initFn(el)
+  } catch (e) {
+    console.error(`[Dashboard] ${label} 渲染失败:`, e)
+  }
+}
+
+async function initCharts() {
+  await Promise.all([
+    initOne(trendChart, '月度流失趋势', initTrendChart),
+    initOne(riskChart, '客户风险分布', initRiskChart),
+    initOne(roiChart, '干预效果追踪', initRoiChart),
+  ])
 }
 
 function handleResize() {
   chartInstances.forEach(c => c.resize())
 }
+
+// ⚠ resize 监听必须**独立注册**，不能放在 initCharts 里面。
+//   旧代码把它放在 initCharts() 末尾：一旦某张图提前 return（容器未就绪），
+//   监听就永远不会挂上，图表连"随窗口缩放自愈"的机会都没有。
+onMounted(() => window.addEventListener('resize', handleResize))
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
@@ -168,9 +248,8 @@ onBeforeUnmount(() => {
   chartInstances.length = 0
 })
 
-function initTrendChart() {
-  if (!trendChart.value) return
-  const chart = echarts.init(trendChart.value)
+function initTrendChart(el) {
+  const chart = echarts.init(el)
   chart.setOption({
     // ⚠ 图内水印：避免截图/投影时角标被裁掉后失去「示例数据」标识
     graphic: [{
@@ -205,9 +284,8 @@ function initTrendChart() {
   chartInstances.push(chart)
 }
 
-function initRiskChart() {
-  if (!riskChart.value) return
-  const chart = echarts.init(riskChart.value)
+function initRiskChart(el) {
+  const chart = echarts.init(el)
   const dist = riskDist.value
   chart.setOption({
     tooltip: { trigger: 'item', backgroundColor: 'rgba(15,15,35,0.95)', borderColor: 'rgba(99,102,241,0.3)', textStyle: { color: '#e0e0e0' } },
@@ -227,9 +305,8 @@ function initRiskChart() {
   chartInstances.push(chart)
 }
 
-function initRoiChart() {
-  if (!roiChart.value) return
-  const chart = echarts.init(roiChart.value)
+function initRoiChart(el) {
+  const chart = echarts.init(el)
   chart.setOption({
     // ⚠ 图内水印：同上，不依赖卡片角标是否被裁切
     graphic: [{
@@ -407,7 +484,15 @@ function showOrderToast(msg) {
             期望价值 = 流失概率 × 余额。500 个极高风险客户的概率都挤在 1.0 附近，
             此时余额是唯一还能拉开优先级的维度 —— 按概率排会混入余额为 0 的客户。
           </p>
-          <div class="overflow-x-auto">
+          <!-- 错误态：明确告知原因，不留空表 -->
+          <div v-if="topError" class="dash-error">
+            <span>⚠ {{ topError }}</span>
+            <router-link to="/models" class="dash-error-link">去训练模型</router-link>
+          </div>
+          <div v-else-if="!topCustomers.length" class="dash-empty">
+            暂无符合条件的客户
+          </div>
+          <div v-else class="overflow-x-auto">
             <table class="action-table">
               <thead>
                 <tr>
@@ -689,6 +774,24 @@ function showOrderToast(msg) {
   background: rgba(99,102,241,0.08); transition: .2s; white-space: nowrap;
 }
 .view-all-link:hover { background: rgba(99,102,241,0.18); }
+
+/* Top10 错误态 / 空态 —— 不留空白表格 */
+.dash-error {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 16px; border-radius: 10px; font-size: 12.5px; color: #fca5a5;
+  background: rgba(239,68,68,.08); border: 1px dashed rgba(239,68,68,.35);
+}
+.dash-error-link {
+  flex-shrink: 0; font-size: 12px; color: #a5b4fc; text-decoration: none;
+  padding: 4px 12px; border-radius: 7px;
+  border: 1px solid rgba(99,102,241,.3); background: rgba(99,102,241,.1);
+}
+.dash-error-link:hover { background: rgba(99,102,241,.2); }
+.dash-empty {
+  padding: 24px 16px; text-align: center; font-size: 12.5px; color: #6b7280;
+  border: 1px dashed rgba(255,255,255,.1); border-radius: 10px;
+  background: rgba(255,255,255,.012);
+}
 
 /* Insights */
 .insight-list { display: flex; flex-direction: column; gap: 10px; }

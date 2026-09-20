@@ -1,5 +1,5 @@
 <script setup>
-import { ref, shallowRef, onMounted, onBeforeUnmount } from 'vue'
+import { ref, shallowRef, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
 import { riskLabel, probColor, LEGACY_THRESHOLDS } from '../utils/risk'
@@ -56,6 +56,13 @@ async function predict() {
     ])
     result.value = predRes.data
     shapResult.value = shapRes.data
+    // ⚠ 必须等 DOM 更新后再画仪表盘。
+    //   仪表盘容器在 <template v-else> 里由 v-if="!result" 控制，而 Vue 的 DOM
+    //   更新是**异步**的：在 `result.value = ...` 之后立刻调用 updateGauge()，
+    //   此时 gaugeChart.value 仍是 null，函数首行 `if (!gaugeChart.value) return`
+    //   会直接返回 —— 仪表盘永远不渲染（实测 canvas 数为 0，容器 604x260 空着）。
+    //   这与 Dashboard / EDA 的图表竞态属同一类问题。
+    await nextTick()
     updateGauge(predRes.data.probability)
   } finally {
     predicting.value = false
