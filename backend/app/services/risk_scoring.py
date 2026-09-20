@@ -23,6 +23,7 @@
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -31,6 +32,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.data_loader import prepare_features, get_cached_customer_df
+
+logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
@@ -61,13 +64,25 @@ def reset_caches() -> None:
     global _engine_cache, _scored_cache
     _best_model_cache["name"] = None
     _best_model_cache["model"] = None
+    _best_model_cache["ts"] = 0.0
     _engine_cache = {"df": None, "raw": None, "thresholds": None,
                      "optimal_threshold": None, "name": None, "ts": 0.0}
     _scored_cache = {"data": None, "name": None, "ts": 0.0}
 
 
 # ── 进程级缓存 ───────────────────────────────────────────
-_best_model_cache = {"name": None, "model": None}
+#
+# ⚠ _best_model_cache 带 TTL 的原因：
+#   模型对象此前**永不过期**（键只有 name/model，没有时间戳）。而本服务跑在
+#   多 worker 部署下（docker-compose: uvicorn --workers 4），每个 worker 各自
+#   持有一份缓存，Celery 重训完写新模型后，没有任何机制通知这些 worker。
+#   结果：重训后，已加载过模型的 worker 会**无限期沿用旧模型**，直到容器重启；
+#   而没加载过的 worker 用新模型 —— 同一个客户在不同请求间得到不同等级，
+#   表现为"刷新几次结果不一样"。
+#   加 TTL 后最多 MODEL_CACHE_TTL 秒收敛到新模型，无需重启。
+MODEL_CACHE_TTL = 600  # 秒
+
+_best_model_cache = {"name": None, "model": None, "ts": 0.0}
 _engine_cache = {
     "df": None,                # 全量数据（复用，避免重复 load_all）
     "raw": None,               # 全量原始概率
@@ -81,9 +96,24 @@ _scored_cache = {"data": None, "name": None, "ts": 0.0}
 
 # ── 模型加载（缓存）─────────────────────────────────────
 
+def _cache_expired() -> bool:
+    """模型对象缓存是否已过期（或从未加载）。"""
+    if _best_model_cache["model"] is None:
+        return True
+    return time.time() - _best_model_cache["ts"] >= MODEL_CACHE_TTL
+
+
 def _load_best_model():
-    """加载 AUC 最高的模型，进程级缓存。返回 (model, name)。"""
-    if _best_model_cache["model"] is not None:
+    """加载 AUC 最高的模型，进程级缓存（带 TTL）。返回 (model, name)。
+
+    ⚠ 读取失败要**记录并降级**，不能向上抛：
+      本函数被客户列表/风险预测/成本收益/矩阵共同依赖。若 meta.json 正被
+      训练任务写入（旧实现是非原子写，见 train.py 的说明），json.load 或
+      joblib.load 会抛异常。旧实现没有 try —— 异常会一路冒到接口层变成 500，
+      或者被更上层吞掉变成空数据。这里统一转成 (None, None)，由调用方按
+      "模型未就绪"处理，并留下 warning 便于定位。
+    """
+    if not _cache_expired():
         return _best_model_cache["model"], _best_model_cache["name"]
 
     import joblib
@@ -92,17 +122,42 @@ def _load_best_model():
     if not meta_path.exists():
         return None, None
 
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    # 读取失败大概率是撞上训练写入窗口，短退避重试几次
+    ATTEMPTS = 3
+    meta = None
+    last_err: Exception | None = None
+    for attempt in range(ATTEMPTS):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            break
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            last_err = e
+            if attempt < ATTEMPTS - 1:
+                time.sleep(0.15 * (attempt + 1))
+
+    if meta is None:
+        logger.warning(
+            "risk_scoring: 读取 %s 失败（已重试 %d 次）: %s: %s",
+            meta_path, ATTEMPTS, type(last_err).__name__, last_err,
+        )
+        return None, None
 
     best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
     model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
     if not model_path.exists():
         return None, None
 
-    model = joblib.load(model_path)
+    try:
+        model = joblib.load(model_path)
+    except Exception as e:
+        # joblib 读到半截文件会抛（pickle 反序列化失败），同样降级处理
+        logger.warning("risk_scoring: 加载模型 %s 失败: %s: %s", model_path, type(e).__name__, e)
+        return None, None
+
     _best_model_cache["model"] = model
     _best_model_cache["name"] = best_name
+    _best_model_cache["ts"] = time.time()
     return model, best_name
 
 

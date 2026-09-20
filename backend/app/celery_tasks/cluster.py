@@ -5,6 +5,8 @@
 - run_elbow_task: 肘部法则
 """
 
+import os
+
 import numpy as np
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
@@ -152,6 +154,9 @@ def run_kmeans_task(self, n_clusters: int = 5, save_to_db: bool = False) -> dict
             db.commit()
 
         # 保存聚类模型
+        # ⚠ 原子写入：`open(path,'w')` 会先截断为 0 字节再写，读取方
+        # （clustering_service.get_cluster_meta → json.load）会拿到空文件而报错。
+        # 与 train.py 的 _save_results_to_disk 同一处理方式：临时文件 + 原子替换。
         CLUSTER_DIR.mkdir(parents=True, exist_ok=True)
         meta = {
             "n_clusters": n_clusters,
@@ -159,8 +164,11 @@ def run_kmeans_task(self, n_clusters: int = 5, save_to_db: bool = False) -> dict
             "cluster_sizes": cluster_sizes,
             "feature_names": CLUSTER_FEATURES,
         }
-        with open(CLUSTER_DIR / "cluster_meta.json", "w", encoding="utf-8") as f:
+        meta_final = CLUSTER_DIR / "cluster_meta.json"
+        meta_tmp = meta_final.with_name(meta_final.name + ".tmp")
+        with open(meta_tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False)
+        os.replace(meta_tmp, meta_final)
 
         return {
             "status": "completed",

@@ -9,6 +9,8 @@
 """
 
 import json
+import logging
+import time
 import numpy as np
 from pathlib import Path
 from sqlalchemy import func
@@ -22,6 +24,8 @@ from app.services.data_loader import prepare_features, get_cached_customer_df
 from app.services import risk_scoring
 from sklearn.model_selection import train_test_split
 import joblib
+
+logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
@@ -39,21 +43,67 @@ class CostBenefitService:
         self.db = db
 
     def _load_best_model(self):
-        """从磁盘加载最佳模型, 返回 (model, model_name, meta)。"""
-        meta_path = MODEL_DIR / "meta.json"
-        if not meta_path.exists():
+        """从磁盘加载最佳模型, 返回 (model, model_name, meta)。
+
+        ⚠ 两处修复：
+        1) **不再每次请求都重新加载**。此前本方法没有缓存，而实例由
+           `get_cost_benefit_service(db)` 每请求新建，所以每个请求都要
+           重新读 meta.json 并 joblib.load 模型。干预策略页一次并发 5 个请求
+           （summary/thresholds/retention/matrix/risk-info），其中 2 个走这里，
+           等于每次翻页都把模型反序列化两遍。
+        2) **读取失败降级而非抛异常**。训练任务写文件期间（旧实现非原子），
+           json.load / joblib.load 会抛 —— 上层接口直接 500 或静默空数据。
+           现在统一返回 (None, None, None)，由调用方给出"模型未就绪"。
+        """
+        meta = self._read_meta()
+        if meta is None:
             return None, None, None
 
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
+        try:
+            best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
+        except (KeyError, ValueError):
+            return None, None, None
 
-        best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
+        # 复用 risk_scoring 的进程级模型缓存（避免同一进程内重复反序列化）
+        cached_name = risk_scoring._best_model_cache["name"]
+        cached_model = risk_scoring._best_model_cache["model"]
+        if cached_model is not None and cached_name == best_name \
+                and not risk_scoring._cache_expired():
+            return cached_model, best_name, meta
+
         model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
-
         if not model_path.exists():
             return None, None, None
 
-        return joblib.load(model_path), best_name, meta
+        try:
+            model = joblib.load(model_path)
+        except Exception as e:
+            logger.warning("cost_benefit: 加载模型 %s 失败: %s: %s",
+                           model_path, type(e).__name__, e)
+            # 退回 risk_scoring 缓存（可能已持有可用模型），避免整页失效
+            if cached_model is not None:
+                return cached_model, cached_name, meta
+            return None, None, None
+
+        return model, best_name, meta
+
+    def _read_meta(self):
+        """读取 meta.json，失败时短重试并返回 None（不抛异常）。"""
+        meta_path = MODEL_DIR / "meta.json"
+        if not meta_path.exists():
+            return None
+        last_err = None
+        for attempt in range(3):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, ValueError, OSError) as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(0.15 * (attempt + 1))
+        logger.warning("cost_benefit: 读取 %s 失败（已重试）: %s: %s",
+                       meta_path, type(last_err).__name__, last_err)
+        return None
 
     def analyze_thresholds(self, cost_ratio: float | None = None) -> Dict[str, Any]:
         """分析不同阈值下的成本收益。

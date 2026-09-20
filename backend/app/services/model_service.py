@@ -10,6 +10,8 @@
 """
 
 import json
+import logging
+import time
 import numpy as np
 import joblib
 from pathlib import Path
@@ -24,6 +26,8 @@ from app.services.data_loader import (
     FEATURE_NAMES, NUMERIC_FEATURES,
 )
 from app.services import risk_scoring
+
+logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
@@ -53,19 +57,45 @@ class ModelService:
         """只加载 meta.json —— 评估指标 / ROC / 特征重要性 / 混淆矩阵都在里面。
 
         只读 meta 比全加载快约 222 倍。此前 4 个接口因此各白慢 1.5 秒。
+
+        ⚠ 失败处理（本函数曾是"故障隐形"的元凶）：
+          旧实现是 `except Exception: return False` —— 把 json.load 的所有异常
+          吞掉，于是模型文件正在被重写、读到半截 JSON 时，接口**静默返回**
+          {"error": "模型尚未训练"} 且 HTTP 200。日志里连一条 500 都没有，
+          运维无从察觉，前端只表现为"页面只剩空框"。
+
+          现在：真实不存在（文件缺失）才直接返回 False；读取/解析失败属于
+          "可能是写入窗口或文件损坏"，做几次短重试并记录 warning。写入端已改为
+          原子替换（见 celery_tasks/train.py 的 _atomic_write_bytes），
+          正常情况下这里不会再失败；重试是为磁盘/网络挂载抖动的兜底。
         """
         if self._meta is not None:
             return True
 
         meta_path = MODEL_DIR / "meta.json"
         if not meta_path.exists():
+            # 真的没有模型 —— 这是合法的"尚未训练"，不算异常
             return False
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                self._meta = json.load(f)
-            return True
-        except Exception:
-            return False
+
+        # 读取失败大概率是撞上了训练写入窗口，短暂退避重试
+        ATTEMPTS = 3
+        last_err: Optional[Exception] = None
+        for attempt in range(ATTEMPTS):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    self._meta = json.load(f)
+                return True
+            except (json.JSONDecodeError, ValueError, OSError) as e:
+                last_err = e
+                if attempt < ATTEMPTS - 1:
+                    time.sleep(0.15 * (attempt + 1))
+
+        logger.warning(
+            "读取 %s 失败（已重试 %d 次）: %s: %s —— "
+            "该次请求将退化为「模型未就绪」，请检查是否有训练任务正在写入",
+            meta_path, ATTEMPTS, type(last_err).__name__, last_err,
+        )
+        return False
 
     def get_best_model_name(self) -> Optional[str]:
         if not self._ensure_meta():

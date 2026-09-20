@@ -5,6 +5,7 @@
 """
 
 import json
+import os
 import numpy as np
 from pathlib import Path
 from celery.exceptions import SoftTimeLimitExceeded
@@ -107,21 +108,73 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
     }
 
 
+def _atomic_write_bytes(target: Path, write_fn) -> None:
+    """把 write_fn(tmp_path) 写到同目录临时文件，再原子替换到 target。
+
+    ⚠ 为什么必须这样写（这是「模型重训后页面整段失效」的根因）：
+      旧实现是 `open(path, 'w')` + `json.dump(...)` / `joblib.dump(model, path)`，
+      而 `open(path, 'w')` 会**先把文件截断为 0 字节**，再逐块写内容。
+      写入期间（meta.json 590 KB、random_forest.joblib 实测 180 MB，
+      后者在绑定挂载上要数秒），任何读取方看到的都是 0 字节或半截 JSON。
+
+      读取方 model_service._ensure_meta() 是 `json.load()` 失败即 return False，
+      于是 /model/comparison、/roc-curves、/feature-importance、/shap-global
+      会**静默返回** {"error": "模型尚未训练"} 且 HTTP 200（日志里连 500 都没有）；
+      cost_benefit._load_best_model() 返回 None，导致 /portfolio/matrix、
+      /cost-benefit/* 同样退化。前端把这些当成正常响应渲染，于是只剩空框。
+
+      实测（同尺寸 533 KB JSON，一边重写一边读）：
+          旧实现 open(w)+json.dump  → 读取 172 次，空文件 48 + 解析失败 49 = 56.4% 失败
+          临时文件 + os.replace     → 读取 170 次，0 失败
+
+      os.replace 在同一文件系统内是原子的：读取方要么看到旧的完整文件，
+      要么看到新的完整文件，**不存在中间态**。
+    """
+    tmp = target.with_name(target.name + ".tmp")
+    write_fn(tmp)
+    os.replace(tmp, target)   # 同目录内原子替换
+
+
 def _save_results_to_disk(models: dict, results: dict, shap_results: dict = None):
-    """将模型文件、元数据、SHAP 结果持久化到磁盘。"""
+    """将模型文件、元数据、SHAP 结果持久化到磁盘（全部原子写入）。
+
+    写入顺序有意为之：
+        1. 先把**所有**模型写成 .tmp（此时对读取方完全不可见）；
+        2. 逐个 os.replace 模型文件；
+        3. **最后**替换 meta.json。
+
+    因为读取方的入口是 meta.json（先读它选出 best model，再加载对应文件），
+    把 meta.json 放在最后意味着：只有全部模型都就位后，新的 meta 才会出现。
+    残留的窗口是「新 meta 尚未发布、但模型文件已是新版本」，此时旧 meta 仍指向
+    可以正常加载并预测的模型，只是版本略新 —— 不会崩、不会空框。
+    """
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ── 1) 全部先写临时文件 ──────────────────────────────
+    pending: list[tuple[Path, Path]] = []   # (tmp, final)
     for name, model in models.items():
         filename = name.lower().replace(" ", "_") + ".joblib"
-        joblib.dump(model, MODEL_DIR / filename)
+        final = MODEL_DIR / filename
+        tmp = final.with_name(final.name + ".tmp")
+        joblib.dump(model, tmp)
+        pending.append((tmp, final))
 
     meta = {
         "results": results,
         "feature_names": FEATURE_NAMES,
         "shap_global": shap_results or {},
     }
-    with open(MODEL_DIR / "meta.json", "w", encoding="utf-8") as f:
+    meta_final = MODEL_DIR / "meta.json"
+    meta_tmp = meta_final.with_name(meta_final.name + ".tmp")
+    with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
+
+    # ── 2) 原子替换模型文件 ──────────────────────────────
+    for tmp, final in pending:
+        os.replace(tmp, final)
+
+    # ── 3) meta.json 最后发布（读取方的"提交点"）─────────
+    os.replace(meta_tmp, meta_final)
 
 
 def _compute_shap(models: dict, X_test, y_test) -> dict:
