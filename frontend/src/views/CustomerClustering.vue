@@ -149,6 +149,11 @@ async function loadAll() {
 let scatterInstance = null
 let scatterRawData = null
 let scatterProfilesData = null
+// 「客群指标对比」与「各簇人数与流失率分布」两张类目轴图的实例。
+// 单独持有是为了在窗口 resize 时按新宽度重算 axisLabel.width（折行宽度），
+// 见 refreshCategoryLabelWidths。
+let compareInstance = null
+let churnDistInstance = null
 const chartInstances = []
 
 /**
@@ -251,11 +256,22 @@ function renderScatter(scatterData, profilesData, colorBy) {
         }
       }
     },
+    // ⚠ 图例必须**置顶**，不能留在底部。
+    //   实测（1366×1000，按聚类着色）：5 个簇名的图例在 bottom:0 铺满
+    //   x≈84..670 整行，而右下角 t-SNE 提示文字（right:12, bottom:6，宽 230px）
+    //   占 x≈440..670 —— 二者在**同一水平带**（y≈342..355）重叠 47px，
+    //   表现为「高活跃稳定客户」后面直接压着说明小字，两段文字糊成一团。
+    //   缩小字号/itemGap 治不了根：视口越窄图例越往右挤，必然撞上右下角提示。
+    //   （实测 1280/1366/1440 均重叠，1600 起才勉强留出 10px 间隙。）
+    //   改为图例置顶 + 提示留底，让二者在垂直方向彻底分离。
     legend: {
-      bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 },
+      top: 0, left: 'center',
+      itemWidth: 10, itemHeight: 10, itemGap: 10,
+      textStyle: { color: '#9ca3af', fontSize: 11 },
       data: series.map(s => s.name)
     },
-    grid: { left: 50, right: 30, top: 20, bottom: 45, containLabel: false },
+    // grid.top 由 20 增至 34：为置顶图例让出高度，否则图例会压住轴名（t-SNE 1/2）
+    grid: { left: 50, right: 30, top: 34, bottom: 45, containLabel: false },
     // ⚠ 坐标轴必须裁剪，否则整张图「糊成一团」。
     //   实测（10 万客户）：PC2 全 range = 92.72，而 1%~99% 的点只占 3.09
     //   —— 也就是 99% 的客户挤在全跨度 3.33% 的一小段里。因为
@@ -289,19 +305,70 @@ function renderScatter(scatterData, profilesData, colorBy) {
   }, true)
 }
 
+/**
+ * 生成类目轴标签样式：按实际槽位宽度自动折行，保证任何视口下
+ * **既不丢字、也不重叠**。
+ *
+ * ⚠ 为什么不能继续用 substring：
+ *   簇名是 6~7 个汉字。「客群指标对比」图用 substring(0, 4) 砍成
+ *   「长期合作 / 高流失风险 / 高活跃客 / 高活跃稳定 / 高流失沉默」，
+ *   「各簇人数与流失率分布」图用 substring(0, 6) 砍成「高流失风险客」
+ *   —— 末字被**静默丢弃**（无省略号、无 tooltip），同一页三张图
+ *   对同一个簇给出三种不同称呼。
+ *
+ * ⚠ 为什么也不能只删掉 substring：
+ *   实测 1024 视口（lg 断点临界）下每张图容器仅 324px 宽，
+ *   绘图区约 254px / 5 槽位 = 51px，而 7 个汉字 @fontSize 10 需约 70px
+ *   —— 标签横向叠压糊成一片（已截图确认）。ECharts 类目轴
+ *   axisLabel.interval 默认 'auto'，挤不下时还会**隔一个隐藏标签**，
+ *   让整簇名消失，比截断更糟。
+ *
+ * 解法：显式给出每槽位可用宽度 + overflow:'breakAll'（超宽即折行），
+ *   并固定 interval:0 禁止自动跳过标签。
+ *
+ * ⚠ 必须用 'breakAll' 而不是 'break'：
+ *   'break' 只在**单词边界**（空格）折行，而中文簇名没有空格 ——
+ *   实测 'break' 下 7 个汉字在 51px 宽度里完全不折、照旧横向溢出。
+ *   'breakAll' 才允许在任意字符间断行（CJK 场景的正确选项）。
+ *
+ * @param el    图表容器（取自 waitForEl，已确保 clientWidth > 0）
+ * @param count 类目数量
+ */
+function categoryLabelStyle(el, count) {
+  const total = el?.clientWidth || 0
+  // 容器宽 → 绘图区宽：扣掉 grid 左右留白（各 12px，合计 24）
+  // 与 y 轴标签+轴名占位（实测约 46px）。宁可略保守：算窄一点只会
+  // 让宽屏偶尔多折一行，算宽了则直接溢出重叠。
+  const usable = Math.max(0, total - 24 - 46)
+  const slot = count > 0 ? usable / count : usable
+  const width = Math.max(24, Math.floor(slot - 8))
+  return {
+    fontSize: 10,
+    width,
+    overflow: 'breakAll',   // 中文按字折行（'break' 对无空格中文无效）
+    interval: 0,            // 禁止因拥挤而自动隐藏类目
+    lineHeight: 12,
+  }
+}
+
 // ====== Comparison Bar Chart ======
 async function initCompare(profilesData) {
   const el = await waitForEl(compareChart)
   if (!el || !profilesData?.clusters) return
   const chart = echarts.init(el)
   const clusters = profilesData.clusters
-  const names = clusters.map(c => c.name?.substring(0, 4) || `C${c.cluster_id}`)
+  // 此前是 c.name?.substring(0, 4) —— 见 categoryLabelStyle 的说明。
+  const names = clusters.map(c => c.name || `C${c.cluster_id}`)
 
   chart.setOption({
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 } },
     grid: { left: 12, right: 12, top: 30, bottom: 40, containLabel: true },
-    xAxis: { type: 'category', data: names, axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5', fontSize: 10 } },
+    xAxis: {
+      type: 'category', data: names,
+      axisLine: { lineStyle: { color: '#d5dce8' } },
+      axisLabel: { color: '#7c8aa5', ...categoryLabelStyle(el, names.length) },
+    },
     yAxis: [
       { type: 'value', name: '金额(万)', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#9ca3af', formatter: v => (v/10000).toFixed(0) } },
       { type: 'value', name: '数量/%', splitLine: { show: false }, axisLabel: { color: '#7c8aa5' } },
@@ -325,6 +392,7 @@ async function initCompare(profilesData) {
       },
     ]
   })
+  compareInstance = chart
   chartInstances.push(chart)
 }
 
@@ -340,9 +408,15 @@ async function initChurnDist(profilesData) {
     grid: { left: 12, right: 12, top: 30, bottom: 40, containLabel: true },
     xAxis: {
       type: 'category',
-      data: clusters.map(c => c.name?.substring(0, 6) || `C${c.cluster_id}`),
+      // 此前是 c.name?.substring(0, 6)，把 7 字簇名砍成「高流失风险客」。
+      // 现改为按槽位宽度自动折行（见 categoryLabelStyle），并去掉 rotate：
+      // 折行已解决放不下，再叠加旋转会让标签高度和宽度双重膨胀。
+      data: clusters.map(c => c.name || `C${c.cluster_id}`),
       axisLine: { lineStyle: { color: '#d5dce8' } },
-      axisLabel: { color: '#9ca3af', fontSize: 10, rotate: 15 },
+      axisLabel: {
+        color: '#9ca3af',
+        ...categoryLabelStyle(el, clusters.length),
+      },
     },
     yAxis: { type: 'value', name: '人数', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
     series: [
@@ -368,6 +442,7 @@ async function initChurnDist(profilesData) {
       }
     ]
   })
+  churnDistInstance = chart
   chartInstances.push(chart)
 }
 
@@ -482,7 +557,33 @@ onMounted(loadAll)
 // 保留最后一次的散点原始数据，供窗口缩放后按新尺寸重绘
 // （renderScatter 内部依赖 explained_variance，重绘时需带上）
 function handleResize() {
+  // ⚠ 顺序要紧：先按新宽度重算类目轴标签折行宽度，再 resize()。
+  //   categoryLabelStyle 的 width 是**初始化时按当时槽位宽度算死的**，
+  //   只调 resize() 不会重算 —— 窗口从宽拖到窄，标签又会退回裁切/重叠。
+  refreshCategoryLabelWidths()
   chartInstances.forEach(c => c.resize())
+}
+
+/**
+ * 按容器当前宽度重算两张类目轴图的 axisLabel.width。
+ *
+ * 这两张图的容器宽随视口变化（lg 断点下每列仅约 324px），
+ * 而折行宽度必须在宽度变化后同步更新，见 handleResize 的说明。
+ */
+function refreshCategoryLabelWidths() {
+  const targets = [
+    [compareChart, compareInstance],
+    [churnChart, churnDistInstance],
+  ]
+  for (const [refObj, inst] of targets) {
+    const el = refObj?.value
+    if (!el || !inst) continue
+    const n = inst.getOption()?.xAxis?.[0]?.data?.length || 0
+    if (!n) continue
+    inst.setOption({
+      xAxis: { axisLabel: categoryLabelStyle(el, n) },
+    })
+  }
 }
 
 /**
@@ -496,6 +597,8 @@ function disposeCharts() {
   })
   chartInstances.length = 0
   scatterInstance = null
+  compareInstance = null
+  churnDistInstance = null
 }
 
 // 此前只在 onBeforeUnmount 里 remove、从未 add —— 本页图表不随窗口缩放。
@@ -670,7 +773,16 @@ onBeforeUnmount(() => {
                   class="border-b border-[#f0f3f8] hover:bg-[#f8fafc]">
                 <td class="py-2 flex items-center gap-1.5">
                   <span class="w-2 h-2 rounded-full flex-shrink-0" :style="{ background: COLORS[i % COLORS.length] }"></span>
-                  <span class="truncate max-w-[80px] text-[#374151]">{{ c.name?.substring(0, 6) }}</span>
+                  <!-- ⚠ 此前是 {{ c.name?.substring(0, 6) }} + max-w-[80px]：
+                       簇名是 6~7 个汉字（如「高流失风险客**户**」），截到 6 字后
+                       末尾的「户」被**静默丢弃**，既无省略号也无 tooltip ——
+                       实测该列渲染为「高流失风险客」，而同页「客群画像」表
+                       （无截断）显示完整，两表对同一簇的称呼不一致。
+                       该列实测有 160px 可用（圆点仅占 ~14px），根本无需截断。
+                       改为保留 truncate 作为超长簇名的兜底：宁可出省略号，
+                       也不能无声少字；title 属性保证截断时仍可悬停看全名。 -->
+                  <span class="truncate min-w-0 max-w-[112px] text-[#374151]"
+                        :title="c.name">{{ c.name }}</span>
                 </td>
                 <td class="text-right py-2 text-[#374151]">{{ c.count.toLocaleString() }}</td>
                 <td class="text-right py-2" :class="c.churn_rate > 30 ? 'text-[#c81e1e]' : 'text-[#0f766e]'">
