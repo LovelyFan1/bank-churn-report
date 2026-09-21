@@ -128,13 +128,57 @@ class ModelService:
     # 下面 5 个接口的数据全部来自 meta.json，
     # 只走 _ensure_meta()（12 ms），不加载模型对象（2,756 ms）。
 
+    def _engine_metrics_for_best(self) -> Optional[Dict[str, Any]]:
+        """取「当前引擎口径」下最优模型的测试集指标（可能为 None）。
+
+        ⚠ 为什么需要这个覆盖（实测缺陷，勿删）：
+
+          meta.json 里的 recall/precision 是**训练当时**用当时的决策阈值算的，
+          而决策阈值由 `net_profit` 决定 —— 后者依赖 COST_RATIO 与
+          RETENTION_SUCCESS_RATE 两个可配置假设。任一假设被调整，
+          阈值就会移动，meta.json 里的指标立即**过时**，直到下次重训。
+
+          实测（改动 RETENTION_SUCCESS_RATE 引入 0.30 后，未重训）：
+              /api/model/comparison   → LightGBM recall 0.7811（meta.json，旧阈值 0.20）
+              /api/model/risk-info    → recall 0.2751（引擎，新阈值 0.60）
+          同一模型两个召回率 —— 正是本项目反复出现的缺陷类型。
+
+          仅在「重训」时才更新 meta.json 是治标：只要有人调一次假设参数
+          （或换了成本口径），不一致就会重现。故此处做**运行时对齐**：
+          最优模型的行以引擎口径为准，其余模型保留 meta 值（引擎只算最优那个）
+          并明确标注 basis，读者能看出两行的口径不同。
+        """
+        try:
+            from app.services import risk_scoring
+            engine = risk_scoring._ensure_engine(self.db)
+            if engine is None:
+                return None
+            dm = risk_scoring.evaluate_at_decision_threshold() or {}
+            if not dm:
+                return None
+            return {
+                "model_name": engine.get("name"),
+                "threshold": dm.get("threshold"),
+                "precision": dm.get("precision"),
+                "recall": dm.get("recall"),
+                "f1_score": dm.get("f1_score"),
+                "accuracy": dm.get("accuracy"),
+                "basis": "engine_at_current_decision_threshold",
+            }
+        except Exception:
+            return None
+
     def get_model_comparison(self) -> Dict[str, Any]:
         if not self._ensure_meta():
             return {"models": [], "best_model": None, "error": "模型尚未训练，请先调用 POST /api/model/train"}
 
+        # 引擎口径（若可用）—— 用于修正最优模型那一行
+        live = self._engine_metrics_for_best()
+        live_name = live["model_name"] if live else None
+
         comparison = []
         for name, result in self._meta["results"].items():
-            comparison.append({
+            row = {
                 "model_name": name,
                 "accuracy": result["accuracy"],
                 "precision": result["precision"],
@@ -143,13 +187,33 @@ class ModelService:
                 "auc": result["auc"],
                 "cv_auc_mean": result.get("cv_auc_mean", 0),
                 "cv_auc_std": result.get("cv_auc_std", 0),
-            })
+                # 口径标注：这两行来自 meta.json（训练当时）；最优那行会被覆盖
+                "basis": "meta_json_at_training_time",
+            }
+            if live and name == live_name:
+                # 用引擎口径覆盖 —— 保证与 /risk-info、/cost-benefit 一致
+                row.update({
+                    "precision": live["precision"],
+                    "recall": live["recall"],
+                    "f1_score": live["f1_score"],
+                    "accuracy": live["accuracy"],
+                    "threshold": live["threshold"],
+                    "basis": live["basis"],
+                })
+            comparison.append(row)
 
         comparison.sort(key=lambda x: x["auc"], reverse=True)
 
         return {
             "models": comparison,
             "best_model": comparison[0]["model_name"],
+            # 说明为什么最优那行的 recall 可能与 meta.json 不同源
+            "note": (
+                "最优模型行取自**当前引擎口径**（决策阈值随 COST_RATIO 与"
+                " RETENTION_SUCCESS_RATE 变动，故与训练时写入 meta.json 的值可能不同）；"
+                "其余模型行为训练时的 meta.json 值。每行 basis 字段标明各自口径。"
+            ) if live else None,
+            "live_metrics": live,
         }
 
     def get_roc_curves(self) -> Dict[str, Any]:

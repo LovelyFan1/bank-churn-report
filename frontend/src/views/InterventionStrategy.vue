@@ -147,10 +147,15 @@ async function loadAll() {
           { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#7c8aa5' }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } }
         ],
         series: [
-          { name: 'TP(挽留成功)', type: 'bar', stack: 'count', data: data.map(d => d.tp), itemStyle: { color: '#22c55e' } },
+          // ⚠ 系列名由「TP(挽留成功)」改为「TP(判对)」——
+          //   TP 是「模型判为流失、且确实流失」的人数，属于**预测正确**，
+          //   不等于「挽留成功」。原标签把预测结果说成了业务结果，
+          //   与本次修正的 retained_customers 命名问题同源。
+          { name: 'TP(判对)', type: 'bar', stack: 'count', data: data.map(d => d.tp), itemStyle: { color: '#22c55e' } },
           { name: 'FP(误报)', type: 'bar', stack: 'count', data: data.map(d => d.fp), itemStyle: { color: '#f59e0b' } },
           { name: 'FN(漏检)', type: 'bar', stack: 'count', data: data.map(d => d.fn), itemStyle: { color: '#ef4444' } },
-          { name: '净利润', type: 'line', yAxisIndex: 1, data: data.map(d => d.net_profit), lineStyle: { color: '#6366f1', width: 2 }, itemStyle: { color: '#6366f1' }, symbol: 'circle', symbolSize: 6,
+          // 净利润的口径说明：已含挽留成功率折算（见后端 net_profit）
+          { name: '净利润(含成功率折算)', type: 'line', yAxisIndex: 1, data: data.map(d => d.net_profit), lineStyle: { color: '#6366f1', width: 2 }, itemStyle: { color: '#6366f1' }, symbol: 'circle', symbolSize: 6,
             markLine: marks.length ? {
               silent: true, symbol: 'none',
               lineStyle: { color: '#a855f7', type: 'dashed', width: 1.5 },
@@ -218,8 +223,13 @@ onBeforeUnmount(() => {
         <div class="text-xl font-bold text-orange-400">¥{{ (businessSummary.annual_loss / 10000).toFixed(0) }}万</div>
       </div>
       <div class="metric-card text-center">
-        <div class="text-xs text-gray-500 mb-1">可挽留客户</div>
-        <div class="text-xl font-bold text-green-400">{{ businessSummary.retained_customers.toLocaleString() }}</div>
+        <div class="text-xs text-gray-500 mb-1">期望可挽留</div>
+        <!-- 兜底 ?? retained_customers：旧后端/旧缓存可能没有 expected_retained
+             字段，直接访问会得到 undefined 并触发 toLocaleString 报错。
+             两个字段语义相同（后端已把 retained_customers 的值改为期望值）。 -->
+        <div class="text-xl font-bold text-green-400">
+          {{ (businessSummary.expected_retained ?? businessSummary.retained_customers ?? 0).toLocaleString() }}
+        </div>
       </div>
       <div class="metric-card text-center">
         <div class="text-xs text-gray-500 mb-1">投资回报率</div>
@@ -237,20 +247,35 @@ onBeforeUnmount(() => {
       <span class="err-hint">（若刚点过「重新训练」，稍等片刻后刷新即可）</span>
     </div>
 
-    <!-- 口径标注：上面的数是「模型推算」，下面的是「工单实测」，两者不可混为一谈 -->
+    <!-- 口径标注：上面的数是「模型推算」，下面的是「工单记录」，两者不可混为一谈 -->
     <div v-if="businessSummary" class="src-note src-model">
       <b>📐 推算值</b>：以上四项由模型测试集指标 × 假设客单价
-      ¥{{ businessSummary.avg_customer_value?.toLocaleString() }} 推算得出，<b>不是</b>实际发生的业务结果。
+      ¥{{ businessSummary.avg_customer_value?.toLocaleString() }} ×
+      <b>假设挽留成功率 {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%</b>
+      推算得出，<b>不是</b>实际发生的业务结果。
       模型召回率 {{ (businessSummary.model_recall * 100).toFixed(1) }}% 意味着约
-      {{ (100 - businessSummary.model_recall * 100).toFixed(1) }}% 的流失客户未被识别。
+      {{ (100 - businessSummary.model_recall * 100).toFixed(1) }}% 的流失客户未被识别。<br>
+      <!-- ⚠ ROI 的公式必须写出来，否则读者无法判断它依赖哪些假设。
+           ROI = COST_RATIO × precision × success_rate，三项里有两项是假设值。 -->
+      ROI = 成本比 {{ businessSummary.cost_ratio ?? 5 }} × 精准率
+      {{ (businessSummary.model_precision * 100).toFixed(1) }}% × 挽留成功率
+      {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%
+      = <b>{{ businessSummary.roi }}x</b>。
+      「期望可挽留」= 判对人数(TP) {{ (businessSummary.tp_at_threshold ?? businessSummary.retained_customers ?? 0).toLocaleString() }}
+      × 挽留成功率 —— <b>不是</b>模型判对的人数本身。
     </div>
 
-    <!-- 挽留效果复盘（工单实测） -->
+    <!-- 挽留效果复盘（工单记录） -->
     <div class="glass-card p-5">
-      <h3 class="text-sm font-medium text-gray-400 mb-2">挽留效果复盘（工单实测）</h3>
+      <h3 class="text-sm font-medium text-gray-400 mb-2">挽留效果复盘（工单记录）</h3>
       <p class="text-xs text-gray-600 mb-4">
-        数据来源：<code>work_orders</code> 表中 <code>result = retained / lost</code> 的真实处理结果，
-        按完成工单聚合。与上方「推算值」口径不同，此处为实际执行结果。
+        数据来源：<code>work_orders</code> 表的 <code>result</code> 字段，按已办结工单聚合。
+        <b class="text-amber-500">⚠ 该表初始内容为播种的演示工单</b>
+        （<code>seed_work_orders.py</code> 生成，处理结果取自硬编码比例表，
+        <b>非真实客户回访结果</b>），故成功率在接入真实反馈前不具备统计意义。<br>
+        <b class="text-amber-500">⚠ 与上方「推算值」的 ROI 不可直接比较</b>：
+        本处 ROI 的分母只含<b>实际已建单完成</b>的工单，
+        而上方推算 ROI 的分母是<b>模型决策线覆盖的全量人群</b>，两者分母相差数百倍。
       </p>
 
       <div v-if="retention && retention.has_data" class="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -259,18 +284,29 @@ onBeforeUnmount(() => {
           <div class="text-xl font-bold text-gray-200">{{ retention.total_completed.toLocaleString() }}</div>
         </div>
         <div class="metric-card text-center">
-          <div class="text-xs text-gray-500 mb-1">挽留成功</div>
+          <div class="text-xs text-gray-500 mb-1">标记为已挽留</div>
           <div class="text-xl font-bold text-green-400">{{ retention.retained.toLocaleString() }}</div>
         </div>
         <div class="metric-card text-center">
-          <div class="text-xs text-gray-500 mb-1">挽留成功率</div>
+          <div class="text-xs text-gray-500 mb-1">工单挽留成功率</div>
           <div class="text-xl font-bold text-emerald-400">{{ (retention.success_rate * 100).toFixed(1) }}%</div>
         </div>
         <div class="metric-card text-center">
-          <div class="text-xs text-gray-500 mb-1">实测 ROI</div>
-          <div class="text-xl font-bold text-indigo-400">{{ retention.roi }}x</div>
+          <!-- ⚠ 改名 + 口径提示：分母只含实际建单完成的工单，
+               与上方推算 ROI 的分母（决策线覆盖全量）相差数百倍，不可比。 -->
+          <div class="text-xs text-gray-500 mb-1" title="分母仅含实际已建单完成的工单，与上方推算 ROI 口径不同">
+            已执行 ROI
+          </div>
+          <div class="text-xl font-bold text-indigo-400">{{ retention.roi_executed }}x</div>
+          <div v-if="retention.roi_if_same_basis_as_plan != null"
+               class="text-xs text-gray-600 mt-1"
+               title="把实测成功率代入模型口径的式子（成本比 × 精准率 × 实测成功率），用于与上方推算 ROI 对照">
+            同口径折算 {{ retention.roi_if_same_basis_as_plan }}x
+          </div>
         </div>
 
+        <!-- 分组表格：补小样本标记。少于 30 条时不给结论 ——
+             此前页面把 9 条样本算出的成功率照常显示，容易被当成有效结论。 -->
         <div v-if="retention.by_strategy?.length" class="col-span-2 md:col-span-4">
           <div class="text-xs text-gray-500 mb-2 mt-2">按策略拆解</div>
           <table class="mini-table">
@@ -284,6 +320,8 @@ onBeforeUnmount(() => {
                 <td class="r">{{ s.retained }}</td>
                 <td class="r" :class="s.success_rate >= 0.5 ? 'text-green-400' : 'text-orange-400'">
                   {{ (s.success_rate * 100).toFixed(1) }}%
+                  <span v-if="s.sample_sufficient === false"
+                        class="text-amber-500" title="样本不足 30 条，该比率不具备统计意义">样本不足</span>
                 </td>
               </tr>
             </tbody>
@@ -424,20 +462,36 @@ onBeforeUnmount(() => {
           <div class="text-xs text-gray-500 mt-1">模型召回率</div>
         </div>
         <div class="text-center p-4 rounded-xl bg-white/3">
-          <div class="text-2xl font-bold text-green-400">{{ businessSummary.retained_customers.toLocaleString() }}</div>
-          <div class="text-xs text-gray-500 mt-1">年可挽留客户</div>
+          <!-- 兜底链：expected_retained（新）→ retained_customers（兼容旧后端）。
+               两字段语义相同（后端已把旧字段的值改为期望值 = TP × 成功率）。 -->
+          <div class="text-2xl font-bold text-green-400">
+            {{ (businessSummary.expected_retained ?? businessSummary.retained_customers ?? 0).toLocaleString() }}
+          </div>
+          <div class="text-xs text-gray-500 mt-1">期望年可挽留</div>
         </div>
         <div class="text-center p-4 rounded-xl bg-white/3">
-          <div class="text-2xl font-bold text-yellow-400">¥{{ (businessSummary.reduced_loss / 10000).toFixed(0) }}万</div>
-          <div class="text-xs text-gray-500 mt-1">年减少损失</div>
+          <div class="text-2xl font-bold text-yellow-400">
+            ¥{{ ((businessSummary.expected_reduced_loss ?? businessSummary.reduced_loss ?? 0) / 10000).toFixed(0) }}万
+          </div>
+          <div class="text-xs text-gray-500 mt-1">期望年减少损失</div>
         </div>
         <div class="text-center p-4 rounded-xl bg-white/3">
           <div class="text-2xl font-bold text-purple-400">{{ businessSummary.roi }}x</div>
-          <div class="text-xs text-gray-500 mt-1">投资回报率</div>
+          <div class="text-xs text-gray-500 mt-1">
+            投资回报率
+            <span class="block text-gray-600 mt-0.5">
+              (含 {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}% 挽留成功率假设)
+            </span>
+          </div>
         </div>
       </div>
       <p class="src-note src-model mt-4" style="margin-bottom:0">
-        ⚠ 以上为模型推算值，非工单实测结果；请与上方「挽留效果复盘（工单实测）」区分阅读。
+        ⚠ 以上为模型推算值，非工单执行结果。ROI = 成本比
+        {{ businessSummary.cost_ratio ?? 5 }} × 精准率
+        {{ (businessSummary.model_precision * 100).toFixed(1) }}% × 挽留成功率
+        {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%
+        —— 其中「挽留成功率」是<b>业务假设值</b>，成功率越低则该值越小、最优阈值越高。
+        请与上方「挽留效果复盘（工单记录）」区分阅读，两者的 ROI 分母口径不同、不可直接比较。
       </p>
     </div>
   </div>

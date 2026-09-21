@@ -299,7 +299,13 @@ def _load_best_model():
 
 # ── 成本收益最优阈值（参考）─────────────────────────────
 
-def net_profit(tp: int, fp: int, fn: int, cost_ratio: float = COST_RATIO) -> float:
+# 挽留成功率 —— 从 config 取，全系统唯一来源
+RETENTION_SUCCESS_RATE = settings.RETENTION_SUCCESS_RATE
+
+
+def net_profit(tp: int, fp: int, fn: int,
+               cost_ratio: float = COST_RATIO,
+               success_rate: float | None = None) -> float:
     """二分类混淆矩阵 → 净收益，单位为「一次误报（干预）的成本」。
 
     这是全系统**唯一**的成本模型，risk_scoring 与 cost_benefit 共用，
@@ -308,25 +314,44 @@ def net_profit(tp: int, fp: int, fn: int, cost_ratio: float = COST_RATIO) -> flo
     记账基准是「不干预」：不管我们做不做，没被识别出的流失客户（FN）都会流失，
     FN 相对于该基准不产生额外损失，故不计入。以一次干预成本 c 为单位：
 
-        TP（劝住了本来会流失的人）= 保住客户价值 - 干预成本 = +(cost_ratio - 1)
+        TP（劝住了本来会流失的人）= 保住价值 × 成功率 − 干预成本
+                                   = +(success_rate × cost_ratio − 1)
         FP（白跑一趟）             = -干预成本              = -1
         TN（本来就不会流失）       = 0
         FN                         = 0（与基准同为流失，无增量差异）
 
     等价换算（cost_ratio = 客户价值 / 单次干预成本）：
-        净收益 = TP×客户价值 - 触达人次×单次干预成本，再除以 c。
+        净收益 = TP×s×客户价值 - 触达人次×单次干预成本，再除以 c。
 
-    ⚠ 旧实现在用 `tp*1 - fn*cost_ratio - fp*1`：把「劝住一个」记 +1、
-    却把「漏掉一个」记 -cost_ratio，两者不对称 —— 漏检背了 5 倍代价，
-    TP 却只拿 1 倍收益，导致所有阈值下净收益恒为负，「最优阈值」退化成
-    「最不亏的那一档」，且与 `reduced_loss` 口径互相矛盾。
-    改为上式后，TP 与「客户价值」直接挂钩，两者才可比。
+    ⚠ success_rate 这一项是**后补的**，此前缺失（实测推导）：
+      旧实现 TP 记 +(cost_ratio-1)，等价于 s=1.0，即「判对了就等于留住了」。
+      展开 ROI 会得到 `ROI = COST_RATIO × precision` —— 一个不含任何成功率
+      因子的式子。这会把 ROI 系统性高估（按 s=0.3 算，高估约 3.3 倍）。
+
+      默认取 settings.RETENTION_SUCCESS_RATE（0.30，行业保守值）。
+      显式传 1.0 可复现旧行为，仅供对照，不应作为对外口径。
+
+    ⚠ 历史沿革（保留以备追溯）：更早的实现是 `tp*1 - fn*cost_ratio - fp*1`，
+      把「劝住一个」记 +1、却把「漏掉一个」记 -cost_ratio，两者不对称 ——
+      导致所有阈值下净收益恒为负，「最优阈值」退化成「最不亏的那一档」。
     """
-    return tp * (cost_ratio - 1) - fp
+    s = RETENTION_SUCCESS_RATE if success_rate is None else float(success_rate)
+    return tp * (s * cost_ratio - 1) - fp
 
 
 def _optimal_threshold(raw_proba: np.ndarray, y_true: np.ndarray) -> float:
-    """遍历阈值，返回净利润最大化的二分类阈值。"""
+    """遍历阈值，返回净利润最大化的二分类阈值。
+
+    ⚠ 阈值随「挽留成功率 s」移动，这是**正确行为**而非副作用：
+      net_profit 里 TP 的奖励是 (s×cost_ratio − 1)，s 越小奖励越薄，
+      就需要更高的精度才划算 → 最优阈值上移、名单收窄。
+      实测（96,418 行、LightGBM、cost_ratio=5）：
+          s=1.00 → 0.20（覆盖 37.0%）
+          s=0.50 → 0.40（覆盖 16.1%）
+          s=0.30 → 0.60（覆盖  6.9%）
+      即 s 是**名单规模的主要决定因素**，改它必须重选阈值，
+      否则会用一个按乐观假设选出的线去做保守决策。
+    """
     best_t, best_profit = 0.5, -float("inf")
     for t in np.arange(0.05, 0.96, 0.05):
         pred = (raw_proba >= t).astype(int)
@@ -1030,6 +1055,7 @@ def get_risk_info() -> dict:
             "calibrated": False,
             "model": None,
             "cost_ratio": COST_RATIO,
+            "success_rate": RETENTION_SUCCESS_RATE,
             "optimal_threshold": None,
             "decision_threshold": None,
             "decision_coverage": None,
@@ -1042,6 +1068,10 @@ def get_risk_info() -> dict:
         "calibrated": True,
         "model": _engine_cache["name"],
         "cost_ratio": COST_RATIO,
+        # 挽留成功率 —— 必须对外暴露，因为它是"名单规模"的主要决定因素，
+        # 且是**业务假设值**（非从数据拟合）。藏在公式里等于不可质疑。
+        "success_rate": RETENTION_SUCCESS_RATE,
+        "success_rate_source": "assumption(settings.RETENTION_SUCCESS_RATE)",
         "optimal_threshold": round(_engine_cache["optimal_threshold"], 4),
         # 决策阈值与分级阈值并列暴露，前端不得混用
         "decision_threshold": round(_engine_cache["decision_threshold"], 4),

@@ -65,17 +65,26 @@ def _best_threshold_on_train(model, X_train, y_train) -> float:
       拟合了这批数据，指标会带**乐观偏差**、经不起追问。
       正确做法是训练集选阈值、测试集评估，两侧不重叠。
 
-    与 risk_scoring.net_profit 同口径（TP 记 +（cost_ratio-1），FP 记 -1，
-    FN 与"不干预"基准相比无增量差异故记 0），保证两边数字可比。
+    ⚠ 与 risk_scoring.net_profit 同口径（统一走那个函数，不再本地复制公式）。
+      口径自引入「挽留成功率 s」后的变化（见 config.RETENTION_SUCCESS_RATE）：
+          TP 记 +(s × cost_ratio − 1)，FP 记 -1，FN 记 0
+      此前 TP 记 +(cost_ratio − 1)，等价于 s=1.0，会把阈值选得**偏松**
+      （名单偏大）。实测 s 从 1.0 降到 0.30 时，最优阈值从 0.20 升到 0.60。
+
+      ⚠ 这里必须与 risk_scoring 用同一个函数而不是各写一份 ——
+        两处若口径漂移，会出现「meta.json 说阈值 0.2、线上按 0.6 运营」
+        这类无法对账的情况（正是本项目反复出现的缺陷类型）。
     """
+    from app.services import risk_scoring
+
     p = model.predict_proba(X_train)[:, 1]
-    cost_ratio = settings.COST_RATIO
     best_t, best_profit = 0.5, -float("inf")
     for t in np.arange(0.05, 0.96, 0.05):
         pred = (p >= t).astype(int)
         tp = int(np.sum((pred == 1) & (y_train == 1)))
         fp = int(np.sum((pred == 1) & (y_train == 0)))
-        profit = tp * (cost_ratio - 1) - fp
+        fn = int(np.sum((pred == 0) & (y_train == 1)))
+        profit = risk_scoring.net_profit(tp, fp, fn)
         if profit > best_profit:
             best_profit, best_t = profit, float(t)
     return best_t

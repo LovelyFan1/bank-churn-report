@@ -37,6 +37,14 @@ const churnRate = ref(0)
 const lossAmount = ref(0)
 const recoverable = ref(0)
 const roi = ref(0)
+// 挽留成功率假设（%）。ROI 由 COST_RATIO × precision × success_rate 推出，
+// 三者的取值必须一起展示，否则 ROI 看起来像客观测量值而非假设的产物。
+const successRatePct = ref(0)
+const precisionPct = ref(0)
+// 决策线覆盖的实际触达人数（= 总客户数 × decision_coverage）。
+// 与「高风险客户」(分位数分级) 是两个口径，页面上必须分别标明 ——
+// 实测两者相差 4.4 倍（28,926 vs 6,585），混用会严重误导人力分配。
+const flaggedCount = ref(0)
 const riskDist = ref({ CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 })
 
 // 模型可信度 —— 取自 /api/model/comparison 的最优模型行（不再是字面量）
@@ -83,6 +91,24 @@ onMounted(async () => {
     lossAmount.value = summaryResult ? Math.round(summaryResult.annual_loss / 10000) : 0
     recoverable.value = summaryResult ? Math.round(summaryResult.reduced_loss / 10000) : 0
     roi.value = summaryResult ? summaryResult.roi : 0
+    // 成功率假设随 summary 一并取回（后端在 note 与字段里都给，这里用字段）
+    successRatePct.value = summaryResult?.success_rate != null
+      ? Math.round(summaryResult.success_rate * 100)
+      : 0
+    // 精准率也一起显示 —— ROI 公式的三个因子都要可见
+    precisionPct.value = summaryResult?.model_precision != null
+      ? (summaryResult.model_precision * 100).toFixed(1)
+      : '0.0'
+
+    // 决策线覆盖人数：优先用 business_summary.annual_flagged（后端已算好），
+    // 缺省时按 总客户数 × decision_coverage 估算
+    if (summaryResult?.annual_flagged != null) {
+      flaggedCount.value = summaryResult.annual_flagged
+    } else {
+      const cov = dash.risk_info?.decision_coverage
+      const tot = dash.overview?.total_customers
+      flaggedCount.value = (cov != null && tot != null) ? Math.round(cov * tot) : 0
+    }
 
     if (!scope.isActive()) return
     loading.value = false
@@ -317,9 +343,19 @@ function showOrderToast(msg) {
           当前在管客户 <span class="hl-white">{{ overview?.total_customers?.toLocaleString() }}</span> 人，
           其中历史上已流失 <span class="hl-red">{{ overview?.churned_customers?.toLocaleString() }} 人</span>，
           按此历史流失率折算年损失约 <span class="hl-red">¥{{ lossAmount }}万</span>（推算）。<br>
-          模型已识别高风险客户 <span class="hl-orange">{{ (riskDist.CRITICAL + riskDist.HIGH).toLocaleString() }} 人</span>，
-          建议优先跟进期望价值最高的前 <span class="hl-orange">{{ topCustomers.length }} 人</span>，
-          预计可挽回 <span class="hl-green">¥{{ recoverable }}万</span>。
+          <!-- ⚠ 这句话此前把两个不同口径的数字连在一起说，是误导：
+               「高风险 28,926 人」是**分位数分级**(P95+P70)的结果；
+               「预计可挽回 ¥8115万」却是按**决策线**(成本最优，覆盖率 6.83%，
+               约 6,585 人)算出来的。两者相差 4.4 倍，却被写成因果关系
+               —— 读者会以为这 28,926 人都能带来挽回金额。
+               现拆成两句，各自标明口径。 -->
+          模型按分位数分级标出高风险客户
+          <span class="hl-orange">{{ (riskDist.CRITICAL + riskDist.HIGH).toLocaleString() }} 人</span>；
+          按成本最优决策线（挽留成功率 {{ successRatePct }}% 假设）实际应触达
+          <span class="hl-orange">{{ flaggedCount.toLocaleString() }} 人</span>，
+          建议优先跟进其中期望价值最高的前
+          <span class="hl-orange">{{ topCustomers.length }} 人</span>，
+          期望可挽回 <span class="hl-green">¥{{ recoverable }}万</span>。
         </div>
         <div class="hero-grid">
           <div class="hero-card">
@@ -328,14 +364,27 @@ function showOrderToast(msg) {
             <div class="hero-card-sub">历史流失人数 × 平均客单价</div>
           </div>
           <div class="hero-card">
-            <div class="hero-card-label">模型可挽回金额</div>
+            <!-- ⚠ 标签由「模型可挽回金额」改为「期望可挽回金额」：
+                 该值已按挽留成功率折算（= TP × 成功率 × 客单价），
+                 原标签让人以为这是"模型算出来一定能挽回的钱"。 -->
+            <div class="hero-card-label">期望可挽回金额</div>
             <div class="hero-card-value hl-green">¥{{ recoverable }}万</div>
-            <div class="hero-card-sub">ROI {{ roi }} 倍</div>
+            <!-- ROI 必须带上成功率与公式，否则读者无法判断它依赖哪些假设。
+                 ROI = 成本比 × 精准率 × 挽留成功率，三项里有两项是假设值。 -->
+            <div class="hero-card-sub">
+              ROI {{ roi }} 倍 = 成本比 5 × 精准率
+              {{ precisionPct }}% × 挽留成功率 {{ successRatePct }}%
+            </div>
           </div>
           <div class="hero-card">
             <div class="hero-card-label">高风险客户</div>
             <div class="hero-card-value hl-orange">{{ (riskDist.CRITICAL + riskDist.HIGH).toLocaleString() }} 人</div>
-            <div class="hero-card-sub">需立即行动</div>
+            <!-- ⚠ 补口径：卡片按**分位数分级**(P95/P70)统计，而模型决策线
+                 (成本最优)覆盖的人更多（实测 28,926 vs 35,626，差 23%）。
+                 两者都在本页出现，不说明会被当成同一件事。 -->
+            <div class="hero-card-sub">
+              按分位数分级（P95+P70）· 决策线覆盖另计
+            </div>
           </div>
           <div class="hero-card">
             <div class="hero-card-label">流失率</div>
@@ -348,7 +397,10 @@ function showOrderToast(msg) {
       <!-- 挽留战报：实测口径，来自 work_orders 真实执行结果。
            工单表为空时不显示（retention 为 null），不用推算值顶替。 -->
       <div v-if="retention" class="glass-card p-5 retention-strip">
-        <div class="retention-title">挽留战报 <span class="badge">实测口径</span></div>
+        <!-- ⚠ 徽章由「实测口径」改为「工单记录」：数据确实来自工单表，
+             但该表初始内容是播种的演示记录（见下方说明），
+             称"实测"会让人以为这是真实客户反馈。 -->
+        <div class="retention-title">挽留战报 <span class="badge">工单记录（含演示数据）</span></div>
         <div class="retention-items">
           <div class="retention-item">
             <div class="retention-num">{{ retention.total_completed }}</div>
@@ -356,21 +408,36 @@ function showOrderToast(msg) {
           </div>
           <div class="retention-item">
             <div class="retention-num" style="color:#0f766e">{{ retention.retained }} 人</div>
-            <div class="retention-label">挽留成功</div>
+            <div class="retention-label">标记为已挽留</div>
           </div>
           <div class="retention-item">
             <div class="retention-num">{{ (retention.success_rate * 100).toFixed(1) }}%</div>
-            <div class="retention-label">挽留成功率</div>
+            <div class="retention-label">工单挽留成功率</div>
           </div>
           <div class="retention-item">
             <div class="retention-num" style="color:#0f766e">¥{{ Math.round(retention.benefit / 10000) }}万</div>
-            <div class="retention-label">实际挽回金额</div>
+            <div class="retention-label">已执行挽回金额</div>
           </div>
           <div class="retention-item">
-            <div class="retention-num">{{ retention.roi }}x</div>
-            <div class="retention-label">实际 ROI</div>
+            <!-- ⚠ 改名：这是「已执行工单口径」的 ROI（分母 = 实际建单数），
+                 与上方 hero-card 的推算 ROI（分母 = 决策线覆盖全量）不可比。
+                 实测两者分母相差数百倍，并列显示会让人误以为"实际比预期好"。
+                 故此处明确写成「已执行 ROI」并加口径说明。 -->
+            <div class="retention-num">{{ retention.roi_executed }}x</div>
+            <div class="retention-label">已执行 ROI</div>
           </div>
         </div>
+        <!-- 口径与数据来源说明：这段是本次修复的核心 —— 此前页面把
+             播种的演示工单当作"实测口径"展示，且不说明与推算 ROI 不可比。 -->
+        <p class="retention-note">
+          ⚠ 口径说明：以上来自 <code>work_orders</code> 表，其初始内容为
+          <b>播种的演示工单</b>（<code>seed_work_orders.py</code> 生成，处理结果取自
+          硬编码比例表，<b>非真实客户回访结果</b>），故成功率在接入真实反馈前
+          不具备统计意义。<br>
+          另：本处「已执行 ROI」的分母只含<b>实际已建单完成</b>的工单；
+          上方「模型可挽回金额」旁的 ROI 分母是<b>模型决策线覆盖的全量人群</b>
+          —— 两者分母相差数百倍，<b>不可直接比较</b>。
+        </p>
       </div>
 
       <!-- Key Insights + Top Customers -->
@@ -628,6 +695,15 @@ function showOrderToast(msg) {
 .retention-item { text-align: center; }
 .retention-num { font-size: 22px; font-weight: 700; color: #17335c; }
 .retention-label { font-size: 11px; color: #7c8aa5; margin-top: 3px; }
+/* 口径说明 —— 说明数据来源（播种演示数据）与两个 ROI 分母不可比 */
+.retention-note {
+  margin-top: 14px; padding-top: 12px; border-top: 1px dashed #e5e9f0;
+  font-size: 11px; line-height: 1.75; color: #7c8aa5;
+}
+.retention-note code {
+  background: #f1f5f9; padding: 1px 5px; border-radius: 4px;
+  font-size: 10px; color: #475569;
+}
 
 /* Section Title */
 .section-title {

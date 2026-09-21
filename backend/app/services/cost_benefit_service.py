@@ -135,6 +135,9 @@ class CostBenefitService:
         thresholds = np.arange(0.05, 0.96, 0.05)
         results = []
 
+        # 挽留成功率 —— 全系统唯一来源（config）。本函数与 net_profit 同口径。
+        s = risk_scoring.RETENTION_SUCCESS_RATE
+
         for threshold in thresholds:
             y_pred = (y_proba >= threshold).astype(int)
 
@@ -146,19 +149,14 @@ class CostBenefitService:
             # ⚠ 三个分项必须与 `net_profit` **同口径**，否则同一响应里
             #   会出现互相矛盾的数字（实测缺陷：旧实现 19/19 档都对不上）。
             #
-            # 旧实现写的是：
-            #     benefit = tp * (cost_ratio - 1)
-            #     cost_fn = fn * cost_ratio      ← 把"漏检"记了账
-            #     cost_fp = fp * 1
-            # 而 net_profit = tp*(cost_ratio-1) - fp，**不含 FN 项**。
-            # 两套记账法并存，实测 t=0.20 时
-            #     benefit - cost_fn - cost_fp = 4090，而 net_profit = 8590，
-            #     差额恒为 fn*cost_ratio。
-            #
             # 记账基准是「不干预」：漏掉的流失客户在两种情形下都会流失，
-            # 因此 FN 不产生**增量**损失（详见 risk_scoring.net_profit 的说明）。
-            # 所以 cost_fn 恒为 0，收益与成本只算 TP 与 FP 两项。
-            benefit = tp * (cost_ratio - 1)   # TP 净收益：保住的价值 - 干预成本
+            # 因此 FN 不产生**增量**损失（详见 risk_scoring.net_profit）。
+            #
+            # ⚠ TP 的收益必须乘「挽留成功率 s」—— 这是后补的一项。
+            #   旧实现写 `benefit = tp * (cost_ratio - 1)`，等价于 s=1.0，
+            #   即「判对了就等于留住了」。实测这一步会让 ROI 高估约 3.3 倍
+            #   （s=0.30 时）。s 与 net_profit 用同一个来源，保证两处不漂移。
+            benefit = tp * (s * cost_ratio - 1)   # TP 期望净收益（含成功率）
             cost_fn = 0                       # 与净收益口径一致：FN 不计增量
             cost_fp = fp * 1                  # 每次白跑一趟 = 1 个干预成本
             net_profit = risk_scoring.net_profit(tp, fp, fn, cost_ratio)
@@ -184,6 +182,8 @@ class CostBenefitService:
                 "benefit": round(float(benefit), 2),
                 "cost_fn": round(float(cost_fn), 2),
                 "cost_fp": round(float(cost_fp), 2),
+                # 按 s=1 计的 TP 名义收益，供对照（明确标注，不参与选阈值）
+                "benefit_if_success_100pct": round(float(tp * (cost_ratio - 1)), 2),
                 # FN 的**名义**代价（fn*cost_ratio）。与 net_profit 口径不同
                 # （净收益以"不干预"为基准，FN 不产生增量损失），故单独命名并
                 # 附口径说明 —— 保留它是为了不丢失"漏检规模"这一信息，
@@ -194,28 +194,115 @@ class CostBenefitService:
 
         optimal = max(results, key=lambda x: x["net_profit"])
 
+        # ⚠ 上方 optimal 是在**测试集**上挑出来的，仅作参考曲线用，
+        #   **不得**作为对外报告的「最优阈值」—— 那是乐观偏差。
+        #
+        #   实测缺陷（本次修复暴露）：本方法此前直接返回这个测试集最优值，
+        #   而 risk_scoring._ensure_engine 是在**训练集**上选阈值，
+        #   两处选出的阈值不同（实测 0.65 vs 0.60），于是
+        #       /api/cost-benefit/summary  → optimal_threshold 0.65
+        #       /api/model/risk-info       → decision_threshold 0.60
+        #   同一系统两个「最优阈值」，且 precision/recall 也跟着不一致
+        #   （0.8464/0.2326 vs 0.8099/0.2751）——正是本项目反复出现的
+        #   「同一件事两个数」缺陷类型。
+        #
+        #   现统一以 **risk_scoring 引擎的决策阈值**为准（训练集选、且是全系统
+        #   贴名单真正用的那一个），并在响应里同时给出该阈值下的测试集指标。
+        engine = risk_scoring._ensure_engine(self.db)
+        if engine is None:
+            return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
+        dt = float(engine["decision_threshold"])
+        dm = risk_scoring.evaluate_at_decision_threshold() or {}
+
+        # 取引擎阈值在结果表里的那一档（网格对齐后必然存在；找不到则现算）
+        official = next((r for r in results if abs(r["threshold"] - dt) < 1e-9), None)
+        if official is None:
+            official = self._metrics_at(y_proba, y_test, dt, cost_ratio, s)
+
         return {
             "cost_ratio": cost_ratio,
+            "success_rate": s,
             "best_model": best_name,
             "test_size": len(y_test),
             "churn_count": int(y_test.sum()),
             "thresholds": results,
-            "optimal_threshold": optimal["threshold"],
-            "optimal_metrics": optimal,
+            # ── 对外口径：与 /api/model/risk-info 完全一致（同一个引擎阈值）──
+            "optimal_threshold": official["threshold"],
+            "optimal_metrics": official,
+            # 决策阈值及其在测试集上的实测指标（与 risk-info 同源，可直接对账）
+            "decision_threshold": round(dt, 4),
+            "decision_coverage": round(float(engine["decision_coverage"]), 4),
+            "decision_metrics": dm,
+            # 保留"测试集自选最优"仅作曲线参考，字段名自带警告
+            "test_set_argmax_threshold": optimal["threshold"],
+            "test_set_argmax_metrics": optimal,
+            "basis": "estimate",
+            "note": (
+                f"TP 收益按挽留成功率 {s:.0%} 折算（RETENTION_SUCCESS_RATE）；"
+                f"若按 100% 计，最优阈值会偏松。"
+                f"该成功率是业务假设值，本系统无真实挽留结果数据可校准。"
+                f"optimal_threshold 取自风险引擎（训练集选线），"
+                f"与 /api/model/risk-info 的 decision_threshold 同源；"
+                f"thresholds 曲线中净收益最大的那档是在测试集上取的（乐观），"
+                f"见 test_set_argmax_threshold，仅供参考、不作对外口径。"
+            ),
+        }
+
+    @staticmethod
+    def _metrics_at(y_proba, y_test, threshold: float,
+                    cost_ratio: float, s: float) -> Dict[str, Any]:
+        """在给定阈值上算一组指标 —— 与主循环同一套公式，供网格外的阈值使用。"""
+        y_pred = (y_proba >= threshold).astype(int)
+        tp = int(np.sum((y_pred == 1) & (y_test == 1)))
+        fp = int(np.sum((y_pred == 1) & (y_test == 0)))
+        fn = int(np.sum((y_pred == 0) & (y_test == 1)))
+        tn = int(np.sum((y_pred == 0) & (y_test == 0)))
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        return {
+            "threshold": round(float(threshold), 2),
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "net_profit": round(float(risk_scoring.net_profit(tp, fp, fn, cost_ratio)), 2),
+            "benefit": round(float(tp * (s * cost_ratio - 1)), 2),
+            "cost_fn": 0.0,
+            "cost_fp": float(fp),
+            "fn_notional_cost": round(float(fn * cost_ratio), 2),
+            "cost_basis": "baseline_no_intervention",
         }
 
     def get_business_summary(self) -> Dict[str, Any]:
         """业务摘要 — 年化成本收益（**推算值**，非实测结果）。
 
-        口径：模型测试集指标 × 假设客单价。ROI 的分母是「完成一次干预的
-        人工成本」，不再是此前那个凭空的比例系数（旧代码写的是
-        `annual_loss * 0.1`，无法回答 0.1 从哪来）。
+        口径：模型测试集指标 × 假设客单价 × **假设挽留成功率**。
+
+        ⚠ 本次修复的两个问题（实测确认）：
+
+        【1】ROI 此前隐含「挽留成功率 100%」
+           旧式子展开后是 `ROI = COST_RATIO × precision`，一个不含成功率
+           因子的式子 —— 等价于假设「只要打电话客户就留下」。实测按 s=0.30
+           计，这会把 ROI 高估约 3.3 倍。现引入 settings.RETENTION_SUCCESS_RATE。
+
+        【2】字段名把「模型判对」说成了「挽留成功」
+           `retained_customers` 的实际含义是 **TP**（模型判为流失且确实流失
+           的人数），不是"真的留住了这么多客户"。前端据此标注「挽留成功」，
+           属于把预测结果说成业务结果。
+           现拆成三个语义明确的字段：
+               tp_at_threshold            判对人数（TP），供对账
+               expected_retained          期望挽留人数 = TP × s  ← 对外口径
+               retained_customers         【兼容旧名】值已改为 expected_retained
+                                          （即已乘 s），使尚未更新的旧页面
+                                          显示的数字自动变正确
         """
         analysis = self.analyze_thresholds()
         if "error" in analysis:
             return analysis
 
         opt = analysis.get("optimal_metrics", {})
+        s = analysis.get("success_rate", risk_scoring.RETENTION_SUCCESS_RATE)
 
         # 客户总量与流失率取自真实数据，不再写死 10000 / 0.2037
         total_customers = self.db.query(Customer).count() or settings.NUM_CUSTOMERS
@@ -227,21 +314,33 @@ class CostBenefitService:
         # 保持与 analyze_thresholds 的成本模型同一套假设 —— 见 config.py 的推导说明。
         cost_per_intervention = avg_customer_value / settings.COST_RATIO
 
-        annual_churn_count = int(total_customers * annual_churn_rate)
+        # ⚠ 分母用「实际流失人数」而非「客户总数 × 流失率」。
+        #   旧实现是 int(total * rate)，实测 96,418 × 0.2040 = 19,669，
+        #   而真实流失数是 19,666 —— 差 3 人（浮点取整）。两个数都对外暴露过，
+        #   无法对账。直接查库更准且更好解释。
+        annual_churn_count = churn_count
+
         annual_loss = annual_churn_count * avg_customer_value
 
         recall = opt.get("recall", 0)
         precision = opt.get("precision", 0)
 
         # 触达人次 = 预测为正的客户数（测试集上为 TP+FP，按比例外推到全年）
-        annual_flagged = annual_churn_count * (recall / precision) if precision > 0 else 0
+        # ⚠ 先取整再用于计算，保证 annual_flagged 与 intervention_cost 内部自洽。
+        #   实测缺陷：旧实现把未截断的浮点（6679.98）用于算成本，却把 int()
+        #   截断后的 6679 对外显示 —— 两者差约 1 人次（≈1 万元），
+        #   使用者按显示的触达人次复算成本会得到不同的数。
+        annual_flagged = int(annual_churn_count * (recall / precision)) if precision > 0 else 0
 
-        retained_with_model = int(annual_churn_count * recall)
-        reduced_loss = retained_with_model * avg_customer_value
+        # TP：模型判为流失、且确实流失的人数（不是"挽留成功"）
+        tp_at_threshold = int(round(annual_churn_count * recall))
+        # 期望挽留人数 = TP × 挽留成功率 —— 这才是"能留住多少人"的口径
+        expected_retained = int(round(tp_at_threshold * s))
+        expected_reduced_loss = expected_retained * avg_customer_value
 
         # 真实投入 = 触达人次 × 单次干预成本
         intervention_cost = annual_flagged * cost_per_intervention
-        roi = (reduced_loss / intervention_cost) if intervention_cost > 0 else 0
+        roi = (expected_reduced_loss / intervention_cost) if intervention_cost > 0 else 0
 
         return {
             "total_customers": total_customers,
@@ -249,27 +348,58 @@ class CostBenefitService:
             "annual_churn_rate": round(annual_churn_rate * 100, 2),
             "avg_customer_value": avg_customer_value,
             "cost_per_intervention": round(cost_per_intervention, 2),
-            "annual_flagged": int(annual_flagged),
+            "annual_flagged": annual_flagged,
             "intervention_cost": round(intervention_cost, 2),
             "annual_loss": annual_loss,
             "optimal_threshold": opt.get("threshold", 0.5),
             "model_recall": recall,
             "model_precision": precision,
-            "retained_customers": retained_with_model,
-            "reduced_loss": reduced_loss,
+            # ── 挽留相关三字段（语义严格区分，勿混用）──
+            "success_rate": s,                       # 假设的挽留成功率
+            "tp_at_threshold": tp_at_threshold,      # 判对人数（TP）
+            "expected_retained": expected_retained,  # 期望挽留人数 = TP × s
+            "expected_reduced_loss": expected_reduced_loss,
+            # ⚠ 兼容字段：旧前端读的是 retained_customers / reduced_loss。
+            #   为不改坏已有页面，此处仍给值，但**语义已改为"期望值"**
+            #   （即已乘 s），使旧页面显示的数字自动变正确，而不是继续显示 TP。
+            #   新代码请用 expected_retained / expected_reduced_loss。
+            "retained_customers": expected_retained,
+            "reduced_loss": expected_reduced_loss,
             "roi": round(roi, 2),
             "basis": "estimate",  # 标记口径：推算值
-            "note": "基于模型测试集指标与假设客单价推算，非实际业务结果",
+            "note": (
+                f"基于模型测试集指标、假设客单价 ¥{avg_customer_value:,.0f}、"
+                f"假设挽留成功率 {s:.0%} 推算，非实际业务结果。"
+                f"「期望挽留人数」= 判对人数(TP) × 挽留成功率；"
+                f"成功率越低，最优阈值越高、名单越窄。"
+            ),
         }
 
     # ── 挽留效果复盘（实测值）───────────────────────────
 
     def get_retention_summary(self) -> Dict[str, Any]:
-        """从 work_orders 的真实处理结果聚合挽留效果。
+        """从 work_orders 的处理结果聚合挽留效果。
 
-        数据来源是工单表里已经存在的 result 字段（retained / lost）与
-        completed_at，属于**实际执行结果**，与 get_business_summary 的
-        推算值口径不同。
+        ⚠ 本方法与 get_business_summary 的 ROI **不可直接比较**，原因如下
+          （实测确认，这是本次修复的第二个问题）：
+
+          · get_business_summary 的分母 = 模型决策线覆盖的**全部**人群
+            （实测 35,690 人）→ 回答"按模型名单全员触达，账算得过来吗"
+          · 本方法的分母 = 实际**已建单完成**的工单数（实测 56 条）
+            → 回答"我实际做掉的这些单，效果如何"
+
+          两者分母相差 637 倍。实测后果：本方法的 ROI(3.04) 高于推算值(2.15)，
+          但这**不是**因为实际做得更好 —— 而是因为分母只统计了实际执行的那
+          一小撮（且这撮还是从 expected_value Top200 里挑的，属高价值易挽留
+          的偏斜样本）。若按同口径折算，实际 ROI 反而更低。
+          故本次给两个 ROI 各自命名并附 `roi_basis`，页面上不得再并列为"ROI"。
+
+        ⚠ 数据来源的另一重限制（必须让使用者知道）：
+          work_orders 的初始内容是 seed_work_orders.py 播种的**演示数据**
+          （其 result 来自一张硬编码的比例表，非真实客户反馈）。
+          因此 `success_rate` 在未接入真实回访结果前**不具备统计意义**，
+          它只是演示流程用的占位值。返回值中 basis 标为
+          "actual_but_seeded" 以如实反映这一点。
 
         工单表为空时返回 has_data=False，前端据此显示空态 ——
         不得用推算值顶替，否则会把「模型理论上能省钱」说成「实际挽回了客户」。
@@ -287,24 +417,39 @@ class CostBenefitService:
                 "retained": 0,
                 "lost": 0,
                 "success_rate": 0.0,
-                "roi": 0.0,
+                "roi_executed": 0.0,
                 "by_strategy": [],
                 "by_assignee": [],
-                "basis": "actual",
+                "basis": "actual_but_seeded",
+                "roi_basis": "executed_orders_only",
             }
 
         total = len(completed)
         retained = sum(1 for o in completed if o.result == "retained")
         success_rate = retained / total if total else 0.0
 
-        # 实测投入与收益：复用与推算值同一套成本假设（config 推导而来），
-        # 差异只来自「实际挽留了多少人」这一点，两组数字才可比。
+        # 实测投入与收益：成本假设与推算值同源（config 推导而来）
         avg_customer_value = settings.AVG_CUSTOMER_VALUE
         cost_per_intervention = avg_customer_value / settings.COST_RATIO
 
         cost = total * cost_per_intervention
         benefit = retained * avg_customer_value
-        roi = (benefit / cost) if cost > 0 else 0.0
+        roi_executed = (benefit / cost) if cost > 0 else 0.0
+
+        # 与推算值同口径的对照值：把"实际成功率"代进模型口径的式子
+        #   ROI_plan = COST_RATIO × precision × s
+        # 这里用实测 s 替换假设 s，并取当前模型的 precision，
+        # 供使用者看出"计划 vs 实际"的差距到底来自哪一项。
+        engine = risk_scoring._ensure_engine(self.db)
+        precision_now = None
+        if engine is not None:
+            dm = risk_scoring.evaluate_at_decision_threshold()
+            precision_now = dm.get("precision")
+
+        roi_if_same_basis = None
+        if precision_now:
+            roi_if_same_basis = round(
+                settings.COST_RATIO * precision_now * success_rate, 2)
 
         def _group(key_fn, key_name: str, empty_label: str):
             """按 key_fn 分组统计成功率。
@@ -325,6 +470,8 @@ class CostBenefitService:
                     "total": v["total"],
                     "retained": v["retained"],
                     "success_rate": round(v["retained"] / v["total"], 4),
+                    # 小样本标记：少于 30 条不给结论（与矩阵的 MIN_CELL_SAMPLE 同标准）
+                    "sample_sufficient": v["total"] >= 30,
                 }
                 for k, v in buckets.items()
             ]
@@ -339,10 +486,24 @@ class CostBenefitService:
             "success_rate": round(success_rate, 4),
             "cost": round(cost, 2),
             "benefit": round(benefit, 2),
-            "roi": round(roi, 2),
+            # ⚠ 改名：这是「已执行工单口径」的 ROI，不是与推算值可比的 ROI
+            "roi_executed": round(roi_executed, 2),
+            "roi_basis": "executed_orders_only",
+            # 与模型口径对齐后的对照值（用实测成功率代入模型式子）
+            "roi_if_same_basis_as_plan": roi_if_same_basis,
+            "precision_used": precision_now,
+            "plan_success_rate": risk_scoring.RETENTION_SUCCESS_RATE,
             "by_strategy": _group(lambda o: o.strategy, "strategy", "未填写策略"),
             "by_assignee": _group(lambda o: o.assignee, "assignee", "未指派"),
-            "basis": "actual",  # 标记口径：实测值
+            # 如实标注：数据来自工单表，而该表初始内容是播种的演示记录
+            "basis": "actual_but_seeded",
+            "note": (
+                "本组数字来自 work_orders 表，其初始内容为 seed_work_orders.py "
+                "播种的演示工单（result 取自硬编码比例表，非真实客户回访结果），"
+                "故 success_rate 在接入真实反馈前不具备统计意义。"
+                "另：roi_executed 的分母仅含已建单完成的工单，"
+                "与成本收益页的推算 ROI 分母口径不同（相差数百倍），两者不可直接比较。"
+            ),
         }
 
     # ── 价值层 × 风险等级 矩阵 ─────────────────────────────
