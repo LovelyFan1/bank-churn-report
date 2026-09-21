@@ -57,12 +57,51 @@ def _get_models():
     }
 
 
+def _best_threshold_on_train(model, X_train, y_train) -> float:
+    """在**训练集**上求净收益最大的概率切点（决策阈值）。
+
+    ⚠ 为什么在训练集上选（而不是测试集）：
+      如果在测试集上挑最优阈值、又在同一测试集上报告指标，阈值本身
+      拟合了这批数据，指标会带**乐观偏差**、经不起追问。
+      正确做法是训练集选阈值、测试集评估，两侧不重叠。
+
+    与 risk_scoring.net_profit 同口径（TP 记 +（cost_ratio-1），FP 记 -1，
+    FN 与"不干预"基准相比无增量差异故记 0），保证两边数字可比。
+    """
+    p = model.predict_proba(X_train)[:, 1]
+    cost_ratio = settings.COST_RATIO
+    best_t, best_profit = 0.5, -float("inf")
+    for t in np.arange(0.05, 0.96, 0.05):
+        pred = (p >= t).astype(int)
+        tp = int(np.sum((pred == 1) & (y_train == 1)))
+        fp = int(np.sum((pred == 1) & (y_train == 0)))
+        profit = tp * (cost_ratio - 1) - fp
+        if profit > best_profit:
+            best_profit, best_t = profit, float(t)
+    return best_t
+
+
 def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> dict:
-    """训练单个模型并返回评估指标。"""
+    """训练单个模型并返回评估指标。
+
+    ⚠ 指标口径（本次修复的核心，此前这里是「同一召回率两个数」的源头）：
+      旧实现用 `model.predict(X_test)` —— 即 sklearn 默认的 0.5 阈值算出
+      recall=0.3627 并写进 meta.json，被 Dashboard / ModelComparison /
+      InterventionStrategy 三处展示；而系统实际运营（客户列表排序、
+      建单建议、cost_benefit）依据的是决策阈值(0.20)，对应 recall≈0.78。
+      同一个系统里两个「模型召回率」，答辩时无法自圆其说。
+
+      现改为：**主指标按决策阈值计算**（因为那才是"按净收益最优挑客户"
+      时真实会发生的结果），同时保留默认 0.5 阈值下的指标供对照，
+      字段名加 `at_default` 后缀，避免混淆。
+    """
     model.fit(X_train, y_train)
 
-    y_pred = model.predict(X_test)
+    # ── 决策阈值：训练集选 ─────────────────────────────────
+    decision_thr = _best_threshold_on_train(model, X_train, y_train)
     y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_proba >= decision_thr).astype(int)      # 主口径
+    y_pred_def = (y_proba >= 0.5).astype(int)           # 对照口径
 
     # ROC 曲线
     fpr, tpr, thresholds = roc_curve(y_test, y_proba)
@@ -72,7 +111,7 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
         "thresholds": [1.0 if np.isinf(v) else round(float(v), 6) for v in thresholds],
     }
 
-    # 混淆矩阵
+    # 混淆矩阵 —— 按决策阈值（与主指标同口径）
     cm = confusion_matrix(y_test, y_pred)
     confusion_data = {
         "tn": int(cm[0, 0]), "fp": int(cm[0, 1]),
@@ -95,10 +134,20 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
     cv_std = float(cv_scores.std()) if not np.isinf(cv_scores.std()) else 0.0
 
     return {
+        # ── 主指标：决策阈值下（对外报的就是这一组）──
         "accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
-        "precision": round(float(precision_score(y_test, y_pred)), 4),
-        "recall": round(float(recall_score(y_test, y_pred)), 4),
-        "f1_score": round(float(f1_score(y_test, y_pred)), 4),
+        "precision": round(float(precision_score(y_test, y_pred, zero_division=0)), 4),
+        "recall": round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
+        "f1_score": round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
+        "decision_threshold": round(float(decision_thr), 4),
+        # ── 对照指标：默认 0.5 阈值下（保留以便追溯，不作为对外口径）──
+        "at_default": {
+            "threshold": 0.5,
+            "accuracy": round(float(accuracy_score(y_test, y_pred_def)), 4),
+            "precision": round(float(precision_score(y_test, y_pred_def, zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test, y_pred_def, zero_division=0)), 4),
+            "f1_score": round(float(f1_score(y_test, y_pred_def, zero_division=0)), 4),
+        },
         "auc": round(float(roc_auc_score(y_test, y_proba)), 4),
         "cv_auc_mean": round(cv_mean, 4),
         "cv_auc_std": round(cv_std, 4),
@@ -283,6 +332,20 @@ def train_all_models_task(self) -> dict:
 
         _save_results_to_disk(models, results, shap_results)
         _save_results_to_db(db, results)
+
+        # ⚠ 让 **backend 进程** 感知到「模型已换新」。
+        #
+        # 背景：`risk_scoring._best_model_cache` 带 600 秒 TTL，且它跑在
+        # backend 进程里，而训练跑在 Celery worker 进程里 —— 两者内存不共享。
+        # 训练完成后，已加载过模型的 backend worker 会**继续用旧模型**，
+        # 直到 TTL 到期（最长 10 分钟）。期间界面显示的分级、Top 名单、
+        # 成本收益都是旧模型的产物，且不同 worker 可能给出不同结果
+        # （有的已过期、有的没有）。
+        #
+        # 这里递增一个磁盘版本号，backend 侧在取模型时比对（见
+        # risk_scoring._model_version_changed 的说明），从而立即换用新模型。
+        from app.services import risk_scoring
+        risk_scoring.bump_model_version()
 
         best_model = max(results.keys(), key=lambda x: results[x]["auc"])
 

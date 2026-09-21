@@ -24,6 +24,7 @@
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -47,6 +48,43 @@ P_MEDIUM = 35     # top 65%
 
 CACHE_TTL = 600  # 秒
 
+# ══════════════════════════════════════════════════════════════════════
+# 两个阈值，各司其职 —— 此前系统把它们混用，导致「同一个召回率两个数」
+# ══════════════════════════════════════════════════════════════════════
+#
+# 本模块对外提供**两类**阈值，语义完全不同，不可互相替代：
+#
+# 【一】分级阈值 thresholds（critical/high/medium）
+#     来源：全量原始概率的**分位数** P95/P70/P35
+#     用途：给客户贴 CRITICAL/HIGH/MEDIUM/LOW 标签，用于**展示与排序**
+#     特性：占比恒定（5%/25%/35%/35%），与业务量无关，便于运营排班
+#
+# 【二】决策阈值 decision_threshold
+#     来源：**训练集**上使净收益最大的绝对概率切点
+#     用途：判定「这个客户要不要真的去干预」—— 即名单准入线
+#     特性：随成本比与数据分布变化，是**成本最优**的绝对线
+#
+# ⚠ 为什么必须分开（这是本次修复的核心）：
+#   两者数值接近但语义不同。此前 train.py 用 sklearn 默认 0.5 算 recall
+#   （得 0.363），而 cost_benefit 用 decision_threshold 算（得 0.780），
+#   于是**同一个系统里同时存在 36.3% 和 78.0% 两个「模型召回率」**，
+#   分别出现在 Dashboard / ModelComparison / InterventionStrategy 三处。
+#
+#   经实测（20,000 条测试集）：
+#       阈值 0.50（sklearn 默认）   → recall 0.3627  precision 0.7267  漏掉 2602 人
+#       阈值 0.20（成本最优）       → recall 0.7796  precision 0.4345  漏掉  900 人
+#   在 cost_ratio=5 的假设下，后者的净收益更高（+8590 vs +5367，单位=一次干预成本），
+#   因为「漏掉一个真实流失客户」的代价是「白打一次电话」的 5 倍。
+#
+# ⚠ 选阈值的样本纪律（此前实现的缺陷）：
+#   旧代码在**测试集**上挑最优阈值、又在**同一测试集**上报告指标 —— 属乐观偏差。
+#   现改为：在**训练集**上挑阈值，在**测试集**上评估。实测两者恰好都选中 0.20，
+#   数值不变，但方法上不再有偏，指标经得起追问。
+
+# 决策阈值的候选网格。上限 0.95 是因为树模型概率趋于两极，
+# 再高的切点会切掉几乎所有样本，失去意义。
+DECISION_GRID = np.arange(0.05, 0.96, 0.05)
+
 # ⚠ 已知行为（预先存在，非本次改动引入）：模型重训后本模块的缓存不会立即失效。
 #   Celery worker 是**独立进程**，它写的 saved_models/ 与本进程的缓存互不可见，
 #   且 _best_model_cache 没有 TTL。故重训完成后最多需等 CACHE_TTL(10 分钟)
@@ -65,9 +103,26 @@ def reset_caches() -> None:
     _best_model_cache["name"] = None
     _best_model_cache["model"] = None
     _best_model_cache["ts"] = 0.0
-    _engine_cache = {"df": None, "raw": None, "thresholds": None,
-                     "optimal_threshold": None, "name": None, "ts": 0.0}
-    _scored_cache = {"data": None, "name": None, "ts": 0.0}
+    _engine_cache = _empty_engine_cache()
+    _scored_cache = {"data": None, "name": None, "ts": 0.0, "engine_ts": None}
+
+
+def _empty_engine_cache() -> dict:
+    """引擎缓存的空白初始值（多处复用，避免字段遗漏）。"""
+    return {
+        "df": None,
+        "raw": None,
+        "thresholds": None,
+        "optimal_threshold": None,     # 保留旧字段名，兼容既有调用方
+        "decision_threshold": None,    # 与 optimal_threshold 同值，语义更明确
+        "decision_coverage": None,     # 决策阈值切掉的人群占比
+        "name": None,
+        "ts": 0.0,
+        # 缓存构建时的版本号 —— 用于跨进程感知「模型重训 / 客户表变更」，
+        # 见 _engine_is_fresh() 的说明
+        "model_version": None,
+        "customer_version": None,
+    }
 
 
 # ── 进程级缓存 ───────────────────────────────────────────
@@ -82,12 +137,69 @@ def reset_caches() -> None:
 #   加 TTL 后最多 MODEL_CACHE_TTL 秒收敛到新模型，无需重启。
 MODEL_CACHE_TTL = 600  # 秒
 
-_best_model_cache = {"name": None, "model": None, "ts": 0.0}
+# ── 模型缓存的跨进程版本标记 ──────────────────────────────
+#
+# ⚠ 为什么 TTL 还不够（实测缺陷）：
+#   训练跑在 **Celery worker 进程**，而本模块的 `_best_model_cache`
+#   在 **backend 进程** 内存里。worker 写新模型后没有任何机制通知 backend，
+#   于是已加载过模型的 worker 会继续用旧模型，直到 MODEL_CACHE_TTL 到期
+#   （最长 10 分钟）。期间：
+#     · 界面显示的分级 / Top 名单 / 成本收益都基于旧模型；
+#     · backend 有 4 个 uvicorn worker，各自 TTL 起点不同，
+#       可能出现「同一客户刷新两次得到不同风险等级」。
+#
+#   解法与 data_loader 的 customer cache 一致：把版本号落成一个极小文件，
+#   写入方（训练任务）递增，读取方每次比对。os.stat + 读 1 个整数
+#   远比 joblib.load 一个模型（数 MB）便宜，因此可以每次调用都检查。
+_MODEL_VERSION_FILE = MODEL_DIR / ".model_version"
+
+
+def _read_model_version() -> str:
+    try:
+        return _MODEL_VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def bump_model_version() -> None:
+    """训练完成后由 Celery worker 调用，通知所有 backend 进程丢弃模型缓存。
+
+    ⚠ 不要在这里清本进程的 `_best_model_cache` 之外的东西 ——
+      本函数设计为**可跨进程生效**，因此必须落盘。
+    """
+    global _engine_cache, _scored_cache
+    # 1) 清本进程（若本函数恰好在 backend 进程内被调用）
+    _best_model_cache["model"] = None
+    _best_model_cache["name"] = None
+    _best_model_cache["ts"] = 0.0
+    _best_model_cache["version"] = None
+    _engine_cache = _empty_engine_cache()
+    _scored_cache = {"data": None, "name": None, "ts": 0.0, "engine_ts": None}
+
+    # 2) 落盘递增版本号，让其他进程也能感知
+    try:
+        _MODEL_VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cur = _read_model_version()
+        try:
+            nxt = int(cur) + 1 if cur else 1
+        except ValueError:
+            nxt = 1
+        tmp = _MODEL_VERSION_FILE.with_name(_MODEL_VERSION_FILE.name + ".tmp")
+        tmp.write_text(str(nxt), encoding="utf-8")
+        os.replace(tmp, _MODEL_VERSION_FILE)
+    except OSError:
+        # 版本文件不可写时退化为旧的 TTL 行为，不能让训练任务因此失败
+        logger.warning("risk_scoring: 无法写入模型版本文件 %s，"
+                       "跨进程失效不可用（将退化为 TTL 过期）", _MODEL_VERSION_FILE)
+
+_best_model_cache = {"name": None, "model": None, "ts": 0.0, "version": None}
 _engine_cache = {
     "df": None,                # 全量数据（复用，避免重复 load_all）
     "raw": None,               # 全量原始概率
-    "thresholds": None,        # {"critical", "high", "medium"} 分位数
-    "optimal_threshold": None,  # 成本收益参考阈值
+    "thresholds": None,        # {"critical", "high", "medium"} 分位数分级线
+    "optimal_threshold": None,  # 成本收益参考阈值（保留旧名，= decision_threshold）
+    "decision_threshold": None,  # 决策阈值：名单准入线（成本最优绝对切点）
+    "decision_coverage": None,   # 决策阈值覆盖的人群占比
     "name": None,
     "ts": 0.0,
 }
@@ -97,10 +209,13 @@ _scored_cache = {"data": None, "name": None, "ts": 0.0}
 # ── 模型加载（缓存）─────────────────────────────────────
 
 def _cache_expired() -> bool:
-    """模型对象缓存是否已过期（或从未加载）。"""
+    """模型对象缓存是否已过期（或从未加载、或模型已被重训）。"""
     if _best_model_cache["model"] is None:
         return True
-    return time.time() - _best_model_cache["ts"] >= MODEL_CACHE_TTL
+    if time.time() - _best_model_cache["ts"] >= MODEL_CACHE_TTL:
+        return True
+    # 跨进程失效：训练任务会递增磁盘版本号（见 bump_model_version 的说明）
+    return _best_model_cache.get("version") != _read_model_version()
 
 
 def _load_best_model():
@@ -143,7 +258,26 @@ def _load_best_model():
         )
         return None, None
 
-    best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
+    # ⚠ 结构异常也要降级，不能把 KeyError 抛到接口层。
+    #   实测：meta.json 能被 json.load 解析、但缺 "results" 键（或该键为空、
+    #   或某模型缺 "auc"）时，旧实现会抛
+    #       KeyError: 'results' / ValueError: max() arg is an empty sequence
+    #   并一路冒到 /api/customers 等**所有**依赖本函数的接口，全部 500。
+    #   写入端的原子写只能保证"不出现半截 JSON"，保证不了结构完整
+    #   （手工编辑、旧版本文件、外部工具写入都可能造成结构异常）。
+    #   cost_benefit_service._read_meta 对同类情况是正确降级的，这里与之对齐。
+    try:
+        results = meta["results"]
+        if not isinstance(results, dict) or not results:
+            raise ValueError("meta.json 的 results 为空或类型异常")
+        best_name = max(results.keys(), key=lambda x: results[x]["auc"])
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        logger.warning(
+            "risk_scoring: %s 结构异常，无法选出最佳模型（降级为模型未就绪）: %s: %s",
+            meta_path, type(e).__name__, e,
+        )
+        return None, None
+
     model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
     if not model_path.exists():
         return None, None
@@ -158,6 +292,8 @@ def _load_best_model():
     _best_model_cache["model"] = model
     _best_model_cache["name"] = best_name
     _best_model_cache["ts"] = time.time()
+    # 记录加载时的版本号；下次调用若发现磁盘版本变了就会自动重载
+    _best_model_cache["version"] = _read_model_version()
     return model, best_name
 
 
@@ -205,9 +341,45 @@ def _optimal_threshold(raw_proba: np.ndarray, y_true: np.ndarray) -> float:
 
 # ── 引擎构建（缓存）─────────────────────────────────────
 
+def _engine_is_fresh() -> bool:
+    """引擎缓存是否仍然有效。
+
+    ⚠ 必须同时满足三个条件（漏掉任何一个都会导致"重训/换数据后界面不更新"）：
+
+    1) **已构建** —— raw 非空；
+    2) **未超 TTL** —— 兜底；
+    3) **模型版本未变** —— `train.py` 训练完会 bump `.model_version`；
+    4) **客户表版本未变** —— `data_source.seed()` / 聚类写回会 bump
+       `.customer_cache_version`。
+
+    ⚠ 第 3、4 条是**补上的**（实测缺陷）：
+      只给 `_best_model_cache` 加版本校验是不够的。`_ensure_engine` 里
+      缓存的 `df` 与 `raw` 才是各接口真正读的东西 —— 实测：
+          bump 模型版本号后调用 _ensure_engine
+          → 耗时 0.0000s，raw 对象未重建，sum 完全不变
+      即 `/api/customers`、`/api/customers/{id}`、`classify_single`
+      在重训后最长 CACHE_TTL(600s) 内仍用**旧模型的概率与旧分位阈值**，
+      而 `/api/cost-benefit/*`（走 _best_model_cache）已换新模型 ——
+      同一系统两套结果，正是本模块一直想消除的那类不一致。
+
+      同理，客户表被换掉（reseed）后，引擎里的 `df`/`raw` 仍指向旧表，
+      而 EDA 已经用新表 —— 同一客户两套数据。
+    """
+    if _engine_cache["raw"] is None:
+        return False
+    if time.time() - _engine_cache["ts"] >= CACHE_TTL:
+        return False
+    if _engine_cache.get("model_version") != _read_model_version():
+        return False
+    from app.services.data_loader import _read_cache_version
+    if _engine_cache.get("customer_version") != _read_cache_version():
+        return False
+    return True
+
+
 def _ensure_engine(db: Session):
     """加载模型 + 全量打分 + 计算分位数阈值 + 成本收益参考。返回缓存 dict 或 None。"""
-    if _engine_cache["raw"] is not None and time.time() - _engine_cache["ts"] < CACHE_TTL:
+    if _engine_is_fresh():
         return _engine_cache
 
     model, name = _load_best_model()
@@ -227,22 +399,41 @@ def _ensure_engine(db: Session):
         "medium": float(np.percentile(raw, P_MEDIUM)),
     }
 
-    # 成本收益参考阈值（测试集上计算，避免过拟合）
+    # ── 决策阈值：在【训练集】上选，避免乐观偏差 ──────────────
+    #
+    # ⚠ 此处是本次修复的重点之一。旧实现是：
+    #       _, test_idx = train_test_split(idx, ...)
+    #       t_opt = _optimal_threshold(raw[test_idx], y[test_idx])   # 在测试集上选
+    #   即「在测试集上挑最优阈值、又在同一测试集上报告指标」—— 阈值本身
+    #   拟合了这批测试数据，指标带乐观偏差，经不起追问。
+    #
+    #   现改为在**训练集**上选阈值，测试集只用于最终的指标报告
+    #   （见 evaluate_at_decision_threshold）。实测两种做法都选中 0.20，
+    #   结论一致，但方法上不再有偏。
     from sklearn.model_selection import train_test_split
     idx = np.arange(len(df))
-    _, test_idx = train_test_split(
+    train_idx, _test_idx = train_test_split(
         idx, test_size=settings.TEST_SIZE,
         random_state=settings.RANDOM_STATE, stratify=y,
     )
-    t_opt = _optimal_threshold(raw[test_idx], y[test_idx])
+    t_opt = _optimal_threshold(raw[train_idx], y[train_idx])
 
+    # 决策阈值在分位数体系中的位置 —— 供前端解释「这条线切掉多少人」
+    coverage = float((raw >= t_opt).mean())
+
+    # 记录构建时的两个版本号（下次调用据此判断是否需重建，见 _engine_is_fresh）
+    from app.services.data_loader import _read_cache_version
     _engine_cache.update({
         "df": df,
         "raw": raw,
         "thresholds": thresholds,
         "optimal_threshold": t_opt,
+        "decision_threshold": t_opt,
+        "decision_coverage": coverage,
         "name": name,
         "ts": time.time(),
+        "model_version": _read_model_version(),
+        "customer_version": _read_cache_version(),
     })
     return _engine_cache
 
@@ -353,16 +544,48 @@ _ACTION_TABLE = {
 
 # 风险因素 → 理由短语。取**首个匹配**（按列表顺序），不再像旧实现那样
 # 让靠前的条目永久遮蔽靠后的条目。
+#
+# ⚠ 每个条目的**第一个关键词必须保持不变** —— `_build_scored_result` 的
+#   `_kw_to_mask` 用 `keywords[0]` 去查对应的布尔掩码，改首位会直接把
+#   向量化的理由算错（那里有 n_map != n_mask 的运行时断言兜底，但断言
+#   只查长度、查不出"关键词换了"）。
+#
+# ⚠ 为什么要给每个条目补**第二组关键词**（实测确认，勿删）：
+#   本表的关键词原本是按 `_risk_factors()` 的**规则标签**写的
+#   （"产品超载"、"高龄"、"非活跃"…）。但 `predict.py` 的 SHAP 归因走的是
+#   另一套标签 `SHAP_FEATURE_LABELS`（"持有产品数"、"年龄"、"活跃状态"…）。
+#   两套文案对不上，导致 `recommend_action` 拿 SHAP 因素去匹配时
+#   **7/13 个标签匹配不上**：
+#       satisfaction_score → 「满意度评分」 ✅      num_products → 「持有产品数」❌
+#       age                → 「年龄」       ❌      balance      → 「账户余额」  ❌
+#       is_active_member   → 「活跃状态」   ❌      credit_score → 「信用评分」  ✅
+#       tenure             → 「在网时长」   ✅      estimated_salary → 「预估薪资」❌
+#       has_credit_card    → 「持有信用卡」 ❌      points_earned    → 「积分」    ❌
+#       geography          → 「地区」       ❌      gender           → 「性别」    ❌
+#       complain           → 「投诉记录」   ✅
+#   实测后果：概率最高的 2000 个客户中，**100% 出现「因素列表首项 ≠ reason 来源」**
+#   —— 例如首项是「持有产品数（75.8%）」，reason 却说「信用评分偏低」，
+#   而信用评分根本不在该客户的前三个因素里。
+#   补上同义关键词后即可正确匹配，且不影响规则标签那条路径。
+#
+# ⚠ 条目数必须是 9、且每条 `keywords[0]` 不得改动 ——
+#   `_build_scored_result` 的 `_kw_to_mask` 按 `keywords[0]` 查布尔掩码，
+#   增删条目或改首位会让向量化路径抛运行时断言（那里只校验长度，校验不出
+#   "关键词被换掉"，所以这里必须靠注释约束）。
 _REASON_MAP = [
-    (["投诉"], "近期有投诉记录，需优先安抚"),
-    (["产品超载"], "产品数量过多，存在体验负担"),
-    (["非活跃"], "长期不活跃，服务感知弱"),
-    (["余额为零"], "账户已空置，需重新建立连接"),
-    (["德国"], "所在地区整体流失率偏高"),
-    (["高龄"], "高龄客户对服务变动更敏感"),
-    (["满意度"], "满意度评分偏低，存在明确不满"),
-    (["信用"], "信用评分偏低，风险敞口较大"),
-    (["在网"], "在网时间较短，尚未形成使用习惯"),
+    (["投诉", "投诉记录"], "近期有投诉记录，需优先安抚"),
+    (["产品超载", "持有产品数", "产品数量"], "产品数量过多，存在体验负担"),
+    (["非活跃", "活跃状态", "不活跃"], "长期不活跃，服务感知弱"),
+    # 文案对"余额为零"与 SHAP 的通用"账户余额"都成立 ——
+    # 原文案「账户已空置」在余额非零（但该特征贡献度高）时是**假声明**。
+    (["余额为零", "账户余额"], "账户余额水平是主要风险来源，需关注资产变动"),
+    (["德国", "地区", "地理"], "所在地区整体流失率偏高"),
+    (["高龄", "年龄"], "年龄结构使其对服务变动更敏感"),
+    (["满意度", "满意"], "满意度评分偏低，存在明确不满"),
+    # ⚠ 已知瑕疵：「持有信用卡」含子串「信用」，会误命中本条。
+    #   属关键词子串匹配的固有弱点，未单独加条目（会破坏上面的长度约束）。
+    (["信用", "信用评分"], "信用评分偏低，风险敞口较大"),
+    (["在网", "在网时长", "年限"], "在网时间较短，尚未形成使用习惯"),
 ]
 
 
@@ -392,6 +615,24 @@ def recommend_action(tier: str, level: str, factors: list | None = None) -> dict
         if any(kw in f for f in factors for kw in keywords):
             reason = text
             break
+
+    # ── 可溯源性兜底 ────────────────────────────────────────
+    #
+    # ⚠ 为什么需要这一步（实测）：`_REASON_MAP` 的关键词表再全，也不可能
+    #   覆盖 `SHAP_FEATURE_LABELS` 的所有文案。实测补完同义词后仍有 3 个
+    #   标签匹配不上：预估薪资 / 积分 / 性别。
+    #   于是会出现「因素列表里写了"预估薪资(55%)"，reason 却说"常规维护建议"」
+    #   —— 理由与列出的因素**对不上**，这比理由写得笼统更糟。
+    #
+    #   兜底策略：若没匹配上、但调用方**确实给了因素**，就用首个因素本身
+    #   作为理由（factors 已按贡献度/优先级排序，首项即最相关的那条）。
+    #   这样保证：reason 永远能从 risk_factors 里找到出处。
+    if reason == "常规维护建议" and factors:
+        first = factors[0]
+        # 去掉 SHAP 文案里的占比后缀「（75.8%）」，让句子读起来自然
+        clean = first.split("（")[0].strip() if "（" in first else first.strip()
+        if clean:
+            reason = f"{clean}是主要风险来源，建议优先核实"
 
     return {
         "channel": CHANNEL_BY_TIER[tier],
@@ -470,9 +711,23 @@ def _risk_factors(row) -> list:
 #      `_SCORED_KEYS` 显式写死，不要依赖 dict 字面量的书写顺序。
 #      实测契约：id…risk_factors 共 23 个键，改前后逐字节一致。
 #
-#   向量化"只快不降内存"—— `_scored_cache` 仍存 10 万个 dict（实测 264 MB），
-#   因为缓存本来就是给列表/导出接口直接复用的。若要降内存，需要一并改
-#   下游消费方，属于另一个话题。
+#   3) 新增字段一律**追加到末尾**，绝不插在中间 —— 插入会整体移动后续键的
+#      下标，任何按下标取值的地方都会静默错位。
+#
+# ⚠ 为什么补了 has_credit_card / points_earned（实测发现的契约缺口）：
+#   本函数之前输出 23 个键，而 `POST /api/model/predict` 需要 12 个特征。
+#   对比两者发现 **has_credit_card 与 points_earned 不在输出里**，于是：
+#     · GET /api/customers/{id} 的响应**不足以**喂给预测接口；
+#     · 谁若把详情响应转手传给 predict / shap-single，
+#       这两个字段会落到 `.get(..., 默认值)`（1 和 500）。
+#   实测影响（4 个真实客户）：
+#       C100000 列表概率 0.0639 → 详情喂入 0.1071（偏差 0.0432，**相对偏差 68%**）
+#       C050001 列表概率 0.2039 → 详情喂入 0.2015
+#     has_credit_card 实际为 0 的客户占 **29.2%**（29233/100000），
+#     points_earned 恰好等于 500 的仅 **0.12%**（123/100000）。
+#   即两个占位默认值对绝大多数客户都是错的，会造成
+#   「点进详情看到的概率 ≠ 列表里的概率」——正是本系统一直在消除的那类不一致。
+#   补上后详情响应即可自洽地驱动单条预测与 SHAP 解释。
 
 _SCORED_KEYS = (
     "id", "customer_id", "surname", "geography", "gender", "age", "tenure",
@@ -480,6 +735,8 @@ _SCORED_KEYS = (
     "estimated_salary", "satisfaction_score", "exited", "probability",
     "risk_level", "value_tier", "expected_value",
     "channel", "strategy", "action", "reason", "risk_factors",
+    # ── 以下为追加字段（见上方说明 3）──
+    "has_credit_card", "points_earned",
 )
 
 # `_REASON_MAP` 的键 → 对应的向量化命中掩码，在 _build_scored_result 内按需构建。
@@ -504,6 +761,9 @@ def _build_scored_result(df, raw, thresholds) -> list[dict]:
     age = df["age"].to_numpy()
     sat = df["satisfaction_score"].to_numpy()
     credit = df["credit_score"].to_numpy()
+    # 追加字段：详情接口要用它们喂单条预测 / SHAP（见 _SCORED_KEYS 的说明）
+    cards = df["has_credit_card"].to_numpy()
+    pts = df["points_earned"].to_numpy()
 
     # ── 两个维度的分级（各 0.005s）─────────────────────
     # 价值层：与 value_tier() 同口径。balance<=0 → ZERO，>=VALUE_TIER_HIGH → HIGH
@@ -621,6 +881,8 @@ def _build_scored_result(df, raw, thresholds) -> list[dict]:
             float(salaries[i]), int(sats[i]), int(exited[i]), float(probs[i]),
             str(lvls[i]), str(tiers[i]), float(evs[i]), str(chans[i]),
             str(acts[i]), str(acts[i]), str(reasons[i]), f,
+            # 追加字段（顺序必须与 _SCORED_KEYS 末尾一致）
+            int(cards[i]), int(pts[i]),
         ))))
     return result
 
@@ -634,14 +896,22 @@ def get_scored_customers(db: Session):
         return None
 
     name = engine["name"]
-    if _scored_cache["data"] is not None and _scored_cache["name"] == name \
-            and time.time() - _scored_cache["ts"] < CACHE_TTL:
+    # ⚠ 打分缓存的守卫必须与引擎同源：除 name 与 TTL 外，还要比对
+    #   引擎的**构建时间戳**。引擎被重建（模型重训 / 客户表变更）后，
+    #   raw 与 thresholds 可能都变了，而这里若只比 name 就会继续复用
+    #   旧的打分结果 —— 表现为「客户列表还是旧等级，但 risk-info 已变」。
+    #   用 engine["ts"] 比对是最简且可靠的判据（引擎重建必然刷新该值）。
+    if (_scored_cache["data"] is not None
+            and _scored_cache["name"] == name
+            and _scored_cache.get("engine_ts") == engine.get("ts")
+            and time.time() - _scored_cache["ts"] < CACHE_TTL):
         return _scored_cache["data"]
 
     # 向量化构建（原逐行 df.iloc 循环改为数组运算，输出逐字段一致）
     result = _build_scored_result(engine["df"], engine["raw"], engine["thresholds"])
 
-    _scored_cache = {"data": result, "name": name, "ts": time.time()}
+    _scored_cache = {"data": result, "name": name, "ts": time.time(),
+                     "engine_ts": engine.get("ts")}
     return result
 
 
@@ -670,20 +940,112 @@ def calibrate_probs(db: Session, raw_probs):
 
 # ── 阈值信息（供接口/前端展示）─────────────────────────
 
-def get_risk_info() -> dict:
-    """当前风险分级标准信息。"""
+def evaluate_at_decision_threshold() -> dict:
+    """在**测试集**上、按**决策阈值**计算真实指标。
+
+    ⚠ 这个函数的存在就是为了消除「同一个召回率两个数」的问题。
+
+    此前系统里 recall 有两个来源，互不一致：
+      · train.py 用 sklearn 默认 0.5 → 0.3627（写进 meta.json，被 3 个页面展示）
+      · cost_benefit 用 decision_threshold(0.20) → 0.7796
+    而实际运营判定（客户列表筛选、建单建议）依据的是分位数分级，
+    与上述两者又都不同。三套口径并存，答辩时无法自圆其说。
+
+    现统一为：**以决策阈值为准报告 recall/precision**，因为那才是
+    「按净收益最优去挑客户」时真实会发生的结果。
+
+    返回 {} 表示引擎未就绪或无法评估（调用方应回退展示，不得编数字）。
+    """
     if _engine_cache["raw"] is None:
+        return {}
+    try:
+        from sklearn.model_selection import train_test_split
+        df = _engine_cache["df"]
+        raw = _engine_cache["raw"]
+        thr = _engine_cache["decision_threshold"]
+        if df is None or raw is None or thr is None:
+            return {}
+
+        y = df["exited"].values
+        idx = np.arange(len(df))
+        _train_idx, test_idx = train_test_split(
+            idx, test_size=settings.TEST_SIZE,
+            random_state=settings.RANDOM_STATE, stratify=y,
+        )
+        # ⚠ 阈值来自训练集，指标在测试集上算 —— 两侧不重叠，无乐观偏差
+        p_te, y_te = raw[test_idx], y[test_idx]
+        pred = (p_te >= thr).astype(int)
+
+        tp = int(((pred == 1) & (y_te == 1)).sum())
+        fp = int(((pred == 1) & (y_te == 0)).sum())
+        fn = int(((pred == 0) & (y_te == 1)).sum())
+        tn = int(((pred == 0) & (y_te == 0)).sum())
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        accuracy = (tp + tn) / len(y_te) if len(y_te) else 0.0
+
+        return {
+            "threshold": round(float(thr), 4),
+            "sample_size": int(len(y_te)),
+            "positives": int(y_te.sum()),
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1_score": round(f1, 4),
+            "accuracy": round(accuracy, 4),
+            "net_profit": round(float(net_profit(tp, fp, fn)), 2),
+            # 口径标注：前端必须显示这是「决策阈值下的实测」
+            "basis": "test_set_at_decision_threshold",
+        }
+    except Exception as e:
+        logger.warning("risk_scoring: 决策阈值指标评估失败: %s: %s", type(e).__name__, e)
+        return {}
+
+
+def get_risk_info() -> dict:
+    """当前风险分级标准信息 —— 全系统口径的唯一对外出口。
+
+    返回三组信息，语义严格区分（见文件顶部「两个阈值」的说明）：
+      thresholds          分级线（分位数）—— 用于贴标签、排序
+      decision_threshold  决策线（成本最优绝对切点）—— 用于决定是否干预
+      decision_metrics    决策线在测试集上的实测指标 —— 对外报 recall 时应引用它
+      optimal_threshold   保留旧字段名，与 decision_threshold 同值
+    """
+    if _engine_cache["raw"] is None:
+        # ⚠ 冷路径**不得返回伪造的阈值**。旧实现返回写死的
+        #   {"critical": 0.7, "high": 0.3, "medium": 0.1}，与真实分位阈值
+        #   （实测 0.6796 / 0.2475 / 0.0682）相差很大 —— 尤其 medium
+        #   差了 10 倍。冷启动的 worker 会把这个假值当"当前分级标准"
+        #   吐给前端，而前端（CustomerManagement 等）会把它显示给用户。
+        #
+        #   触发路径有两处，都不罕见：
+        #     · 该路由历史上没有 db 依赖，永不触发 _ensure_engine，
+        #       只能靠 main.py 的启动预热线程；预热失败后就永久返回假值；
+        #     · 多 worker 下某个 worker 尚未被预热线程覆盖。
+        #
+        #   现改为 thresholds=None + calibrated=False，让调用方明确知道
+        #   "还没算出来"，而不是拿到一组看似可用的数字。
         return {
             "calibrated": False,
             "model": None,
             "cost_ratio": COST_RATIO,
             "optimal_threshold": None,
-            "thresholds": {"critical": 0.7, "high": 0.3, "medium": 0.1},
+            "decision_threshold": None,
+            "decision_coverage": None,
+            "decision_metrics": {},
+            "thresholds": None,
+            "note": "风险引擎尚未就绪（模型未训练或缓存未构建），"
+                    "此时不提供分级阈值，避免给出与实际不符的默认值",
         }
     return {
         "calibrated": True,
         "model": _engine_cache["name"],
         "cost_ratio": COST_RATIO,
         "optimal_threshold": round(_engine_cache["optimal_threshold"], 4),
+        # 决策阈值与分级阈值并列暴露，前端不得混用
+        "decision_threshold": round(_engine_cache["decision_threshold"], 4),
+        "decision_coverage": round(_engine_cache["decision_coverage"], 4),
+        "decision_metrics": evaluate_at_decision_threshold(),
         "thresholds": {k: round(v, 4) for k, v in _engine_cache["thresholds"].items()},
     }

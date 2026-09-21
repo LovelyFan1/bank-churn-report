@@ -41,6 +41,9 @@ const riskDist = ref({ CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 })
 
 // 模型可信度 —— 取自 /api/model/comparison 的最优模型行（不再是字面量）
 const confRows = ref([])
+// 可信度四项指标的阈值口径说明（决策阈值 / 默认 0.5），必须显示出来，
+// 否则读者无从判断这些数字是在哪条判定线下得出的
+const metricBasis = ref('')
 
 onMounted(async () => {
   // ── 分两批加载：核心 4 个先渲染骨架，次要 4 个后台异步补齐 ──
@@ -107,17 +110,34 @@ onMounted(async () => {
     activeCustomerIds.value = new Set(activeRes.data?.customer_ids || [])
 
     // 模型可信度
+    //
+    // ⚠ 召回率/精确率取「决策阈值」口径，不取 meta.json 里的 recall。
+    //
+    //   原因（本次修复）：meta.json 的 recall 由 train.py 用 sklearn 默认
+    //   0.5 阈值算出（实测 0.3627），而系统实际按决策阈值(0.20)挑客户，
+    //   该阈值下真实 recall 是 0.7796。此前两处数字并存 —— Dashboard 显示
+    //   36.3%，干预策略页显示 78.0%，同一个系统两个「模型召回率」。
+    //
+    //   阈值信息以 /api/model/risk-info 为唯一出口（risk_scoring 是分级与
+    //   阈值的权威），故这里优先采用它的 decision_metrics；取不到才回退
+    //   meta.json（例如模型刚重训、引擎尚未预热时）。
     const comparison = comparisonRes.data
+    const dm = riskInfo.value?.decision_metrics
     if (comparison?.best_model && comparison.models?.length) {
       const best = comparison.models.find(m => m.model_name === comparison.best_model)
         || comparison.models[0]
       modelMetrics.value = best
+      // 决策阈值口径优先；无则回退到 meta.json 默认阈值口径
+      const useDecision = dm && typeof dm.recall === 'number'
       confRows.value = [
-        { label: '整体准确率', val: best.accuracy * 100 },
-        { label: '召回率（识别流失）', val: best.recall * 100 },
-        { label: '精确率', val: best.precision * 100 },
-        { label: 'F1 分数', val: best.f1_score * 100 },
+        { label: '整体准确率', val: (useDecision ? dm.accuracy : best.accuracy) * 100 },
+        { label: '召回率（识别流失）', val: (useDecision ? dm.recall : best.recall) * 100 },
+        { label: '精确率', val: (useDecision ? dm.precision : best.precision) * 100 },
+        { label: 'F1 分数', val: (useDecision ? dm.f1_score : best.f1_score) * 100 },
       ]
+      metricBasis.value = useDecision
+        ? `决策阈值 ${dm.threshold}（测试集 ${dm.sample_size?.toLocaleString()} 人实测）`
+        : '默认阈值 0.5（meta.json，口径较保守）'
     }
 
     // 挽留战报：只在有真实工单数据时展示
@@ -458,7 +478,9 @@ function showOrderToast(msg) {
             模型可信度
             <span v-if="modelMetrics" class="badge">{{ modelMetrics.model_name }}</span>
           </div>
-          <div class="text-xs mb-4" style="color:#7c8aa5">模型预测 vs 实际流失（测试集验证）</div>
+          <div class="text-xs mb-1" style="color:#7c8aa5">模型预测 vs 实际流失（测试集验证）</div>
+          <!-- 阈值口径必须显式标注：召回率/精确率完全取决于在哪条判定线上统计 -->
+          <div v-if="metricBasis" class="metric-basis">口径：{{ metricBasis }}</div>
 
           <template v-if="confRows.length">
             <div class="conf-row" v-for="item in confRows" :key="item.label">
@@ -706,6 +728,13 @@ function showOrderToast(msg) {
 /* Model Confidence */
 .conf-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .conf-label { font-size: 12px; color: #7c8aa5; width: 120px; flex-shrink: 0; }
+/* 阈值口径标注 —— 召回率/精确率随判定线变化，必须让读者看到是哪条线 */
+.metric-basis {
+  font-size: 11px; color: #1d4ed8; margin-bottom: 14px;
+  padding: 4px 8px; border-radius: 6px;
+  background: #eef3fb; border: 1px solid #c7d6ee;
+  display: inline-block;
+}
 .conf-bar { flex: 1; height: 7px; background: #eef1f6; border-radius: 4px; overflow: hidden; }
 .conf-fill { height: 100%; border-radius: 4px; transition: width 1s ease; }
 .conf-val { font-size: 13px; font-weight: 600; width: 50px; text-align: right; }

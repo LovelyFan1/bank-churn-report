@@ -18,6 +18,7 @@ const retention = ref(null)   // 挽留效果复盘（来自工单真实 result�
 // 不接住就会渲染成空框（矩阵页曾因此"只有表头没有内容"）
 const matrixError = ref('')
 const summaryError = ref('')
+const thresholdError = ref('')
 const thresholdChart = shallowRef(null)
 const chartInstances = []
 const loading = ref(true)
@@ -114,6 +115,10 @@ async function loadAll() {
     //   truthy 对象让 `v-if="!matrix"` 失效 → 渲染出表头但 matrixRows 为 []
     //   → 矩阵只剩空框。这里把 error 提升为显式错误态。
     thresholdData.value = thresholdRes.data
+    // ⚠ 阈值图的错误态：接口失败时 thresholdData = {error} 是 truthy，
+    //   旧代码只在有 thresholds 字段时才建图，但卡片无条件渲染 ——
+    //   结果是「320px 空卡片 + 悬空的『最优阈值:』文案」。
+    thresholdError.value = thresholdRes.data?.error || ''
     riskInfo.value = riskInfoRes.data
     retention.value = retentionRes.data
     matrixError.value = matrixRes.data?.error || ''
@@ -222,6 +227,16 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <!-- ⚠ 成本收益接口失败时的错误态。
+         此前 summaryError 被赋值但**模板从未引用**，于是 businessSummary=null
+         时整块卡片直接消失，页面上没有任何解释 —— 用户会以为
+         「这个页面没有成本收益功能」，而不是「模型尚未训练」。
+         与下方 matrixError 的处理方式保持一致。 -->
+    <div v-else-if="summaryError" class="err-note">
+      ⚠ 成本收益数据不可用：{{ summaryError }}
+      <span class="err-hint">（若刚点过「重新训练」，稍等片刻后刷新即可）</span>
+    </div>
+
     <!-- 口径标注：上面的数是「模型推算」，下面的是「工单实测」，两者不可混为一谈 -->
     <div v-if="businessSummary" class="src-note src-model">
       <b>📐 推算值</b>：以上四项由模型测试集指标 × 假设客单价
@@ -289,8 +304,19 @@ onBeforeUnmount(() => {
     <!-- Threshold Analysis Chart -->
     <div class="glass-card p-5">
       <h3 class="text-sm font-medium text-gray-400 mb-2">阈值优化分析</h3>
-      <p class="text-xs text-gray-600 mb-4">不同预测阈值下的TP/FP/FN分布与净利润曲线，最优阈值: {{ thresholdData?.optimal_threshold }}</p>
-      <div ref="thresholdChart" class="w-full h-[320px]"></div>
+      <p class="text-xs text-gray-600 mb-4">
+        不同预测阈值下的TP/FP/FN分布与净利润曲线，最优阈值:
+        {{ thresholdData?.optimal_threshold ?? '—' }}
+      </p>
+      <!-- ⚠ 接口失败时不再渲染一个 320px 高的空白卡片。
+           此前 thresholdData = {error: ...} 是 truthy，卡片无条件渲染，
+           但建图分支因无 thresholds 字段而跳过 —— 结果是「空卡片 + 悬空的
+           '最优阈值:' 文案」，看起来像页面坏了。 -->
+      <div v-if="thresholdError" class="empty-state">
+        <div class="text-2xl mb-2">⚠️</div>
+        <p class="text-sm text-gray-500">{{ thresholdError }}</p>
+      </div>
+      <div v-show="!thresholdError" ref="thresholdChart" class="w-full h-[320px]"></div>
     </div>
 
     <!-- 价值层 × 风险等级 矩阵 -->
@@ -444,6 +470,16 @@ onBeforeUnmount(() => {
   border: 1px dashed #e5e9f0; border-radius: 10px;
   background: #f8fafc;
 }
+
+/* 接口失败的提示条 —— 让「数据不可用」与「功能不存在」在视觉上可区分 */
+.err-note {
+  font-size: 12px; line-height: 1.7;
+  padding: 12px 16px; border-radius: 8px;
+  border-left: 3px solid #b45309;
+  background: #fdf6ec;
+  color: #92400e;
+}
+.err-note .err-hint { color: #b08050; margin-left: 4px; }
 .btn-retry {
   margin-top: 14px; padding: 7px 18px; border-radius: 8px;
   font-size: 12.5px; font-weight: 600; cursor: pointer;

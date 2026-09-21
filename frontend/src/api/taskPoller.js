@@ -19,23 +19,42 @@ const DEFAULT_TIMEOUT = 30 * 60 * 1000 // 30 分钟
  * @param {Function} options.onProgress  - (meta) => void  进度回调
  * @param {number}   options.interval    - 轮询间隔 ms (默认 2000)
  * @param {number}   options.timeout     - 超时 ms (默认 30 分钟)
+ * @param {AbortSignal} options.signal   - 中止信号；aborted 后立即停止轮询
  * @returns {Promise<any>} 任务结果
+ *
+ * ⚠ 关于 signal（实测缺陷）：原实现是 `while (true)` 且**没有任何中止条件**，
+ *   只在 30 分钟超时后抛错。调用方（聚类页/模型页）也没传 signal，于是
+ *   「点了重新聚类后切走页面」会导致：页面已卸载，回调仍写已卸载组件的 ref，
+ *   且每 2 秒一次请求持续**最长半小时**，占用浏览器同域连接槽。
+ *   现检查 signal：中止时抛 ERR_CANCELED，调用方可据 isCanceled 静默跳过。
  */
 export async function pollTask(taskId, options = {}) {
   const {
     onProgress,
     interval = DEFAULT_POLL_INTERVAL,
     timeout = DEFAULT_TIMEOUT,
+    signal,
   } = options
 
   const startTime = Date.now()
 
+  /** 中止时抛出与 axios 同款的错误码，便于调用方统一用 isCanceled 判断 */
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      const err = new Error('轮询已取消')
+      err.code = 'ERR_CANCELED'
+      throw err
+    }
+  }
+
   while (true) {
+    throwIfAborted()
     if (Date.now() - startTime > timeout) {
       throw new Error(`任务超时: ${taskId}`)
     }
 
-    const { data } = await api.get(`/tasks/${taskId}`)
+    const { data } = await api.get(`/tasks/${taskId}`, signal ? { signal } : {})
+    throwIfAborted()
 
     if (data.status === 'SUCCESS') {
       // ⚠ Celery 的 SUCCESS 只表示「任务函数正常返回了」，**不代表业务成功**。

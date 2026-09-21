@@ -2,7 +2,13 @@
 import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick, computed } from 'vue'
 import * as echarts from 'echarts'
 import api from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
+
+// 页面级请求作用域：本页两个接口都是重接口（各含一次 10 万行全量加载），
+// 卸载时取消，避免它们离开页面后仍占着连接槽。
+// ⚠ 写操作与 pollTask 的轮询不经 scope（见下方 runClustering）。
+const scope = useRequestScope()
 
 const loading = ref(true)
 const profiles = ref(null)
@@ -16,8 +22,13 @@ const notClusteredYet = ref(false)     // 是否尚未执行聚类
 // 散点抽样元信息（total/plotted/sampled）—— 供标题标注「已抽样展示」，
 // 避免把抽样后的点数误当成客户总数
 const scatterMeta = ref(null)
+// 散点图使用的降维方法：'tsne'（默认）或 'pca'（t-SNE 不可用时的回退）。
+// 轴标签与说明文案据此切换 —— t-SNE 的轴无物理含义，不能写成 PC1/PC2。
+const scatterMethod = ref('tsne')
 // 加载/渲染错误 —— 逐条展示，不留「结构在、内容空」的哑页面
 const errors = ref([])
+// 聚类任务进行中的进度文案（来自 Celery 的 meta.message）
+const clusterMsg = ref('')
 
 const COLORS = ['#6366f1', '#ef4444', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899']
 
@@ -53,7 +64,7 @@ const highRiskCount = computed(() => {
 })
 
 async function loadProfiles() {
-  const { data } = await api.get('/cluster/profiles')
+  const { data } = await scope.get('/cluster/profiles')
   profiles.value = data
   if (data.error) {
     notClusteredYet.value = true
@@ -78,6 +89,16 @@ async function loadProfiles() {
  */
 async function loadAll() {
   errors.value = []
+
+  // ⚠ 进入 loading 态前先销毁旧图表实例。
+  //   与 EdaAnalysis.loadAll 同一类问题：`loading.value = true` 会让
+  //   <template v-else> 整体卸载，canvas 脱离 DOM，但 ECharts 实例仍被
+  //   chartInstances 持有 → 无法被 GC 回收。重跑 loadAll 就会留下孤儿实例。
+  //   实测该页只有「错误态 → 重试 → 成功」这条路径泄漏 1 个
+  //   （alive=10 / inDom=9），其余路径因 setOption(..., true) 复用而未泄漏，
+  //   但根因相同，统一在入口清理最稳妥。
+  disposeCharts()
+
   loading.value = true
   try {
     // 1) 画像
@@ -164,13 +185,22 @@ function renderScatter(scatterData, profilesData, colorBy) {
   const clusterNames = {}
   profilesData?.clusters?.forEach(c => { clusterNames[c.cluster_id] = c.name || `聚类 ${c.cluster_id}` })
 
-  // 主成分方差解释率由后端 PCA 实时给出（/cluster/3d-scatter 的 explained_variance），
-  // 此前轴上写死的「PC1 (15.8%) / PC2 (9.4%)」是固定字符串，与实际结果无关。
+  // ⚠ 后端默认返回 **t-SNE** 嵌入（method='tsne'），仅在 t-SNE 不可用时回退 PCA。
+  //   两者的轴标签与说明文案必须不同：t-SNE 的轴**无物理含义**，
+  //   不能像 PCA 那样写「PC1 (13.6%)」——那是虚假信息。
+  const method = scatterData.method || 'pca'
+  const isTsne = method === 'tsne'
+
+  // 主成分方差解释率由后端实时给出（仅 PCA 路径有值）
   const ev = scatterData.explained_variance || []
   const pct = (i) => (ev[i] != null ? (ev[i] * 100).toFixed(1) + '%' : '—')
+  const axisName = (i) => isTsne
+    ? `t-SNE ${i + 1}`
+    : `PC${i + 1} (${pct(i)})`
 
   // 坐标轴稳健区间 —— 由后端按 [0.5%, 99.5%] 分位算好返回，用于裁掉离群值
-  // 造成的超长轴。取不到时返回 undefined，ECharts 会退回按数据自动定轴
+  // 造成的超长轴（只对 PCA 路径有实际意义；t-SNE 无长尾，后端给的是实际范围）。
+  // 取不到时返回 undefined，ECharts 会退回按数据自动定轴
   // （即旧行为），不会因为字段缺失而画不出图。
   const axisRange = (axis, idx) => {
     const r = scatterData.axis_range?.[axis]
@@ -234,19 +264,27 @@ function renderScatter(scatterData, profilesData, colorBy) {
     //   按后端给的 [0.5%, 99.5%] 分位裁剪后，实测只切掉 1% 的点，视图立刻清晰。
     //   （裁剪只改显示范围，不动数据。）
     xAxis: {
-      type: 'value', name: `PC1 (${pct(0)})`, nameTextStyle: { color: '#9ca3af', fontSize: 11 },
+      type: 'value', name: axisName(0), nameTextStyle: { color: '#9ca3af', fontSize: 11 },
       min: axisRange('x', 0), max: axisRange('x', 1),
       splitLine: { lineStyle: { color: 'rgba(75,85,99,0.15)' } },
       axisLabel: { color: '#6b7280', fontSize: 10 },
       axisLine: { lineStyle: { color: '#d5dce8' } },
     },
     yAxis: {
-      type: 'value', name: `PC2 (${pct(1)})`, nameTextStyle: { color: '#9ca3af', fontSize: 11 },
+      type: 'value', name: axisName(1), nameTextStyle: { color: '#9ca3af', fontSize: 11 },
       min: axisRange('y', 0), max: axisRange('y', 1),
       splitLine: { lineStyle: { color: 'rgba(75,85,99,0.15)' } },
       axisLabel: { color: '#6b7280', fontSize: 10 },
       axisLine: { lineStyle: { color: '#d5dce8' } },
     },
+    // ⚠ t-SNE 的轴无物理含义，图上加一行提示，避免被当成"PC1 越大越好"
+    graphic: isTsne ? [{
+      type: 'text', right: 12, bottom: 6,
+      style: {
+        text: 't-SNE 降维：轴无物理含义，簇间距离不可直接比较',
+        fill: '#9aa7bd', fontSize: 10,
+      },
+    }] : [],
     series,
   }, true)
 }
@@ -384,11 +422,14 @@ async function initRadar(profilesData) {
 }
 
 async function loadScatter() {
-  const { data } = await api.get('/cluster/3d-scatter')
+  const { data } = await scope.get('/cluster/3d-scatter')
   // 记录抽样元信息，供标题标注（后端在大数据量时只返回抽样点）
   scatterMeta.value = data?.total_points
     ? { total_points: data.total_points, plotted_points: data.plotted_points, sampled: data.sampled }
     : null
+  // 降维方法由后端决定：默认 tsne，不可用时回退 pca。
+  // 缺字段（老产物）时按 pca 处理，与后端回退路径一致。
+  scatterMethod.value = data?.method === 'tsne' ? 'tsne' : 'pca'
   return data
 }
 
@@ -401,19 +442,36 @@ function onColorByChange(val) {
 
 async function runClustering() {
   loading.value = true
+  clusterMsg.value = '正在提交聚类任务…'
   try {
     // 1) 提交聚类任务 → 拿到 task_id
+    //    ⚠ 写操作不经 scope：任务已提交，不能因离开页面就中断请求
     const { data: submitData } = await api.post(`/cluster/kmeans/save?k=${k.value}`)
 
     // 2) 轮询直到完成
+    //    ⚠ 传 signal：离开页面时停止轮询。
+    //      此前 pollTask 没有任何中止条件，仅靠 30 分钟超时 ——
+    //      点了聚类后切走页面，会持续每 2 秒请求一次最长半小时。
     await pollTask(submitData.task_id, {
+      signal: scope.signal,
       onProgress: (meta) => {
-        // 可在此显示进度，例如更新 loading 文案
+        // 把后端进度写进文案 —— 此前该回调体是空注释，进度完全被丢弃
+        if (meta?.message) clusterMsg.value = meta.message
       },
     })
 
     // 3) 加载结果 —— 走统一的 loadAll（串行 + 逐图容错 + 错误可见）
+    clusterMsg.value = '正在加载聚类结果…'
     await loadAll()
+    clusterMsg.value = ''
+  } catch (e) {
+    // ⚠ 必须 catch：此前只有 try/finally，pollTask 抛错（任务 failed /
+    //   超时 / 被 revoke）会变成 unhandled rejection，页面静默回到原状，
+    //   用户以为"点了没反应" —— 与 taskPoller 注释里描述的
+    //   "聚类功能坏了很久没人发现"是同一类症状。
+    if (e?.code === 'ERR_CANCELED' || !scope.isActive()) return
+    errors.value.push('聚类失败：' + (e?.message || e))
+    clusterMsg.value = ''
   } finally {
     loading.value = false
   }
@@ -427,14 +485,25 @@ function handleResize() {
   chartInstances.forEach(c => c.resize())
 }
 
+/**
+ * 销毁当前所有 ECharts 实例并清空登记表。
+ * 必须在「卸载图表容器之前」调用 —— 见 loadAll 入口处的泄漏说明。
+ * 单个 dispose 抛错不阻断其余实例清理。
+ */
+function disposeCharts() {
+  chartInstances.forEach(c => {
+    try { c?.dispose() } catch (e) { /* 已销毁或未初始化，忽略 */ }
+  })
+  chartInstances.length = 0
+  scatterInstance = null
+}
+
 // 此前只在 onBeforeUnmount 里 remove、从未 add —— 本页图表不随窗口缩放。
 onMounted(() => window.addEventListener('resize', handleResize))
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
-  chartInstances.forEach(c => c.dispose())
-  chartInstances.length = 0
-  scatterInstance = null
+  disposeCharts()
 })
 </script>
 
@@ -457,8 +526,11 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div v-if="loading" class="flex items-center justify-center h-64">
+    <div v-if="loading" class="flex flex-col items-center justify-center h-64 gap-3">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+      <!-- 显示 Celery 返回的进度文案（此前进度回调被丢弃，用户只看到转圈，
+           不知道是在加载数据、聚类、还是写库） -->
+      <p v-if="clusterMsg" class="text-sm text-[#7c8aa5]">{{ clusterMsg }}</p>
     </div>
 
     <!-- 加载失败：明确列出原因 + 重试，不留「结构在、内容空」的哑页面 -->
@@ -545,7 +617,9 @@ onBeforeUnmount(() => {
         <div class="glass-card p-5 lg:col-span-2">
           <div class="flex items-center justify-between mb-3">
             <div>
-              <h3 class="text-sm font-medium text-[#7c8aa5]">PCA 降维散点图</h3>
+              <h3 class="text-sm font-medium text-[#7c8aa5]">
+                {{ scatterMethod === 'tsne' ? 't-SNE 降维散点图' : 'PCA 降维散点图' }}
+              </h3>
               <p class="text-xs text-[#9aa7bd] mt-1">
                 <template v-if="scatterMeta && scatterMeta.total_points > scatterMeta.plotted_points">
                   {{ scatterMeta.plotted_points.toLocaleString() }} 客户（从 {{ scatterMeta.total_points.toLocaleString() }} 中分层抽样）
@@ -553,7 +627,13 @@ onBeforeUnmount(() => {
                 <template v-else>
                   {{ totalCustomers.toLocaleString() }} 客户
                 </template>
-                在主成分空间的分布，可切换着色维度观察分类边界。
+                <template v-if="scatterMethod === 'tsne'">
+                  的二维嵌入，可切换着色维度观察客群结构。
+                  t-SNE 保留局部邻域关系，<b>轴无物理含义、簇间距离不可直接比较</b>。
+                </template>
+                <template v-else>
+                  在主成分空间的分布，可切换着色维度观察分类边界。
+                </template>
               </p>
             </div>
             <div class="flex gap-2">

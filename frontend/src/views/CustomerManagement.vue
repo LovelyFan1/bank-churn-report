@@ -40,7 +40,7 @@
       <!-- 口径说明：后端 risk_scoring 用的是**原始概率的分位数边界**（P95/P70/P35），
            不是固定阈值、也没有做概率校准（树模型校准会失真，见 risk_scoring.py 顶部注释）。
            riskInfo.calibrated 只是「引擎已就绪」的标记，不代表概率经过校准。 -->
-      <div v-if="riskInfo?.calibrated" class="risk-banner">
+      <div v-if="riskInfo?.calibrated && riskInfo.thresholds" class="risk-banner">
         <span>🎯 风险分级口径：按概率分位数 P95 / P70 / P35 划四级（{{ riskInfo.model }} · 漏检/误报成本比 1:{{ riskInfo.cost_ratio }}）：</span>
         <span class="risk-banner-item" style="color:#f87171">极高 ≥ {{ fmtPercent(riskInfo.thresholds.critical) }}</span>
         <span class="risk-banner-item" style="color:#fb923c">高危 ≥ {{ fmtPercent(riskInfo.thresholds.high) }}</span>
@@ -301,10 +301,22 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, probColor, fmtPercent, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
+
+/**
+ * 页面级请求作用域 —— 组件卸载时自动取消在途请求。
+ *
+ * ⚠ 本页此前是**唯一几个没有接入**的重页面之一（只 Dashboard / EDA /
+ *   干预策略 / 模型对比 用了）。而客户列表恰是最重的接口：每请求要拷贝
+ *   10 万行、`page_size` 最大 100。离开页面后请求继续飞行，占用浏览器
+ *   同域连接槽（上限约 6），拖慢下一页 —— 正是 useRequestScope 注释里
+ *   描述的「实测峰值 46 个在途请求」的成因之一。
+ */
+const scope = useRequestScope()
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
@@ -442,16 +454,39 @@ function clearSelection() {
 /**
  * 批量建单：逐条提交，汇总成功/失败。
  * 失败原因逐条记录（如并发建单撞上 409），不吞掉 —— 否则用户以为全成功了。
+ *
+ * ⚠ 修复的缺陷（承诺与行为不一致）：
+ *   原实现是 `customers.value.filter(c => selected.value.has(...))`，
+ *   而 `customers.value` **只是当前页的 20 条**。跨页勾选时（selected 是
+ *   组件级 Set，翻页不清空），按钮显示「批量建单（5）」但实际只提交当前页
+ *   命中的那几条 —— 实测第 1 页选 3 + 第 2 页选 2，只发出 2 条 POST。
+ *   用户以为建了 5 张单，实际只建了 2 张，且没有任何提示。
+ *
+ * 现改为**以 selected 集合为准**：当前页能直接取到字段的就用，
+ * 取不到的（在别的页）用该客户自己的详情接口补齐 —— 保证「勾了几个就建几张」。
  */
 async function batchCreate() {
-  const targets = customers.value.filter((c) => selected.value.has(c.customer_id))
-  if (!targets.length) return
+  const ids = [...selected.value]
+  if (!ids.length) return
   batchRunning.value = true
   batchResult.value = null
 
+  // 当前页的客户可直接复用（省一次请求）；其余的去详情接口补
+  const onPage = new Map(customers.value.map((c) => [c.customer_id, c]))
+
   const okList = []
   const failList = []
-  for (const c of targets) {
+  for (const cid of ids) {
+    let c = onPage.get(cid)
+    if (!c) {
+      try {
+        const { data } = await api.get(`/customers/${cid}`)
+        c = data
+      } catch (e) {
+        failList.push({ id: cid, reason: '获取客户信息失败：' + (e.response?.data?.detail || e.message) })
+        continue
+      }
+    }
     try {
       await api.post('/work-orders', {
         customer_id: c.customer_id,
@@ -461,7 +496,7 @@ async function batchCreate() {
         probability: c.probability,
         balance: c.balance,
         risk_factors: c.risk_factors || [],
-        strategy: c.action || '',
+        strategy: c.action || c.strategy || '',
         // 渠道直接用该客户的推荐值 —— 不覆盖，因此无需 override_reason
         channel: c.channel,
         thresholds_snapshot: riskInfo.value?.thresholds || null,
@@ -545,7 +580,21 @@ async function exportCsv() {
   }
 }
 
+/**
+ * 并发令牌 —— 丢弃过期响应。
+ *
+ * ⚠ 实测缺陷（修复前无此令牌）：快速切换筛选（点 Tab / 改下拉 / 翻页）时，
+ *   先发出的慢响应会后到并**无条件覆盖**后发出的快响应，导致
+ *   「Tab 高亮"高危"、URL 是 risk_level=HIGH，但表格 20 行全是"极高"徽章」。
+ *   实测（把 risk_level=CRITICAL 延迟 5s）：UI 状态与表格数据完全不符，
+ *   且不自愈 —— 用户不刷新就一直是错的，会照着错误名单打电话。
+ *
+ *   同项目的 EdaAnalysis.vue 早已用 `loadToken` 解决同类问题，本页遗漏。
+ */
+let loadToken = 0
+
 async function fetchCustomers() {
+  const token = ++loadToken
   try {
     const params = { page: page.value, page_size: pageSize.value }
     if (currentRisk.value !== 'all') params.risk_level = currentRisk.value
@@ -556,7 +605,9 @@ async function fetchCustomers() {
     params.sort_by = sortBy.value
     params.sort_order = sortBy.value === 'age' ? 'asc' : 'desc'
 
-    const { data } = await api.get('/customers', { params })
+    const { data } = await scope.get('/customers', { params })
+    // 过期响应直接丢弃：不写任何 state，否则会用旧筛选条件的结果覆盖新结果
+    if (token !== loadToken) return
     customers.value = data.items || []
     total.value = data.total || 0
     totalPages.value = data.total_pages || 1
@@ -564,6 +615,7 @@ async function fetchCustomers() {
     riskInfo.value = data.risk || null
     if (data.summary) Object.assign(summary, data.summary)
   } catch (e) {
+    if (token !== loadToken) return   // 过期请求的报错同样不该弹给用户
     customers.value = []
     showToast('加载失败: ' + (e.response?.data?.detail || e.message))
   }
@@ -627,6 +679,12 @@ onMounted(async () => {
   readUrl()
   await fetchCustomers()
   loading.value = false
+})
+
+// 卸载时清理定时器 —— 此前只清 toast 的，searchTimer 会残留
+onBeforeUnmount(() => {
+  clearTimeout(toastTimer)
+  clearTimeout(searchTimer)
 })
 
 // 浏览器前进/后退时同步筛选状态（syncUrl 用的是 replace，不会与这里形成循环）

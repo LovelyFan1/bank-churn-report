@@ -16,6 +16,9 @@ const comparison = ref(null)
 // 页面级错误态：这些接口用 HTTP 200 + body.error 表达「模型未就绪」，
 // 必须显式接住，否则只会渲染出一堆空框
 const loadError = ref('')
+// 决策阈值 + 该阈值下的实测指标（来自 /api/model/risk-info）——
+// 用于标注表格里 recall/precision 的真实口径，见 loadData 的说明
+const riskInfo = ref(null)
 const rocChart = shallowRef(null)
 const radarChart = shallowRef(null)
 const featureChart = shallowRef(null)
@@ -64,27 +67,80 @@ async function trainModels() {
 
 let _rocRes = null, _featRes = null, _shapRes = null
 
+/**
+ * 逐个接口兜底请求 —— 返回 { data } 或 { error }，**绝不抛异常**。
+ *
+ * ⚠ 实测缺陷（原实现用 Promise.all）：
+ *   6 个请求任一 reject，后续 8 行赋值全部跳过，页面渲染出
+ *   6 个只有标题的空卡片，**且没有任何错误提示**（catch 只 console.error）。
+ *   实测分别注入 roc-curves / confusion-matrices / shap-global 500：
+ *       tableRendered=false  canvasCount=0  errorTextVisible=false
+ *   用户面对空白页，既不知发生了什么，也无从重试。
+ *
+ *   注意本页**已经**为「模型未就绪」（HTTP 200 + body.error）做了错误态，
+ *   但没有覆盖「接口 5xx」这条路径 —— 护卫不完整。
+ *   EdaAnalysis.vue 早已用「逐个兜底 + 每图独立错误占位」解决同类问题，
+ *   这里与之对齐。
+ */
+async function fetchSafe(url) {
+  try {
+    const { data } = await scope.get(url)
+    return { data, error: null }
+  } catch (e) {
+    if (isCanceled(e) || !scope.isActive()) return { data: null, error: null, canceled: true }
+    return { data: null, error: e.response?.data?.detail || e.message || '请求失败' }
+  }
+}
+
 async function loadData() {
-  const [compRes, rocRes, featRes, cmRes, shapRes] = await Promise.all([
-    scope.get('/model/comparison'),
-    scope.get('/model/roc-curves'),
-    scope.get('/model/feature-importance'),
-    scope.get('/model/confusion-matrices'),
-    scope.get('/model/shap-global'),
+  const [compRes, rocRes, featRes, cmRes, shapRes, riskRes] = await Promise.all([
+    fetchSafe('/model/comparison'),
+    fetchSafe('/model/roc-curves'),
+    fetchSafe('/model/feature-importance'),
+    fetchSafe('/model/confusion-matrices'),
+    fetchSafe('/model/shap-global'),
+    fetchSafe('/model/risk-info'),
   ])
+  // 页面已离开，丢弃本次结果
+  if (compRes.canceled) return
+
   // ⚠ 这些接口在「模型未就绪」或「meta.json 读取失败」时返回 **HTTP 200**，
   //   body 形如 {"models": [], "best_model": null, "error": "模型尚未训练..."}。
   //   旧代码直接把 compRes.data 赋给 comparison，于是模板里
   //   `v-if="comparison"` 为真（对象是 truthy）→ 渲染表头但零行、
   //   图表收到空数组 → 整页只剩空框，用户看不到任何原因。
   //   这里显式把 error 提升为页面级错误态。
-  loadError.value = compRes.data?.error || ''
-  comparison.value = compRes.data?.error ? null : compRes.data
-  confusionData.value = cmRes.data?.error ? null : cmRes.data.matrices
-  _rocRes = rocRes.data?.error ? null : rocRes.data
-  _featRes = featRes.data?.error ? null : featRes.data
-  _shapRes = shapRes.data?.error ? null : shapRes.data
+  //
+  // ⚠ 两条失败路径都要覆盖：
+  //   1) HTTP 200 + body.error（模型未就绪）→ 取 body.error
+  //   2) HTTP 4xx/5xx → fetchSafe 已归一为 error 字符串
+  const errs = []
+  const pick = (res) => {
+    if (res.error) { errs.push(res.error); return null }
+    if (res.data?.error) { errs.push(res.data.error); return null }
+    return res.data
+  }
+  const comp = pick(compRes)
+  comparison.value = comp
+  confusionData.value = pick(cmRes)?.matrices ?? null
+  _rocRes = pick(rocRes)
+  _featRes = pick(featRes)
+  _shapRes = pick(shapRes)
   shapData.value = _shapRes
+
+  // 决策阈值口径 —— 用于给"最优模型"那一行的 recall/precision 标注真实口径。
+  //
+  // ⚠ 为什么需要：表格里的 recall 直接来自 meta.json，而 meta.json 的 recall
+  //   是 train.py 用 sklearn 默认 0.5 阈值算出来的（0.3627）。系统实际按
+  //   决策阈值(0.20)挑客户，该线下的真实 recall 是 0.7796 —— 同一个系统里
+  //   两个「模型召回率」，此前 Dashboard 显示 36.3%、干预策略页显示 78.0%。
+  //
+  //   这里**不篡改表格数值**（那是各模型在同一阈值下的公平对比，改用决策阈值
+  //   会破坏可比性），而是在表头与最优行做口径标注，说明真实运营口径下的数字。
+  riskInfo.value = riskRes.error ? null : (riskRes.data?.error ? null : riskRes.data)
+
+  // 汇总错误：优先展示"模型未就绪"这类业务原因，否则展示请求错误
+  loadError.value = errs.length ? errs[0] : ''
 }
 
 /** 重新拉取全部结果（错误态下的「刷新」按钮） */
@@ -336,7 +392,22 @@ onBeforeUnmount(() => {
     <template v-else>
       <!-- Model Comparison Table -->
       <div class="glass-card p-5 overflow-x-auto">
-        <h3 class="text-sm font-medium text-gray-400 mb-4">模型性能对比</h3>
+        <h3 class="text-sm font-medium text-gray-400 mb-1">模型性能对比</h3>
+        <!-- 口径说明：表格是各模型在【同一阈值】下的公平对比；
+             真实运营用的是决策阈值，两者 recall 差异很大，必须讲清楚 -->
+        <p class="text-xs mb-3" style="color:#7c8aa5">
+          下表为各模型在<strong>同一判定阈值</strong>下的公平对比。
+          <template v-if="riskInfo?.decision_metrics">
+            系统实际按<strong>决策阈值 {{ riskInfo.decision_metrics.threshold }}</strong>
+            （净收益最优，覆盖约 {{ ((riskInfo.decision_coverage || 0) * 100).toFixed(0) }}% 客户）挑客户，
+            该口径下最优模型的实测
+            <span style="color:#1d4ed8">
+              召回率 {{ (riskInfo.decision_metrics.recall * 100).toFixed(1) }}% ·
+              精确率 {{ (riskInfo.decision_metrics.precision * 100).toFixed(1) }}%
+            </span>
+            （测试集 {{ riskInfo.decision_metrics.sample_size?.toLocaleString() }} 人）。
+          </template>
+        </p>
         <table v-if="comparison" class="w-full text-sm">
           <thead>
             <tr class="text-gray-500 border-b border-[#e5e9f0]">

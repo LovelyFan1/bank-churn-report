@@ -12,6 +12,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import {
   riskLabel, riskBadgeClass, probColor, fmtPercent, fmtWan,
   valueTierLabel, valueTierColor, channelLabel,
@@ -19,6 +20,11 @@ import {
 
 const route = useRoute()
 const router = useRouter()
+
+// 页面级请求作用域：本页有 3 处 GET（客户详情/风险口径/工单）。
+// 卸载时取消在途请求 —— 此前未接入，快速进出详情页会留下飞行中的请求。
+// ⚠ SHAP 归因是 POST，但不经 scope：它不写数据，且用户在等结果。
+const scope = useRequestScope()
 
 const loading = ref(true)
 const err = ref('')
@@ -42,7 +48,7 @@ const FEATURE_CN = {
 onMounted(async () => {
   const id = route.params.id
   try {
-    c.value = (await api.get(`/customers/${id}`)).data
+    c.value = (await scope.get(`/customers/${id}`)).data
   } catch (e) {
     err.value = e.response?.data?.detail || e.message
     loading.value = false
@@ -53,7 +59,7 @@ onMounted(async () => {
   // SHAP、工单、分级阈值并行取，不阻塞主信息渲染
   loadShap()
   loadOrders(id)
-  api.get('/model/risk-info').then(({ data }) => { riskInfo.value = data }).catch(() => {})
+  scope.get('/model/risk-info').then(({ data }) => { riskInfo.value = data }).catch(() => {})
 })
 
 /** SHAP 归因 —— 需要传该客户的 12 个特征，字段名与客户接口输出一致 */
@@ -71,11 +77,21 @@ async function loadShap() {
   }
 }
 
-/** 该客户的历史工单 —— 按客户编号搜，复用工单列表接口 */
+/**
+ * 该客户的历史工单 —— 按客户编号搜，复用工单列表接口。
+ *
+ * ⚠ 后端 `search` 是 `ilike %id%` **模糊匹配**，会带出编号相近的其他客户
+ *   （如搜 C000001 也可能命中 C0000011 之类），所以拿到结果后必须再按
+ *   `customer_id === id` 精确过滤 —— 这一步原有实现已做，保留。
+ *
+ * ⚠ 同时把 `page_size` 从 20 提到接口上限 100：模糊匹配会把名额占满，
+ *   若某客户的真实工单数 >20（或被相似编号挤占），原实现会**静默漏掉**
+ *   部分历史工单。提到 100 后覆盖面显著变宽。
+ */
 async function loadOrders(id) {
   try {
-    const { data } = await api.get('/work-orders', {
-      params: { search: id, page: 1, page_size: 20 },
+    const { data } = await scope.get('/work-orders', {
+      params: { search: id, page: 1, page_size: 100 },
     })
     orders.value = (data.items || []).filter((o) => o.customer_id === id)
   } catch (_) {

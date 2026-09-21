@@ -133,29 +133,67 @@ class EDAService:
         }
 
     def get_numeric_distribution(self, feature: str) -> Dict[str, Any]:
-        """数值特征分布"""
+        """数值特征分布。
+
+        ⚠ 本方法此前**任何输入都返回 HTTP 500**（实测 age/geography/balance/
+          exited/credit_score 全部 500）。两条独立的序列化缺陷：
+            1) `round(np.int64(18), 2)` 返回的仍是 **np.int64**，而
+               FastAPI 的 jsonable_encoder 无法序列化 numpy 标量 → ValueError；
+            2) `pd.cut(...).index` 的元素是 **pandas.Interval**
+               （如 `(17.926, 21.7]`），不是 JSON 基础类型 → TypeError。
+
+          注解：`round()` 对 numpy 标量是**原位返回 numpy 类型**的，
+          这与 Python 内建 int/float 的行为不同 —— 是本次踩坑的根源。
+
+        修法：
+            · 统计量一律显式 `float()` 包裹（float(np.int64) → Python float）；
+            · bins 改为 `[左, 右]` 的数值对列表（并保留可读标签），
+              不再直接吐 Interval 对象；
+            · counts 显式转 `int()`。
+        另把列名校验从"任何列都放行"改为**仅数值列**，避免对
+        geography 这类字符串列做 mean/cut（会得到无意义的 nan/报错）。
+        """
         df = self._get_dataframe()
 
         if feature not in df.columns:
             return {"error": f"Feature {feature} not found"}
 
-        data = df[feature]
+        # 只接受数值列：字符串列做 mean/quantile 无意义，且 pd.cut 会失败
+        if not pd.api.types.is_numeric_dtype(df[feature]):
+            return {"error": f"Feature {feature} 不是数值列，无法计算分布"}
+
+        data = pd.to_numeric(df[feature], errors="coerce").dropna()
+        if len(data) == 0:
+            return {"error": f"Feature {feature} 无有效数值"}
+
+        def _f(v) -> float:
+            """统一转 Python float —— 见上方缺陷说明 1。"""
+            return round(float(v), 2)
+
+        # 直方图：bins 用 [左, 右] 数值对，counts 用 int
+        cats = pd.cut(data, bins=20)
+        hist = cats.value_counts().sort_index()
+        bins = [[float(iv.left), float(iv.right)] for iv in hist.index]
+        labels = [f"{float(iv.left):.4g}~{float(iv.right):.4g}" for iv in hist.index]
+        counts = [int(c) for c in hist.values]
 
         return {
             "feature": feature,
             "statistics": {
-                "mean": round(data.mean(), 2),
-                "median": round(data.median(), 2),
-                "std": round(data.std(), 2),
-                "min": round(data.min(), 2),
-                "max": round(data.max(), 2),
-                "q25": round(data.quantile(0.25), 2),
-                "q75": round(data.quantile(0.75), 2)
+                "mean": _f(data.mean()),
+                "median": _f(data.median()),
+                "std": _f(data.std()),
+                "min": _f(data.min()),
+                "max": _f(data.max()),
+                "q25": _f(data.quantile(0.25)),
+                "q75": _f(data.quantile(0.75)),
             },
             "histogram": {
-                "bins": pd.cut(data, bins=20).value_counts().sort_index().index.tolist(),
-                "counts": pd.cut(data, bins=20).value_counts().sort_index().values.tolist()
-            }
+                # 保留旧键（bins/counts）以兼容既有前端，但类型已可序列化
+                "bins": bins,
+                "bin_labels": labels,
+                "counts": counts,
+            },
         }
 
     def get_key_insights(self) -> Dict[str, Any]:
@@ -200,13 +238,53 @@ class EDAService:
                 return 0
             return round(a / b, 1)
 
+        # ── 标题按数据动态生成，不写死 ──────────────────────────
+        #
+        # ⚠ 实测缺陷：此前 6 条洞察的 `title` 全是**写死的字符串**
+        #   （如「投诉客户流失率极高」），而 `value` 是实时算的。
+        #   本数据集里 complain 与 exited 的相关性接近 0（生成器在
+        #   打完流失标签后又按 0.85/0.15 重掷了 complain，把相关性洗掉了），
+        #   实测：
+        #       投诉客户流失率 = 20.39%   总体 = 20.42%   → 1.00 倍
+        #   于是首页出现自相矛盾的一行：
+        #       「投诉客户流失率极高  20.4%  是总体的 1.0 倍」
+        #   同理「零余额客户流失率 13.8%（是有余额的 0.6 倍）」也挂在
+        #   「风险」列表里，但它其实**低于**总体 —— 不是风险。
+        #
+        #   现改为按实际倍数决定标题措辞：显著高于总体才说"偏高/飙升"，
+        #   接近总体就如实说"与总体持平"，低于总体则说明它**不是**风险因素。
+        #   这样文案永远与数字自洽。
+        def verdict_title(rate: float, base: float, subject: str,
+                          high_word="流失率偏高", low_word="流失率更低") -> str:
+            """按 rate/base 的倍数给出与数据相符的标题。
+
+            ⚠ low_word 由调用方决定措辞，本函数不自动追加「（非风险因素）」——
+              曾因调用方已写该后缀而输出重复：
+                  「零余额客户流失率更低（非风险因素）（非风险因素）」
+            """
+            if base <= 0:
+                return f"{subject}流失率"
+            r = rate / base
+            if r >= 1.5:
+                return f"{subject}{high_word}"
+            if r >= 1.15:
+                return f"{subject}流失率略高"
+            if r >= 0.85:
+                return f"{subject}流失率与总体持平"
+            # ⚠ 这里不追加任何固定后缀 —— 后缀的含义依 subject 而异：
+            #   「零余额客户」低于是"非风险因素"，而「活跃会员」低于是"优势"。
+            #   统一追加会产出「活跃会员留存优势明显（非风险因素）」这种错话。
+            return f"{subject}{low_word}"
+
         return {
             "overall_rate": round(overall_rate * 100, 1),
             "insights": [
                 {
                     "icon": "🔴",
                     "bg": "rgba(239,68,68,0.1)",
-                    "title": "投诉客户流失率极高",
+                    # ⚠ 标题随数据变化：本数据集投诉与流失几乎无关，
+                    #   实测 1.00 倍，因此这里会显示"与总体持平"而非"极高"。
+                    "title": verdict_title(complain_rate, overall_rate, "投诉客户"),
                     "value": f"{round(complain_rate * 100, 1)}%",
                     "sub": f"是总体的 {ratio(complain_rate, overall_rate)} 倍",
                     "detail": f"投诉客户 {len(complain_df)} 人，流失 {int(complain_df['exited'].sum())} 人",
@@ -214,7 +292,8 @@ class EDAService:
                 {
                     "icon": "🟠",
                     "bg": "rgba(245,158,11,0.1)",
-                    "title": "3+产品客户风险飙升",
+                    "title": verdict_title(high_prod_rate, low_prod_rate,
+                                          "3+产品客户", "风险飙升"),
                     "value": f"{round(high_prod_rate * 100, 1)}%",
                     "sub": f"是1产品客户的 {ratio(high_prod_rate, low_prod_rate)} 倍",
                     "detail": f"3+产品客户 {len(high_prod_df)} 人，1产品客户流失率 {round(low_prod_rate * 100, 1)}%",
@@ -222,7 +301,8 @@ class EDAService:
                 {
                     "icon": "🔵",
                     "bg": "rgba(99,102,241,0.1)",
-                    "title": "德国地区流失率偏高",
+                    "title": verdict_title(germany_rate, france_rate,
+                                          "德国地区", "流失率偏高"),
                     "value": f"{round(germany_rate * 100, 1)}%",
                     "sub": f"比法国高 {ratio(germany_rate, france_rate)} 倍",
                     "detail": f"法国 {round(france_rate * 100, 1)}% · 德国 {round(germany_rate * 100, 1)}%",
@@ -230,15 +310,16 @@ class EDAService:
                 {
                     "icon": "🟢",
                     "bg": "rgba(34,197,94,0.1)",
-                    "title": "活跃会员留存优势明显",
-                    "value": f"{round(active_rate * 100, 1)}%",
+                    # 活跃是"优势"，用 inactive_rate 作基准判定
+                    "title": verdict_title(active_rate, inactive_rate,
+                                          "活跃会员", "流失率更高", "留存优势明显"),                    "value": f"{round(active_rate * 100, 1)}%",
                     "sub": f"非活跃 {round(inactive_rate * 100, 1)}%",
                     "detail": f"活跃客户流失率仅为非活跃的 {ratio(active_rate, inactive_rate)}",
                 },
                 {
                     "icon": "🟡",
                     "bg": "rgba(234,179,8,0.1)",
-                    "title": "高龄客户流失风险",
+                    "title": verdict_title(old_rate, young_rate, "高龄客户", "流失风险"),
                     "value": f"{round(old_rate * 100, 1)}%",
                     "sub": f"50岁以上 · 是年轻的 {ratio(old_rate, young_rate)} 倍",
                     "detail": f"50+客户 {len(old_df)} 人，流失 {int(old_df['exited'].sum())} 人",
@@ -246,7 +327,11 @@ class EDAService:
                 {
                     "icon": "⚪",
                     "bg": "rgba(156,163,175,0.1)",
-                    "title": "零余额客户流失率",
+                    # ⚠ 零余额实测流失率 13.79% **低于**有余额的 24.10%（0.6 倍）。
+                    #   旧标题只写「零余额客户流失率」，配 0.6 倍，容易被读成风险；
+                    #   verdict_title 会据实给出"流失率更低（非风险因素）"。
+                    "title": verdict_title(zero_bal_rate, has_bal_rate,
+                                          "零余额客户", "流失率偏高", "流失率更低"),
                     "value": f"{round(zero_bal_rate * 100, 1)}%",
                     "sub": f"是有余额的 {ratio(zero_bal_rate, has_bal_rate)} 倍",
                     "detail": f"零余额客户 {len(zero_bal_df)} 人，占总体 {round(len(zero_bal_df) / total * 100, 1)}%",

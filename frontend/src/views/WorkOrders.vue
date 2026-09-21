@@ -37,7 +37,7 @@
           v-model="searchText"
           placeholder="搜索客户姓名 / 编号..."
           class="search-input"
-          @input="fetchOrders"
+          @input="onSearchInput"
         />
         <button class="btn btn-primary btn-sm" @click="openCreate()">＋ 创建工单</button>
       </div>
@@ -223,17 +223,21 @@
             </div>
             <div class="form-group" style="grid-column: 1 / -1">
               <label>推荐策略</label>
-              <select v-model="form.strategy">
-                <option value="">-- 选择干预策略 --</option>
-                <option>专属客户经理一对一挽留</option>
-                <option>定制化产品优惠方案</option>
-                <option>VIP费率优惠</option>
-                <option>主动外呼关怀</option>
-                <option>产品升级推荐</option>
-                <option>满意度回访</option>
-                <option>积分奖励计划</option>
-                <option>定期营销推送</option>
-              </select>
+              <!-- ⚠ 改为**只读展示**，不再提供自造的下拉选项。
+                   原实现硬编码 8 个选项（专属客户经理一对一挽留 / 定制化产品
+                   优惠方案 / …），而这 8 条**都不在后端 _ACTION_TABLE 的产出里**。
+                   后果有二（实测）：
+                     1) 打开编辑时 form.strategy 是后端值（如"客户经理上门 +
+                        定制挽留方案"），v-model 找不到匹配 option，
+                        selectedIndex = -1 → **下拉显示空白**，用户以为没设置；
+                        （同一页面的详情面板却正确显示该后端值，自相矛盾）
+                     2) 用户一旦碰这个下拉并保存，就会把后端统一策略**改写成
+                        自造的第三套措辞** —— 正是 risk_scoring 顶部注释声明
+                        要消除的"同一客户三处三个不同动作"。本处是最后残留的
+                        第三套来源（建单弹窗早已改为由后端 recommend_action 决定）。
+                   策略与渠道由后端 value_tier × risk_level 决定，前端不应另立一套。
+                   如需人工调整，应走"渠道覆盖 + 填理由"那条已有路径。 -->
+              <input :value="form.strategy || '（后端未给出建议）'" readonly class="readonly" />
             </div>
             <div class="form-group" style="grid-column: 1 / -1">
               <label>备注</label>
@@ -254,9 +258,15 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import api from '../api'
+import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, riskColor, probColor, fmtPercent, valueTierLabel, channelLabel, fmtWan } from '../utils/risk'
+
+// 页面级请求作用域：本页有 4 处 GET（列表/统计/进行中客户），
+// 卸载时取消，避免占着浏览器同域连接槽拖慢下一页。
+// ⚠ 写操作（POST/PUT/DELETE）**不经 scope** —— 已提交的请求不能因离开页面而中断。
+const scope = useRequestScope()
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
@@ -311,10 +321,38 @@ function statusLabel(s) {
   const m = { pending: '待处理', in_progress: '处理中', completed: '已完成', lost: '已流失' }
   return m[s] || s
 }
+/**
+ * 格式化后端返回的时间戳。
+ *
+ * ⚠ 后端存的是 **naive UTC**（`datetime.now(timezone.utc)` 写入 SQLAlchemy
+ *   的 DateTime 列时会丢掉 tzinfo；SQLite 也不保存时区），序列化后形如
+ *   `"2026-09-19T13:24:40.606519"` —— **不带 Z 后缀**。
+ *
+ *   旧实现是 `d.replace('T',' ').substring(0,19)`，即**原样显示 UTC**，
+ *   导致所有时间比北京时间**早 8 小时**。实测（真实数据）：
+ *       工单 created_at(UTC) = 2026-09-19 13:24:40
+ *       页面显示            = 2026-09-19 13:24:40   ← 实际应为 21:24:40
+ *   更直观的证据：DB 里有 2 条 updated_at 晚于当前时刻的工单
+ *   （2026-09-22 22:24 vs 当前 2026-09-21 04:45 UTC），
+ *   旧实现会把它们显示成"未来的时间"。
+ *
+ *   现改为：补上 'Z' 让 JS 按 UTC 解析，再转成本地时区显示。
+ *   兼容三种输入：带 Z / 带 +08:00 / 已带偏移 —— 都交给 Date 处理。
+ */
 function fmtDate(d) {
   if (!d) return ''
-  if (typeof d === 'string') return d.replace('T', ' ').substring(0, 19)
-  return d
+  if (typeof d !== 'string') return d
+  // 无时区标识的 ISO 串 → 显式声明为 UTC（后端约定见上）
+  const hasTz = /(Z|[+-]\d{2}:?\d{2})$/.test(d)
+  const iso = hasTz ? d : d + 'Z'
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) {
+    // 解析失败则退化为原样显示（不因格式问题让整列空白）
+    return d.replace('T', ' ').substring(0, 19)
+  }
+  const p = (n) => String(n).padStart(2, '0')
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())} ` +
+         `${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`
 }
 
 function setFilter(f) {
@@ -327,6 +365,28 @@ function setFilter(f) {
 function onFilterChange() {
   page.value = 1
   fetchOrders()
+}
+
+/**
+ * 搜索输入 —— 必须**重置页码** + **防抖**。
+ *
+ * ⚠ 实测缺陷（修复前是 `@input="fetchOrders"`）：
+ *   1) 不重置页码 → 停在第 3 页时搜索，请求带的是 `page=3&search=Bentley`，
+ *      而匹配结果只有 1 条（`total_pages=1`），第 3 页必然返回空数组，
+ *      页面显示「暂无工单数据」——**搜索功能完全失效且给出误导性空态**。
+ *      实测：`page=3&search=Bentley` → `{total:1, total_pages:1, items:0}`。
+ *   2) 无防抖 → 输入 "Bentley" 会连发 7 个请求（实测逐字符触发）。
+ *
+ * 同文件的 setFilter / onFilterChange 都正确重置了页码，只有搜索漏了。
+ * 与 CustomerManagement.vue 的 300ms 防抖保持一致。
+ */
+let searchTimer = null
+function onSearchInput() {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    page.value = 1          // ← 关键：重置到第一页，否则结果被藏在空页里
+    fetchOrders()
+  }, 300)
 }
 
 function goPage(p) {
@@ -443,7 +503,7 @@ async function deleteOrder(id) {
 
 async function fetchStats() {
   try {
-    const { data } = await api.get('/work-orders/stats')
+    const { data } = await scope.get('/work-orders/stats')
     Object.assign(stats, data)
     assignees.value = data.assignees || []
   } catch (_) {}
@@ -455,7 +515,7 @@ async function fetchOrders() {
     if (currentFilter.value !== 'all') params.status = currentFilter.value
     if (assigneeFilter.value) params.assignee = assigneeFilter.value
     if (searchText.value) params.search = searchText.value
-    const { data } = await api.get('/work-orders', { params })
+    const { data } = await scope.get('/work-orders', { params })
     orders.value = data.items
     totalPages.value = data.total_pages
   } catch (_) {
@@ -473,6 +533,12 @@ function showToast(msg) {
 onMounted(async () => {
   await Promise.all([fetchStats(), fetchOrders()])
   loading.value = false
+})
+
+// 卸载时清理：toast 定时器 + 搜索防抖定时器（此前都残留）
+onBeforeUnmount(() => {
+  clearTimeout(toastTimer)
+  clearTimeout(searchTimer)
 })
 
 // Expose for Dashboard usage

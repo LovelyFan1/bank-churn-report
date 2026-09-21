@@ -6,9 +6,11 @@
 - 训练时按 chunk 流式喂给模型 (partial_fit / MiniBatch)
 """
 
+import os
 import pandas as pd
 import numpy as np
 import time
+from pathlib import Path
 from typing import Iterator, Tuple, Optional, List
 from sqlalchemy.orm import Session
 from app.models.customer import Customer
@@ -254,23 +256,84 @@ _REQUIRED_COLUMNS = {
     "age_group": lambda df: None,   # 由调用方提供；EDA 也会按需自行计算
 }
 
-_customer_cache = {"df": None, "ts": 0.0}
+_customer_cache = {"df": None, "ts": 0.0, "version": None}
+
+# ── 跨进程缓存失效的版本标记 ──────────────────────────────
+#
+# ⚠ 为什么需要它（实测发现的严重缺陷）：
+#   `invalidate_customer_cache()` 是**进程内**函数，只能清当前进程的内存缓存。
+#   而本项目的重算力任务跑在 **Celery worker（独立进程）** 里：
+#       Celery worker 写库 → 调 invalidate_customer_cache() → 只清 worker 自己
+#       backend 的 4 个 uvicorn worker **完全不知道**，继续用旧快照。
+#
+#   实测（重新聚类 k=5 之后立刻请求接口）：
+#       DB  cluster_id 分布 = {0:28382, 1:23748, 2:25539, 3:21080, 4:1251}   ← 新
+#       GET /api/cluster/profiles 返回 count = 25577, 22760, 22649, 14343, 14671 ← 旧
+#   两者不一致，且会持续到 CUSTOMER_CACHE_TTL（**整整 1 小时**）到期或
+#   backend 重启为止。这正是「点了重新聚类，页面像没反应」的直接原因。
+#
+# 方案：把「缓存版本」落成一个极小的文件，写入方 bump 版本号，读取方每次
+#   请求对比一次。`os.stat` + 读 1 个整数远比重新加载 10 万行（实测 2.8 秒）
+#   便宜，因此可以每次调用都检查，不牺牲性能。
+#
+# 为什么用文件而不是 Redis：项目已依赖 Redis，但 data_loader 被 Celery 与
+#   backend 共用，引入 Redis 客户端会增加一个部署耦合点（Redis 不可用时
+#   连全量读都会失败）。文件方案零依赖、失败时静默降级为旧行为。
+_CACHE_VERSION_FILE = Path(__file__).parent.parent.parent / "saved_models" / ".customer_cache_version"
+
+
+def _read_cache_version() -> str:
+    """读取当前缓存版本号；文件不存在或读失败时返回空串（降级为不感知）。"""
+    try:
+        return _CACHE_VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def invalidate_customer_cache() -> None:
-    """客户表变更后调用（播种、换数据源、批量导入）。"""
+    """客户表变更后调用（播种、换数据源、批量导入、**聚类标签写回**）。
+
+    ⚠ 本函数会**同时**：
+      1) 清当前进程的内存缓存；
+      2) 递增磁盘上的版本号 —— 让**其他进程**（Celery ↔ backend）也能感知。
+    只做第 1 步是旧实现的缺陷，见上方版本标记的说明。
+    """
     _customer_cache["df"] = None
     _customer_cache["ts"] = 0.0
+    _customer_cache["version"] = None
+
+    try:
+        _CACHE_VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cur = _read_cache_version()
+        try:
+            nxt = int(cur) + 1 if cur else 1
+        except ValueError:
+            nxt = 1
+        # 原子写：避免读方拿到写了一半的内容
+        tmp = _CACHE_VERSION_FILE.with_name(_CACHE_VERSION_FILE.name + ".tmp")
+        tmp.write_text(str(nxt), encoding="utf-8")
+        os.replace(tmp, _CACHE_VERSION_FILE)
+    except OSError:
+        # 版本文件不可写不应让调用方失败（例如只读挂载）。
+        # 此时退化为旧的"仅进程内失效"行为。
+        pass
 
 
 def get_cached_customer_df(db: Session) -> pd.DataFrame:
-    """全量客户 DataFrame（进程级缓存）。
+    """全量客户 DataFrame（进程级缓存 + 跨进程版本校验）。
 
     ⚠ 返回的是**共享对象**，调用方**不得原地修改**。
     需要加列/改列的，先 `df = df.copy()` 或改用局部变量 ——
     eda_service.get_age_distribution() 曾因此差点污染整张共享表。
     """
-    if _customer_cache["df"] is not None and time.time() - _customer_cache["ts"] < CUSTOMER_CACHE_TTL:
+    cur_version = _read_cache_version()
+    fresh = (
+        _customer_cache["df"] is not None
+        and time.time() - _customer_cache["ts"] < CUSTOMER_CACHE_TTL
+        # 版本一致才复用：其他进程（Celery）写库后会 bump 版本号
+        and _customer_cache["version"] == cur_version
+    )
+    if fresh:
         return _customer_cache["df"]
 
     loader = DataLoader(db)
@@ -290,4 +353,5 @@ def get_cached_customer_df(db: Session) -> pd.DataFrame:
 
     _customer_cache["df"] = df
     _customer_cache["ts"] = time.time()
+    _customer_cache["version"] = cur_version
     return df

@@ -25,21 +25,63 @@ MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
 
 def _load_best_model():
-    """从磁盘加载 AUC 最高的模型。"""
+    """从磁盘加载 AUC 最高的模型。失败时返回 (None, None)，不抛异常。
+
+    ⚠ 旧实现是裸的 json.load + joblib.load，**没有任何异常处理**。
+    实测：把 meta.json 截断成一半（模拟训练任务正在写入的中间状态），
+        predict.py 版   → 抛 JSONDecodeError（任务整体失败）
+        risk_scoring 版 → 返回 (None, None)，降级为"模型未就绪"并记 warning
+    同一份文件、两种处理，说明这里漏了防护。
+    train.py 用原子写（tempfile + os.replace）后撞上的概率已很低，但
+    "读的时候文件恰好不存在/损坏"仍会发生（例如首次部署、误删、磁盘写满），
+    本函数是任务入口，不该因此把整个 batch_score 打成 failed。
+    现与 risk_scoring._load_best_model 对齐：重试 + 降级 + warning。
+    """
+    import logging
+    import time as _time
+    logger = logging.getLogger(__name__)
+
     meta_path = MODEL_DIR / "meta.json"
     if not meta_path.exists():
         return None, None
 
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    ATTEMPTS = 3
+    meta = None
+    last_err: Exception | None = None
+    for attempt in range(ATTEMPTS):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            break
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            last_err = e
+            if attempt < ATTEMPTS - 1:
+                _time.sleep(0.15 * (attempt + 1))
 
-    best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
-    model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
-
-    if not model_path.exists():
+    if meta is None:
+        logger.warning("predict: 读取 %s 失败（已重试 %d 次）: %s: %s",
+                       meta_path, ATTEMPTS, type(last_err).__name__, last_err)
         return None, None
 
-    return joblib.load(model_path), best_name
+    try:
+        results = meta["results"]
+        best_name = max(results.keys(), key=lambda x: results[x]["auc"])
+    except (KeyError, TypeError, ValueError) as e:
+        logger.warning("predict: meta.json 结构异常，无法选出最佳模型: %s: %s",
+                       type(e).__name__, e)
+        return None, None
+
+    model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
+    if not model_path.exists():
+        logger.warning("predict: 最佳模型文件不存在: %s", model_path)
+        return None, None
+
+    try:
+        return joblib.load(model_path), best_name
+    except Exception as e:
+        logger.warning("predict: 加载模型 %s 失败: %s: %s",
+                       model_path, type(e).__name__, e)
+        return None, None
 
 
 SHAP_FEATURE_LABELS = {
@@ -192,47 +234,98 @@ def batch_score_task(self, top_n: int = 100) -> dict:
 
 
 def _enrich_with_shap(model, top_records: list) -> None:
-    """用 SHAP 值为 Top N 客户的 record 填充 risk_factors（带贡献百分比）。
+    """用 SHAP 值为 Top N 客户的 record 填充 risk_factors（带贡献度）。
 
     Args:
         model: 已加载的最佳模型
         top_records: [(prob, record, feature_vector), ...] — 原地修改 record["risk_factors"]
+
+    ⚠ 两处曾导致本函数**每次都失败**的问题（实测确认，勿回退）：
+
+    1) `shap.TreeExplainer(model, model_output="probability")` 会直接抛异常：
+           ValueError: Only model_output="raw" is supported for
+                       feature_perturbation="tree_path_dependent"
+       实测（shap==0.45.0 + XGBoost）：调用 batch_score_task 时堆栈被打到
+       stderr，异常被下面的 except 吞掉，**每次都降级**成硬阈值规则 ——
+       即"SHAP 归因"这个功能其实从未生效过，前端拿到的只是 _risk_factors_from_row
+       的规则标签，没有任何贡献度。
+       train.py / model_service.py 用的是 `TreeExplainer(model)`（默认 raw），
+       所以只有本文件这一处坏掉。
+       现统一改为不传 model_output（即 raw），与另两处保持一致。
+
+    2) 把 log-odds 尺度的 SHAP 值写成 `v*100:.1f%`，**不是占比却长得像占比**。
+       实测（50 个 Top 客户）：
+           展示值范围 −178.6% ~ +201.7%，均值 −11.3%
+           每行 top6 的绝对值之和：min 137.5% / max 491.5% / mean 263.4%
+           出现 >100% 的条目 30 个，>50% 的 78 个
+           负值条目占 57.0%
+       也就是说：一行的"百分比"加起来高达 263%，单个特征还能超过 100% ——
+       这不是任何意义上的百分比，用户无法正确理解。
+       现改为**归一化的贡献占比**：对每个客户，用其 top 特征的 |SHAP| 之和
+       作分母，得到真正相加为 100% 的占比，并在字段里标注这是相对贡献。
+       这样"产品超载 32%"就是"该客户的风险因素中，产品数量贡献了 32%"，
+       语义明确且可验证。
     """
     if not top_records:
         return
 
+    def _fallback():
+        for _prob, record, _ in top_records:
+            record["risk_factors"] = _risk_factors_from_row(record)
+            _apply_strategy(record)
+
     try:
         import shap
 
-        # TreeExplainer 对树模型最轻量
-        explainer = shap.TreeExplainer(model, model_output="probability")
+        # ⚠ 不传 model_output —— 默认 raw 是唯一被 tree_path_dependent 支持的尺度
+        explainer = shap.TreeExplainer(model)
         features_matrix = np.array([r[2] for r in top_records])
         shap_values = explainer.shap_values(features_matrix)
 
         if isinstance(shap_values, list):
             shap_values = shap_values[1]  # 二分类取正类
 
-        for idx, (prob, record, _) in enumerate(top_records):
+        shap_values = np.asarray(shap_values)
+        if shap_values.ndim != 2 or shap_values.shape[1] != len(FEATURE_NAMES):
+            # 形状不符 → 宁可回退，也不能让索引悄悄错位
+            raise ValueError(
+                f"SHAP 输出形状 {shap_values.shape} 与 FEATURE_NAMES"
+                f"({len(FEATURE_NAMES)}) 不匹配"
+            )
+
+        for idx, (_prob, record, _) in enumerate(top_records):
             shap_vals = shap_values[idx]
-            # feature → SHAP contribution
             pairs = [(FEATURE_NAMES[i], float(shap_vals[i]))
                      for i in range(len(FEATURE_NAMES))]
-            pairs.sort(key=lambda x: abs(x[1]), reverse=True)
+            # 只看**推动流失**的方向（正贡献）。负的 SHAP 是"降低流失概率"，
+            # 把它列进"风险因素"本身就是矛盾的（风险因素应当说明为什么会流失）。
+            pos = [(f, v) for f, v in pairs if v > 0]
+            if not pos:
+                # 该客户没有任何正向贡献特征（模型认为他不太会流失）
+                record["risk_factors"] = []
+                _apply_strategy(record)
+                continue
 
+            pos.sort(key=lambda x: x[1], reverse=True)
+            top = pos[:6]
+            total = float(sum(v for _f, v in pos))
             record["risk_factors"] = [
-                f"{SHAP_FEATURE_LABELS.get(f, f)} ({'+' if v > 0 else ''}{v * 100:.1f}%)"
-                for f, v in pairs[:6]
-                if abs(v) > 0.003  # 过滤贡献极小的特征
+                # 占比 = 该特征正贡献 / 全部正贡献之和，相加恰为 100%
+                f"{SHAP_FEATURE_LABELS.get(f, f)}（{v / total * 100:.1f}%）"
+                for f, v in top
             ]
+            record["risk_factors_basis"] = "shap_ratio_of_positive_contributions"
             _apply_strategy(record)
 
-    except Exception:
-        # 回退：模型不支持 TreeExplainer（如 LogisticRegression），用硬阈值
-        import traceback
-        traceback.print_exc()
-        for prob, record, _ in top_records:
-            record["risk_factors"] = _risk_factors_from_row(record)
-            _apply_strategy(record)
+    except Exception as e:
+        # 回退：模型不支持 TreeExplainer（如 LogisticRegression），用硬阈值。
+        # ⚠ 记录 warning 而非直接 print 堆栈 —— 之前每调用一次就打一整段
+        #   traceback 到 stderr，把正常日志淹掉，且让人以为系统在报错。
+        import logging
+        logging.getLogger(__name__).warning(
+            "SHAP 归因不可用，回退为规则标签: %s: %s", type(e).__name__, e
+        )
+        _fallback()
 
 
 def _apply_strategy(record: dict) -> None:

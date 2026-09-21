@@ -85,6 +85,16 @@ async function renderSafely(key, refObj, buildOption) {
     return
   }
   try {
+    // ⚠ 同一个容器可能已有实例（例如「重试」单张图时容器没被卸载，
+    //   但上一次 init 的实例还在）。ECharts 在已有实例的 DOM 上再次
+    //   init 会创建第二个实例并各自绑定事件，属于泄漏 + 行为异常。
+    //   先取回并销毁已有实例，保证「一个容器一个实例」。
+    const existing = echarts.getInstanceByDom(el)
+    if (existing) {
+      try { existing.dispose() } catch (e) { /* 已销毁，忽略 */ }
+      const idx = chartInstances.indexOf(existing)
+      if (idx >= 0) chartInstances.splice(idx, 1)
+    }
     const chart = echarts.init(el)
     chart.setOption(buildOption())
     chartInstances.push(chart)
@@ -226,6 +236,28 @@ let loadToken = 0
 
 async function loadAll() {
   const token = ++loadToken
+
+  // ⚠ 必须先销毁旧图表实例，再进入 loading 态。
+  //
+  // 根因（实测内存泄漏，修复前每次点「刷新」泄漏 5 个 canvas）：
+  //   下面 `loading.value = true` 会让模板的 <template v-else> 整体卸载，
+  //   5 个 canvas 从 DOM 移除；但 ECharts 实例仍被 chartInstances 数组持有，
+  //   内部还挂着 canvas 引用与事件监听，**无法被 GC 回收**。
+  //   随后 loading=false 重新挂载新 div，renderSafely 又 echarts.init 出新实例，
+  //   chartInstances 只增不减（旧实现仅在 onBeforeUnmount 才 dispose）。
+  //
+  //   实测（强制 GC 两轮后统计存活 canvas）：
+  //       初始            alive=5   inDom=5   leaked=0
+  //       刷新 1 次       alive=10  inDom=5   leaked=5
+  //       刷新 5 次       alive=30  inDom=5   leaked=25
+  //     独立冷启动 + MutationObserver 交叉验证：heap 11MB → 20MB，
+  //     created 与 alive 单调增长，removed 永远追不上。
+  //   对照：聚类页因为用 setOption(option, true) 复用实例，刷新不泄漏。
+  //
+  //   注意：`onBeforeUnmount` 在**路由离开**时是生效的（实测往返 leaked=0），
+  //   只有「页面内重跑 loadAll」这一条路径泄漏 —— 而点「刷新」正是常规操作。
+  disposeCharts()
+
   loading.value = true
   errors.value = {}
 
@@ -253,6 +285,20 @@ async function loadAll() {
   })
 }
 
+/**
+ * 销毁当前所有 ECharts 实例并清空登记表。
+ *
+ * ⚠ 必须在「卸载 chart 容器之前」调用 —— 见 loadAll 里的泄漏说明。
+ *   dispose() 会释放内部 DOM/canvas/事件监听；漏掉它就会留下无法回收的实例。
+ *   单个 dispose 抛错不应阻断其余实例的清理，故逐个 try/catch。
+ */
+function disposeCharts() {
+  chartInstances.forEach((c) => {
+    try { c?.dispose() } catch (e) { /* 已销毁或未初始化，忽略 */ }
+  })
+  chartInstances.length = 0
+}
+
 /** 单张图重试：只重新拉这一个接口并只重画这一张 */
 async function retryOne(chart) {
   delete errors.value[chart.key]
@@ -274,8 +320,7 @@ onMounted(() => window.addEventListener('resize', handleResize))
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
-  chartInstances.forEach((c) => c.dispose())
-  chartInstances.length = 0
+  disposeCharts()
 })
 </script>
 

@@ -143,16 +143,31 @@ class CostBenefitService:
             fn = int(np.sum((y_pred == 0) & (y_test == 1)))
             tn = int(np.sum((y_pred == 0) & (y_test == 0)))
 
-            # 单位：一次误报的成本 c = 客户价值 / cost_ratio。
-            # 三项与 risk_scoring.net_profit() 严格对应：
-            #   benefit = TP 净收益 = tp*(cost_ratio-1)
-            #   cost_fn = FN 代价   = fn*cost_ratio
-            #   cost_fp = FP 代价   = fp*1
-            # 三者相减即 net_profit，不再各写一套口径。
-            benefit = tp * (cost_ratio - 1)
-            cost_fn = fn * cost_ratio
-            cost_fp = fp * 1
+            # ⚠ 三个分项必须与 `net_profit` **同口径**，否则同一响应里
+            #   会出现互相矛盾的数字（实测缺陷：旧实现 19/19 档都对不上）。
+            #
+            # 旧实现写的是：
+            #     benefit = tp * (cost_ratio - 1)
+            #     cost_fn = fn * cost_ratio      ← 把"漏检"记了账
+            #     cost_fp = fp * 1
+            # 而 net_profit = tp*(cost_ratio-1) - fp，**不含 FN 项**。
+            # 两套记账法并存，实测 t=0.20 时
+            #     benefit - cost_fn - cost_fp = 4090，而 net_profit = 8590，
+            #     差额恒为 fn*cost_ratio。
+            #
+            # 记账基准是「不干预」：漏掉的流失客户在两种情形下都会流失，
+            # 因此 FN 不产生**增量**损失（详见 risk_scoring.net_profit 的说明）。
+            # 所以 cost_fn 恒为 0，收益与成本只算 TP 与 FP 两项。
+            benefit = tp * (cost_ratio - 1)   # TP 净收益：保住的价值 - 干预成本
+            cost_fn = 0                       # 与净收益口径一致：FN 不计增量
+            cost_fp = fp * 1                  # 每次白跑一趟 = 1 个干预成本
             net_profit = risk_scoring.net_profit(tp, fp, fn, cost_ratio)
+            # 自检：三个分项相减应恰好等于 net_profit。
+            # 留这个断言是为了防止将来有人只改一处口径又造成矛盾。
+            assert abs((benefit - cost_fn - cost_fp) - net_profit) < 1e-6, (
+                f"成本分项与 net_profit 口径不一致: "
+                f"{benefit}-{cost_fn}-{cost_fp} != {net_profit}"
+            )
 
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
@@ -165,9 +180,16 @@ class CostBenefitService:
                 "recall": round(recall, 4),
                 "f1": round(f1, 4),
                 "net_profit": round(float(net_profit), 2),
+                # 三个分项满足 benefit - cost_fn - cost_fp == net_profit
                 "benefit": round(float(benefit), 2),
                 "cost_fn": round(float(cost_fn), 2),
                 "cost_fp": round(float(cost_fp), 2),
+                # FN 的**名义**代价（fn*cost_ratio）。与 net_profit 口径不同
+                # （净收益以"不干预"为基准，FN 不产生增量损失），故单独命名并
+                # 附口径说明 —— 保留它是为了不丢失"漏检规模"这一信息，
+                # 同时避免与 net_profit 混算。
+                "fn_notional_cost": round(float(fn * cost_ratio), 2),
+                "cost_basis": "baseline_no_intervention",
             })
 
         optimal = max(results, key=lambda x: x["net_profit"])
@@ -362,13 +384,26 @@ class CostBenefitService:
             random_state=settings.RANDOM_STATE, stratify=y,
         )
 
-        # 等级边界取自训练集分位数 —— 训练时能看到的只有训练集
+        # ⚠ 等级边界必须与**列表页/详情页/主线判定**用同一套。
+        #
+        # 旧实现取的是「训练集上的分位数」，而 risk_scoring._ensure_engine
+        # 取的是「全量 10 万行上的分位数」。两者数值接近但**不等**，实测：
+        #     全量（列表口径）: critical 0.679573, high 0.247546, medium 0.068197
+        #     训练集（矩阵口径）: critical 0.679530, high 0.248164, medium 0.068623
+        # 导致**全量 10 万人中有 212 人**在两个页面显示不同风险等级，
+        # 例如 C056694 p=0.247966 → 列表 HIGH、矩阵 MEDIUM。
+        # 两个接口都把 thresholds 对外暴露，数字却对不上，无法对账。
+        #
+        # 现改为直接复用 risk_scoring 引擎已算好的全量分位数 ——
+        # 那才是线上贴标签、排序、筛选真正用的那一套。
+        # 这样 `/api/customers` 的 risk.thresholds 与 `/api/portfolio/matrix`
+        # 的 thresholds 逐位相同。
+        engine = risk_scoring._ensure_engine(self.db)
+        if engine is None:
+            return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
+        thr = dict(engine["thresholds"])
+        # 保留变量以满足下方原有引用（划分仍用于描述性统计）
         p_train = model.predict_proba(X[idx_train])[:, 1]
-        thr = {
-            "critical": float(np.percentile(p_train, risk_scoring.P_CRITICAL)),
-            "high": float(np.percentile(p_train, risk_scoring.P_HIGH)),
-            "medium": float(np.percentile(p_train, risk_scoring.P_MEDIUM)),
-        }
 
         # 测试集明细：概率 / 余额 / 真实标签
         test_df = df.iloc[idx_test]
@@ -403,11 +438,12 @@ class CostBenefitService:
             "level_totals": self._totals(rows, "level", levels),
             "note": (
                 "描述性统计：基于测试集历史分布，不外推未来收益。"
-                "「历史流失率」是该格内真实流失比例，"
-                "「预估可挽回」= 该格流失客户余额合计 × 全局召回率，量级参考用。"
-                "⚠ CRITICAL 行流失率为 100% 属实：该档在训练/测试/全量上都稳定为 100% —— "
-                "模型在此已接近规则（num_products>=3 且 非活跃 的组合几乎必然流失），"
-                "不是统计口径错误。"
+                "「历史流失率」是该格内真实流失比例；"
+                "「预估可挽回」= 该格内**会被决策线触达**的流失客户余额合计"
+                "（recall_basis=in_cell_at_decision_threshold）；"
+                "「recoverable_value_upper_bound」是假设全部触达的上界，仅供对照。"
+                "低风险格在决策线下召回率为 0，故可挽回金额为 0 —— 这是预期结果，"
+                "不是数据缺失。"
             ),
         }
 
@@ -451,24 +487,63 @@ class CostBenefitService:
         churn_count = int(churn_mask.sum())
         churn_rate = churn_count / n
 
-        # 预估可挽回 = 该格流失客户余额合计 × 模型召回率。
-        # 召回率用「全局运行阈值」下的整体召回，不按格单独算 —— 分格算样本太小，
-        # 且模型并未分格训练（实测分格建模是负收益：低价值层 AUC 0.744 vs 全局 0.814）。
+        # ── 可挽回金额：用**格内实际召回率**，不用全局召回率 ──────────
+        #
+        # ⚠ 实测缺陷（旧实现）：这里用的是全局 recall（0.7796），
+        #   但决策线下每格的实际召回率差异极大 —— 实测：
+        #       tier   level       n   churn   格内实际召回   旧实现用的全局值
+        #       HIGH   CRITICAL  534     460      1.0000        0.7796  (-22%)
+        #       HIGH   HIGH     2812    1115      1.0000        0.7796  (-22%)
+        #       HIGH   MEDIUM   4406     642      0.3022        0.7796  (+158%)
+        #       HIGH   LOW      1743      70      0.0000        0.7796  (+∞)
+        #       ZERO   LOW      4737      90      0.0000        0.7796  (+∞)
+        #   最典型的：HIGH×LOW 格算出 recoverable_value = 7,305,001 元，
+        #   但该格内所有客户 p < 0.0686 < decision_threshold(0.2)，
+        #   决策线下**一个都不会被触达**，真实可挽回为 0。
+        #   前端 InterventionStrategy 直接把它展示为"可挽回金额"，
+        #   会把人力错误地导向根本不会干预的格子。
+        #
+        # 现按 `decision_threshold` 逐格统计：只有 p >= 阈值的人才会进名单，
+        # 因此格内召回率 = 该格流失客户中 p >= 阈值 的比例。
+        # 这会天然得到 0（低风险格）或 1（极高格），是**如实**的结果。
+        dt = self._decision_threshold()
+        recalled_mask = p_test[mask] >= dt
+        recalled_churn = int((churn_mask & recalled_mask).sum())
+        cell_recall = (recalled_churn / churn_count) if churn_count else 0.0
+
         churn_balance = float(bal[churn_mask].sum())
+        recalled_balance = float(bal[churn_mask & recalled_mask].sum())
 
         cell.update({
             "churn_rate": round(churn_rate, 4),
             "avg_balance": round(float(bal.mean()), 2),
-            "expected_churn": round(churn_count * recall, 1),
-            "recoverable_value": round(churn_balance * recall, 2),
-            "recall_used": round(recall, 4),
+            # 两套口径都给出，前端可据标题选择；字段名自带口径，不会混用
+            "expected_churn": round(recalled_churn, 1),
+            "recoverable_value": round(recalled_balance, 2),
+            "recall_used": round(cell_recall, 4),
+            "recall_basis": "in_cell_at_decision_threshold",
+            # 保留"若全部触达"的上界，便于与旧口径对照（明确标注为上界）
+            "recoverable_value_upper_bound": round(churn_balance, 2),
+            "decision_threshold": round(float(dt), 4),
         })
         return cell
 
+    def _decision_threshold(self) -> float:
+        """当前生效的决策阈值（名单准入线）。
+
+        供逐格统计"该格有多少人真的会被触达"用 —— 见 _build_cell 里
+        关于「格内实际召回率 vs 全局召回率」的说明。
+        取不到时退回 0.5（与 _global_recall 的兜底一致）。
+        """
+        engine = risk_scoring._ensure_engine(self.db)
+        if not engine:
+            return 0.5
+        return float(engine.get("decision_threshold")
+                     or engine.get("optimal_threshold") or 0.5)
+
     def _global_recall(self, p_test, y_test) -> float:
         """全局运行阈值下的召回率。阈值取 risk-info 的 optimal_threshold 口径。"""
-        engine = risk_scoring._ensure_engine(self.db)
-        thr_run = engine["optimal_threshold"] if engine else 0.5
+        thr_run = self._decision_threshold()
         pred = (p_test >= thr_run).astype(int)
         tp = int(np.sum((pred == 1) & (y_test == 1)))
         fn = int(np.sum((pred == 0) & (y_test == 1)))

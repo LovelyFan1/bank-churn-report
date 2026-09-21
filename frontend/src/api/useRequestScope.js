@@ -38,6 +38,16 @@ export function useRequestScope() {
     isActive: () => active,
 
     /**
+     * 本作用域的 AbortSignal —— 供**不经 api 实例**的调用方使用。
+     *
+     * 典型用途：`pollTask(taskId, { signal: scope.signal })`。
+     * pollTask 是自实现的轮询循环，不走 api 实例的拦截器，需要自己接 signal。
+     */
+    get signal() {
+      return controller.signal
+    },
+
+    /**
      * 带 signal 的 GET。失败时抛出的错误已被标记取消的会被调用方忽略。
      * @param {string} url
      * @param {object} [config]

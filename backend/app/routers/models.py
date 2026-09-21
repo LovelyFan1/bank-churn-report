@@ -54,12 +54,21 @@ async def batch_score(top_n: int = Query(default=100, ge=1, le=1000)):
 # ═══════════════════════════════════════════════════════════
 
 @router.get("/risk-info")
-async def get_risk_info():
+async def get_risk_info(db: Session = Depends(get_db)):
     """当前风险分级标准 — 阈值 / 最优阈值 / 成本比。
 
     这是全系统分级口径的**唯一对外出口**：风险等级由 risk_scoring 的分位数
     边界（P95/P70/P35）决定，前端各页面必须读这里的值，不得自行写死阈值。
+
+    ⚠ 这里显式传 db 并调用 _ensure_engine，而不是只读缓存：
+      该接口此前没有 db 依赖，于是**永远不会**触发引擎构建，
+      只能依赖 main.py 启动时的预热线程。一旦预热失败（或该 worker 未被
+      覆盖），它会永久返回冷路径的占位阈值（旧实现是写死的 0.7/0.3/0.1，
+      与实测的 0.6796/0.2475/0.0682 相差最多 10 倍），而前端会把它当
+      真实分级标准展示。改为主动构建后，多 worker 下每个 worker 首次
+      请求都会把引擎准备好，不存在"永久冷"的 worker。
     """
+    risk_scoring._ensure_engine(db)      # 确保缓存就绪（幂等，命中缓存时零开销）
     return risk_scoring.get_risk_info()
 
 
