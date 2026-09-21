@@ -66,8 +66,12 @@
               </td>
             </tr>
             <template v-for="o in orders" :key="o.id">
-              <tr class="cursor-pointer" @click="toggleDetail(o)">
+              <tr class="cursor-pointer" :class="{ expanded: expandedId === o.id }" @click="toggleDetail(o)">
                 <td>
+                  <!-- 展开指示箭头 —— 此前**完全没有**视觉线索，面板只能靠
+                       "点整行任意位置"打开（实测行内 hasChevronOrIcon=false）。
+                       补上箭头并随展开旋转，让"这行可以点开"变得显然。 -->
+                  <span class="chev" :class="{ open: expandedId === o.id }">▸</span>
                   <div class="flex items-center gap-2.5">
                     <div class="w-9 h-9 rounded-lg flex items-center justify-center text-white font-bold text-sm flex-shrink-0" :style="{ background: riskColor(o.risk_level) }">
                       {{ o.customer_name?.charAt(0)?.toUpperCase() }}
@@ -95,10 +99,22 @@
                 <td class="tabular-nums text-emerald-400 text-xs">
                   {{ o.expected_value_snapshot != null ? fmtWan(o.expected_value_snapshot) : '—' }}
                 </td>
-                <td>
-                  <span class="status-tag" :class="o.status">
-                    <span class="status-dot" :class="o.status"></span>{{ statusLabel(o.status) }}
-                  </span>
+                <td @click.stop>
+                  <!-- 状态下拉：列表内直接切换，无需先展开详情。
+                       ⚠ 这是"状态无法调整"的主因修复 —— 原实现把状态按钮
+                       藏在详情面板里，而面板只能靠点整行触发、行上无任何提示。
+                       现在列表即可改，且终态（已完成/已流失）也能改回。 -->
+                  <select
+                    class="status-select"
+                    :class="o.status"
+                    :value="o.status"
+                    @change="changeStatus(o, $event.target.value)"
+                    :title="'工单状态：' + statusLabel(o.status)"
+                  >
+                    <option v-for="s in STATUS_OPTIONS" :key="s" :value="s">
+                      {{ statusLabel(s) }}
+                    </option>
+                  </select>
                 </td>
                 <td>{{ o.assignee || '—' }}</td>
                 <td class="text-gray-500 text-xs">{{ fmtDate(o.created_at) }}</td>
@@ -153,11 +169,26 @@
                         </dd>
                       </div>
                     </div>
-                    <div class="flex gap-2 mt-4">
-                      <button v-if="o.status === 'pending'" class="btn btn-sm" style="background:#1d4ed8;color:#fff" @click="changeStatus(o, 'in_progress')">▶ 开始处理</button>
-                      <button v-if="o.status === 'in_progress'" class="btn btn-sm" style="background:#065f46;color:#6ee7b7" @click="changeStatus(o, 'completed')">✓ 标记完成</button>
-                      <button v-if="o.status === 'in_progress'" class="btn btn-sm" style="background:#7f1d1d;color:#fca5a5" @click="changeStatus(o, 'lost')">✕ 标记流失</button>
-                      <button class="btn btn-outline btn-sm" @click="openEdit(o)">✎ 编辑</button>
+                    <div class="flex gap-2 mt-4 flex-wrap items-center">
+                      <!-- 快捷流转按钮：按当前状态给出"下一步"。
+                           ⚠ 终态（已完成/已流失）此前**没有任何按钮**，用户无法回退。
+                           现补「↩ 重新处理」，让误标记可以撤回（后端本就允许）。 -->
+                      <button v-if="o.status === 'pending'" class="btn btn-sm btn-status" style="background:#1d4ed8;color:#fff" @click="changeStatus(o, 'in_progress')">▶ 开始处理</button>
+                      <button v-if="o.status === 'in_progress'" class="btn btn-sm btn-status" style="background:#065f46;color:#6ee7b7" @click="changeStatus(o, 'completed')">✓ 标记完成</button>
+                      <button v-if="o.status === 'in_progress'" class="btn btn-sm btn-status" style="background:#7f1d1d;color:#fca5a5" @click="changeStatus(o, 'lost')">✕ 标记流失</button>
+                      <button v-if="o.status === 'completed' || o.status === 'lost'" class="btn btn-outline btn-sm btn-status" @click="changeStatus(o, 'in_progress')">↩ 重新处理</button>
+
+                      <!-- 完整状态下拉：任意状态可直接互转，不必按顺序点按钮 -->
+                      <select
+                        class="status-select ml-1"
+                        :class="o.status"
+                        :value="o.status"
+                        @change="changeStatus(o, $event.target.value)"
+                      >
+                        <option v-for="s in STATUS_OPTIONS" :key="s" :value="s">{{ statusLabel(s) }}</option>
+                      </select>
+
+                      <button class="btn btn-outline btn-sm btn-status" @click="openEdit(o)">✎ 编辑</button>
                     </div>
                   </div>
                 </td>
@@ -252,6 +283,33 @@
       </div>
     </div>
 
+    <!-- 状态变更确认弹窗 —— 结案与「从终态回退」都需二次确认。
+         用自绘弹窗而非 window.confirm：后者是同步阻塞的浏览器原生框，
+         样式与整站割裂，且无法标注"危险操作"的语义色。 -->
+    <div v-if="confirmDialog" class="modal-overlay" @click.self="confirmDialog = null">
+      <div class="modal" style="max-width: 420px">
+        <div class="modal-header">
+          <h2>{{ confirmDialog.title }}</h2>
+          <button class="modal-close" @click="confirmDialog = null">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="text-sm text-gray-400" style="line-height: 1.7">
+            {{ confirmDialog.body }}
+          </p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-outline" @click="confirmDialog = null">取消</button>
+          <button
+            class="btn btn-sm btn-status"
+            :style="confirmDialog.danger
+              ? 'background:#7f1d1d;color:#fca5a5'
+              : 'background:#1d4ed8;color:#fff'"
+            @click="runConfirm()"
+          >确认</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Toast -->
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
   </div>
@@ -321,6 +379,10 @@ function statusLabel(s) {
   const m = { pending: '待处理', in_progress: '处理中', completed: '已完成', lost: '已流失' }
   return m[s] || s
 }
+
+// 状态下拉的选项顺序 —— 按业务流转的自然顺序排列（而非字母序），
+// 让「待处理 → 处理中 → 已完成」的推进方向一目了然。
+const STATUS_OPTIONS = ['pending', 'in_progress', 'completed', 'lost']
 /**
  * 格式化后端返回的时间戳。
  *
@@ -398,6 +460,113 @@ function toggleDetail(o) {
   expandedId.value = expandedId.value === o.id ? null : o.id
 }
 
+// ── 状态流转 ────────────────────────────────────────
+//
+// 四个状态与其含义（后端 Pydantic 白名单，非法值 422）：
+//   pending      待处理 —— 新建工单的固定初始态
+//   in_progress  处理中
+//   completed    已完成（结案，客户留存）
+//   lost         已流失（结案，客户流失）
+//
+// ⚠ 后端**不校验流转路径**（实测 pending → completed 直接跳返回 200），
+//   因此"哪些流转合理"完全由前端把关，这里用 _STATUS_RULES 显式声明。
+//
+// 每条规则给出：是否需二次确认、确认文案、以及要写入的 result。
+// 需要确认的只有两类：
+//   1) 结案（completed / lost）—— 会写 completed_at，且 lost 意味着客户已流失
+//   2) 从终态回退 —— 会清掉 result / completed_at，属撤销操作
+const _STATUS_RULES = {
+  pending: {
+    // 回退到待处理：清空结案痕迹（否则会留下"处理中却带着完成时间"的脏数据）
+    confirm: (o) => (o.status === 'pending' ? null : {
+      title: '撤回为「待处理」？',
+      body: `工单 #${o.id} 将退回待处理，已记录的「处理结果」与「完成时间」会被清空。`,
+      danger: false,
+    }),
+    result: null,
+  },
+  in_progress: {
+    confirm: (o) => ((o.status === 'completed' || o.status === 'lost') ? {
+      title: '重新处理该工单？',
+      body: `工单 #${o.id} 将从「${statusLabel(o.status)}」退回处理中，已记录的「处理结果」与「完成时间」会被清空。`,
+      danger: false,
+    } : null),
+    result: null,
+  },
+  completed: {
+    confirm: (o) => (o.status === 'completed' ? null : {
+      title: '标记为「已完成」？',
+      body: `确认客户 ${o.customer_name}（${o.customer_id}）挽留成功？该操作会记录完成时间。`,
+      danger: false,
+    }),
+    result: 'retained',
+  },
+  lost: {
+    confirm: (o) => (o.status === 'lost' ? null : {
+      title: '标记为「已流失」？',
+      body: `确认客户 ${o.customer_name}（${o.customer_id}）已流失？该操作会记录完成时间且不可自动恢复。`,
+      danger: true,
+    }),
+    result: 'lost',
+  },
+}
+
+/** 待确认的状态变更（弹窗内容）；null 表示无弹窗 */
+const confirmDialog = ref(null)
+
+/** 执行确认弹窗中的操作，并关闭弹窗 */
+function runConfirm() {
+  const d = confirmDialog.value
+  confirmDialog.value = null
+  d?.onConfirm?.()
+}
+
+/**
+ * 状态变更入口 —— 列表下拉与详情按钮共用。
+ *
+ * @param o         工单对象
+ * @param newStatus 目标状态
+ * @param opts.skipConfirm 内部用：二次确认通过后递归调用时跳过确认
+ */
+async function changeStatus(o, newStatus, opts = {}) {
+  if (!newStatus || newStatus === o.status) return
+
+  const rule = _STATUS_RULES[newStatus]
+  if (!rule) return
+
+  // 未确认且该流转需要确认 → 弹窗，等用户点确认后再走
+  if (!opts.skipConfirm) {
+    const cfg = rule.confirm ? rule.confirm(o) : null
+    if (cfg) {
+      confirmDialog.value = {
+        ...cfg,
+        onConfirm: () => changeStatus(o, newStatus, { skipConfirm: true }),
+      }
+      return
+    }
+  }
+
+  // 乐观更新：下拉立即反映目标状态，失败时回滚（否则控件会显示假状态）
+  const prev = { status: o.status, result: o.result, completed_at: o.completed_at }
+  o.status = newStatus
+
+  try {
+    // result 显式传：后端仅在"未传"时才自动补，传 null 可清空结案痕迹。
+    // 实测后端行为：PUT {status:'in_progress'} 不会清掉旧的 result/completed_at，
+    // 所以回退时必须显式送 null，否则留下"处理中却已完成"的脏数据。
+    await api.put(`/work-orders/${o.id}`, {
+      status: newStatus,
+      result: rule.result,
+    })
+    showToast(`工单 #${o.id} 状态已更新为「${statusLabel(newStatus)}」`)
+    // 重新拉取：stats 计数与 result/completed_at 都变了，需以服务端为准
+    await Promise.all([fetchOrders(), fetchStats()])
+  } catch (e) {
+    Object.assign(o, prev)
+    showToast('状态更新失败：' + (e.response?.data?.detail || e.message))
+  }
+}
+
 function openCreate(preset) {
   editingId.value = null
   resetForm(preset)
@@ -473,18 +642,6 @@ async function submitOrder() {
     fetchStats()
   } catch (e) {
     showToast('操作失败: ' + (e.response?.data?.detail || e.message))
-  }
-}
-
-async function changeStatus(o, newStatus) {
-  try {
-    await api.put(`/work-orders/${o.id}`, { status: newStatus })
-    showToast(`工单状态已更新为「${statusLabel(newStatus)}」`)
-    expandedId.value = null
-    fetchOrders()
-    fetchStats()
-  } catch (e) {
-    showToast('操作失败')
   }
 }
 
@@ -594,6 +751,54 @@ tbody tr:hover { background: #f8fafc; }
 .status-dot.in_progress { background: #1d4ed8; }
 .status-dot.completed   { background: #0f766e; }
 .status-dot.lost        { background: #c81e1e; }
+
+/* ── 状态下拉（列表内直接改状态）─────────────────────
+   ⚠ 这是"建单后没法调状态"的主因修复：
+   原实现的三个状态按钮藏在详情面板里，而面板只能靠点整行打开、
+   行上毫无提示；且终态（已完成/已流失）连按钮都没有。
+   现在列表内即可切换任意状态。配色沿用原 status-tag 的四色，
+   保证"状态 → 颜色"的对应关系没有变化。 */
+.status-select {
+  appearance: none;
+  padding: 4px 22px 4px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'><path d='M2 4l3 3 3-3' fill='none' stroke='%236b7280' stroke-width='1.4' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 7px center;
+  transition: filter .15s;
+}
+.status-select:hover { filter: brightness(0.96); }
+.status-select:focus { outline: 2px solid #93c5fd; outline-offset: 1px; }
+
+.status-select.pending     { background-color: #fef9c3; color: #a16207; }
+.status-select.in_progress { background-color: #e8f0fe; color: #1d4ed8; }
+.status-select.completed   { background-color: #e0f2f1; color: #0f766e; }
+.status-select.lost        { background-color: #fde8e8; color: #c81e1e; }
+
+/* ── 行展开指示 ──────────────────────────────────────
+   此前行上**没有任何**可展开线索（实测 hasChevronOrIcon=false），
+   详情面板只能靠"点整行任意位置"这个隐性约定打开。 */
+.chev {
+  display: inline-block;
+  width: 14px;
+  color: #b6c2d4;
+  font-size: 11px;
+  transition: transform .18s ease, color .18s ease;
+  transform-origin: 50% 50%;
+}
+tbody tr:hover .chev { color: #1d4ed8; }
+.chev.open { transform: rotate(90deg); color: #1d4ed8; }
+
+/* 展开行与 hover 行的视觉强调 —— 让"哪些行可以点开"变得显然 */
+tbody tr.cursor-pointer:hover { background: #f8fafc; }
+tbody tr.expanded { background: #f1f5f9; }
+
+/* 详情面板内的操作按钮加大，便于点击（原 12px/32px 偏小） */
+.btn-status { font-size: 13px; padding: 7px 14px; }
 
 /* ── Detail Panel ── */
 .detail-panel {

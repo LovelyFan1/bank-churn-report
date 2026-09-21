@@ -266,14 +266,31 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate, db: Session = 
     update_data = body.model_dump(exclude_unset=True)
 
     # 状态流转时自动处理 result 和 completed_at
+    #
+    # ⚠ 这里必须处理「回退」这一支，否则会留下**自相矛盾的脏数据**。
+    #   实测（修复前）：PUT {status:'in_progress'} 到一条 completed 工单上，
+    #   返回 200 且 status 变成 in_progress，但 result 仍是 'retained'、
+    #   completed_at 仍带着旧时间戳 —— 一条"处理中却已记录完成时间与结果"的工单。
+    #   后果：按 result 聚合的挽留效果报表会把它算成"已挽回"，
+    #   而客户名单/工单列表显示它还在处理中。两个页面互相打架。
+    #
+    #   规则：状态离开结案态（completed / lost）时，结案痕迹必须一并清除。
+    #   注：WorkOrderUpdate 不含 completed_at 字段，故它不会被请求携带，
+    #   回退时直接置 None 即可；result 则可能被显式传入（前端会传 null 来清空），
+    #   因此仅在请求**未提供** result 时才由后端补默认值。
     if "status" in update_data:
         new_status = update_data["status"]
-        if new_status == "completed" and not update_data.get("result"):
-            update_data["result"] = "retained"
-        if new_status == "lost" and not update_data.get("result"):
-            update_data["result"] = "lost"
+
         if new_status in ("completed", "lost"):
+            # 结案：result 缺省时按状态补（completed→retained，lost→lost）
+            if not update_data.get("result"):
+                update_data["result"] = "retained" if new_status == "completed" else "lost"
             update_data["completed_at"] = datetime.now(timezone.utc)
+        else:
+            # 非结案态（pending / in_progress）：清除结案痕迹
+            if "result" not in update_data:
+                update_data["result"] = None
+            update_data["completed_at"] = None
 
     # 人工调整 risk_level 时，同步刷新分级依据快照与**动作** ——
     # 否则会出现「等级是新的、依据是旧的」这种更隐蔽的不一致。
