@@ -23,6 +23,7 @@ import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import api from '../api'
 import InfoTip from '../components/InfoTip.vue'
 import { AGENT_KEY_PREFIX, KEY_USER, agentKeyFor } from '../utils/userStorage'
+import { assignees as staffList, canAssign, loadAssignees, defaultAssignee } from '../utils/assignees'
 
 /**
  * 会话持久化 —— 用户要求「切换窗口时会话不消失」。
@@ -191,6 +192,10 @@ onMounted(async () => {
     caps.value = data
   } catch (_) { /* 能力清单取不到不影响对话 */ }
 
+  // 行员名单 —— 建单确认面板的负责人下拉需要它。
+  // 失败会被 loadAssignees 吞掉并降级为只读，不阻断对话。
+  loadAssignees()
+
   await scrollToEnd()
 })
 
@@ -345,7 +350,11 @@ function openBatch(turn, action) {
     kind: 'create',
     targets: [...(action.targets || [])],
     blocked: action.blocked || [],
-    assignee: '',
+    // ⚠ 预填当前登录人，不再留空。
+    //   后端建单已要求负责人必填，留空会让整批被拒；
+    //   而"我让 Agent 建的单默认我跟"也是最自然的默认值。
+    //   用户要转给别人，从下拉里换即可。
+    assignee: defaultAssignee(),
     running: false,
     result: null,
     error: '',
@@ -713,8 +722,15 @@ function warnClass(level) {
                   已自动排除（已有进行中工单）：{{ t.batch.blocked.join('、') }}
                 </p>
                 <div class="batch-assignee">
-                  <label>负责人（可选，留空则不指派）</label>
-                  <input v-model="t.batch.assignee" placeholder="例如 张思远" />
+                  <label>负责人（必选，默认派给发起人）</label>
+                  <!-- 与页面建单同一份行员名单、同一接口 —— 三处入口行为一致 -->
+                  <select v-if="canAssign && staffList.length" v-model="t.batch.assignee">
+                    <option value="" disabled>请选择负责人</option>
+                    <option v-for="a in staffList" :key="a.username" :value="a.username">
+                      {{ a.display_name }}（{{ a.role_label }}）
+                    </option>
+                  </select>
+                  <input v-else v-model="t.batch.assignee" readonly />
                 </div>
               </template>
 

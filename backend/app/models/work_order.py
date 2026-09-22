@@ -17,7 +17,25 @@ class WorkOrder(Base):
     strategy = Column(String)                       # 建议策略
     status = Column(String, default="pending")      # pending / in_progress / completed / lost
     result = Column(String)                         # retained / lost / null
-    assignee = Column(String)                       # 负责人
+    # ── 两个人、两个字段（此前挤在一个 assignee 里）──────
+    #
+    # ⚠ 银行工单里"谁建的"与"谁办的"是**两个不同的岗位**：
+    #     经理建单并派单（决定联系谁、交给谁）
+    #     专员办单并回填结果（执行触达）
+    #   原先只有一个 assignee，两种语义混在一起，导致：
+    #     · 建单人自己是谁，系统不知道（只能手打，批量建单干脆没这个框）
+    #     · "我的工单"无法实现（专员无法按自己筛选）
+    #
+    # created_by 由**服务端从会话取**，不接受前端传入 —— 与审计同一原则：
+    #   写操作的"操作者"若由客户端声称，就等于可伪造。
+    created_by = Column(String, index=True)         # 建单人**行员号**（非姓名）
+    # 负责人**行员号**。存工号而非姓名，理由见 models/user.py 的 username 注释：
+    #   姓名会遇上同名/改名，且无法与账号关联 —— 而"我的工单"必须靠关联。
+    # ⚠ 历史数据（本列改造前播种的 60 条）里存的是**自由文本姓名**，
+    #   其中 34 条对应的人并不存在（seed_work_orders.py 的硬编码名单）。
+    #   兼容策略：解析得到就显示姓名，解析不到原样显示并标注"历史数据"。
+    #   不伪造、不清洗 —— 审计要的是"当时是什么"。
+    assignee = Column(String, index=True)
     note = Column(Text)                             # 备注
 
     # ── 分级依据快照 ─────────────────────────────────

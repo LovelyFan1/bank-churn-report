@@ -31,7 +31,10 @@
         <span class="flex-1"></span>
         <select v-model="assigneeFilter" class="select" @change="onFilterChange">
           <option value="">全部负责人</option>
-          <option v-for="a in assignees" :key="a" :value="a">{{ a }}</option>
+          <!-- ⚠ value 保持**数据库里的原值**（可能是工号，也可能是历史姓名），
+               只把显示文本映射成姓名 —— 若把 value 也换成工号，
+               历史工单（存姓名）就筛不出来了。 -->
+          <option v-for="a in stats.assignees" :key="a" :value="a">{{ assigneeName(a) }}</option>
         </select>
         <input
           v-model="searchText"
@@ -134,11 +137,21 @@
                     </option>
                   </select>
                 </td>
-                <td>{{ o.assignee || '—' }}</td>
+                <!-- 负责人：取值是工号，显示成姓名。
+                     解析不到的（历史工单里的旧姓名/已停用账号）原样显示，
+                     并标注出来 —— 否则会让人以为"下拉里怎么没这个人"是 bug。 -->
+                <td>
+                  <span>{{ displayAssignee(o.assignee).text }}</span>
+                  <span v-if="displayAssignee(o.assignee).legacy"
+                        class="legacy-tag" title="该负责人不在当前行员名单中（历史数据或已停用账号）">历史</span>
+                </td>
                 <td class="text-gray-500 text-xs">{{ fmtDate(o.created_at) }}</td>
                 <td v-if="!masked" @click.stop>
                   <button class="btn btn-outline btn-xs" @click="openEdit(o)">✎</button>
-                  <button class="btn btn-outline btn-xs ml-1" @click="deleteOrder(o)">✕</button>
+                  <!-- ⚠ 删除仅 order:write（经理及以上）可见。专员没有该权限，
+                       显示了也只会得到 403 —— 不如不显示。 -->
+                  <button v-if="canAssign" class="btn btn-outline btn-xs ml-1"
+                          @click="deleteOrder(o)">✕</button>
                 </td>
               </tr>
               <!-- Detail Panel -->
@@ -150,6 +163,24 @@
                       <div v-if="!masked"><dt>风险因素</dt><dd><span v-for="f in o.risk_factors" :key="f" class="risk-tag">{{ f }}</span></dd></div>
                       <div v-if="!masked"><dt>推荐策略</dt><dd class="text-indigo-300">{{ o.strategy || '—' }}</dd></div>
                       <div v-if="!masked"><dt>备注</dt><dd class="text-gray-400">{{ o.note || '—' }}</dd></div>
+                      <!-- ── 建单人 / 负责人 ──────────────────────
+                           这两个此前**详情面板里完全没有**（列表有负责人列、
+                           详情却没有），用户点开一张单看不到"谁建的、谁负责"。
+                           建单人是工号，由服务端从会话取；老工单为 NULL ——
+                           如实显示"建单人不明"，不编造。 -->
+                      <div><dt>建单人</dt>
+                        <dd>
+                          {{ o.created_by ? assigneeName(o.created_by) : '' }}
+                          <span v-if="!o.created_by" class="text-gray-600">建单人不明（历史数据，快照字段上线前创建）</span>
+                        </dd>
+                      </div>
+                      <div><dt>负责人</dt>
+                        <dd>
+                          {{ displayAssignee(o.assignee).text }}
+                          <span v-if="displayAssignee(o.assignee).legacy"
+                                class="legacy-tag" title="不在当前行员名单中">历史</span>
+                        </dd>
+                      </div>
                       <div><dt>处理结果</dt><dd>{{ o.result === 'retained' ? '✅ 已挽留' : o.result === 'lost' ? '❌ 已流失' : '—' }}</dd></div>
                       <div><dt>更新时间</dt><dd class="text-gray-400">{{ fmtDate(o.updated_at) }}</dd></div>
                       <div><dt>完成时间</dt><dd class="text-gray-400">{{ fmtDate(o.completed_at) || '—' }}</dd></div>
@@ -282,8 +313,17 @@
               <input :value="(form.risk_factors || []).join(', ')" readonly class="readonly" />
             </div>
             <div class="form-group">
-              <label>负责人</label>
-              <input v-model="form.assignee" placeholder="输入负责人姓名" />
+              <label>负责人 <span class="text-red-400">*</span></label>
+              <!-- 下拉选人（取值=工号）。与客户管理页同一份名单、同一接口，
+                   避免两处各写一套导致"这里能选、那里选不到"。 -->
+              <select v-if="canAssign && staffList.length" v-model="form.assignee">
+                <option value="" disabled>请选择负责人</option>
+                <option v-for="a in staffList" :key="a.username" :value="a.username">
+                  {{ a.display_name }}（{{ a.role_label }}）
+                </option>
+              </select>
+              <input v-else :value="assigneeName(form.assignee)" readonly class="readonly"
+                     title="行员名单不可用" />
             </div>
             <div class="form-group" style="grid-column: 1 / -1">
               <label>推荐策略</label>
@@ -388,6 +428,14 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import api from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, riskColor, probColor, fmtPercent, valueTierLabel, channelLabel, fmtWan } from '../utils/risk'
+// ⚠ 别名导入：本页已有一个 `assignees`（"按负责人筛选"下拉的**实际取值**列表，
+//   来自 /work-orders/stats，可能含历史姓名）。这里要的是**可选行员**列表
+//   （来自 /api/users/assignable，取值是工号）—— 两者用途不同，不能合并：
+//   前者用于筛选已有工单，后者用于新建/改派时选人。
+import {
+  assignees as staffList, canAssign, loadAssignees,
+  defaultAssignee, assigneeName, displayAssignee,
+} from '../utils/assignees'
 
 // 页面级请求作用域：本页有 4 处 GET（列表/统计/进行中客户），
 // 卸载时取消，避免占着浏览器同域连接槽拖慢下一页。
@@ -401,12 +449,13 @@ const orders = ref([])
 // ⚠ 由后端下发，前端不自己判角色 —— 权限口径只有一处来源。
 const masked = ref(false)
 const maskNotice = ref('')
-const stats = reactive({ total: 0, pending: 0, in_progress: 0, completed: 0, lost: 0 })
+const stats = reactive({ total: 0, pending: 0, in_progress: 0, completed: 0, lost: 0, assignees: [], scoped_to_me: false })
 const currentFilter = ref('all')
 const searchText = ref('')
-// 按负责人筛选 —— 组长看「小李手上有多少单」用得到
+// 按负责人筛选 —— 组长看「小李手上有多少单」用得到。
+// 取值列表直接放在 stats 里（fetchStats 的 Object.assign 会带进来），
+// 不再单开一个 ref —— 两份状态容易出现"筛选下拉有、别处没有"的不一致。
 const assigneeFilter = ref('')
-const assignees = ref([])
 const page = ref(1)
 const totalPages = ref(1)
 const expandedId = ref(null)
@@ -534,11 +583,19 @@ async function regenNote() {
 }
 
 // ── Computed ────────────────────────────────────────
+// ⚠ 专员（staff）看到的数字**只是指派给自己的**（后端已按可见范围过滤）。
+//   若仍写"全部工单"，他会以为系统里只有这 21 张 —— 与实际的 60 张对不上。
+//   故标签随范围变化，如实说明。
 const statsCards = computed(() => [
   // ⚠ 卡片背景是白卡（style.css 的 .glass-card），故"总量"数字不能用
   //   浅色（原为 #e2e8f0，在白底上几乎不可见）。改用主色 #17335c，
   //   既保证可读，又与下方彩色分解项形成"总量 vs 分类"的层级。
-  { key: 'all', label: '全部工单', value: stats.total, color: '#17335c' },
+  {
+    key: 'all',
+    label: stats.scoped_to_me ? '我的工单' : '全部工单',
+    value: stats.total,
+    color: '#17335c',
+  },
   { key: 'pending', label: '⏳ 待处理', value: stats.pending, color: '#fbbf24' },
   { key: 'in_progress', label: '🔄 处理中', value: stats.in_progress, color: '#60a5fa' },
   { key: 'completed', label: '✅ 已完成', value: stats.completed, color: '#34d399' },
@@ -787,7 +844,8 @@ function resetForm(preset) {
     balance: preset?.balance || 0,
     risk_factors: preset?.risk_factors || [],
     strategy: preset?.strategy || '',
-    assignee: '',
+    // 预填当前登录人（派给自己），不再留空 —— 见 CustomerManagement.openCreate 的说明
+    assignee: defaultAssignee(),
     note: '',
     thresholds_snapshot: preset?.thresholds_snapshot || null,
     model_used: preset?.model_used || null,
@@ -873,8 +931,8 @@ async function doDeleteOrder(id) {
 async function fetchStats() {
   try {
     const { data } = await scope.get('/work-orders/stats')
+    // data 含 total/pending/.../assignees/scoped_to_me，一次并入
     Object.assign(stats, data)
-    assignees.value = data.assignees || []
   } catch (_) {}
 }
 
@@ -902,7 +960,9 @@ function showToast(msg) {
 
 // ── Lifecycle ───────────────────────────────────────
 onMounted(async () => {
-  await Promise.all([fetchStats(), fetchOrders()])
+  // 行员名单与工单数据并发拉取：名单用于新建/改派时选人，
+  // 也是把工单里的工号渲染成姓名的依据 —— 晚到会让列表先显示工号再跳成姓名。
+  await Promise.all([fetchStats(), fetchOrders(), loadAssignees()])
   loading.value = false
 })
 
@@ -1066,6 +1126,14 @@ tbody tr.expanded { background: #f1f5f9; }
 .st-completed { color: #15803d; }
 .st-lost { color: #9aa7bd; }
 .detail-panel dt { font-size: 11px; color: #9aa7bd; margin-bottom: 2px; }
+/* 历史负责人标记 —— 该取值不在当前行员名单里（旧姓名或已停用账号）。
+   标注出来是为了区分"数据问题"与"界面 bug"，不是错误提示。 */
+.legacy-tag {
+  display: inline-block; margin-left: 5px;
+  font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0;
+  cursor: help;
+}
 .detail-panel dd { font-size: 13px; color: #374151; }
 
 /* ── Modal ── */

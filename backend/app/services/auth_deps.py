@@ -140,6 +140,27 @@ def require_perm(perm: str):
     return _dep
 
 
+def require_any_perm(*perms: str):
+    """生成一个「命中任一权限即可」的依赖。
+
+    ⚠ 为什么需要它（而不是给接口挂两个 require_perm）：
+      工单更新有两种合法主体 —— 经理（order:write，可改任意单、任意字段）
+      与专员（order:assigned，只能改自己单的状态/结果/备注）。
+      挂两个 require_perm 是「且」的关系，会把两种人都挡在外面。
+      而「谁受字段与归属限制」无法用权限点表达，故此处只做入口放行，
+      细分限制由调用方（work_orders._assert_can_touch / 字段白名单）完成。
+    """
+    def _dep(user: User = Depends(current_user)) -> User:
+        if not any(auth.has_perm(user.role, p) for p in perms):
+            raise HTTPException(
+                status_code=403,
+                detail=f"当前角色（{auth.ROLE_LABELS.get(user.role, user.role)}）"
+                       f"无权执行此操作",
+            )
+        return user
+    return _dep
+
+
 # ══════════════════════════════════════════════════════════
 # 审计
 # ══════════════════════════════════════════════════════════

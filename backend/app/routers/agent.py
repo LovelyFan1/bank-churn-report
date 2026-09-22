@@ -190,9 +190,28 @@ async def agent_confirm(payload: dict, request: Request,
     db = SessionLocal()
     try:
         if action == "create_work_order":
-            # 复用既有建单逻辑（含 409 互斥、渠道覆盖校验、快照补齐），
+            # ── 负责人兜底：Agent 抽出的人未必有效 ──────────────
+            #
+            # ⚠ 实测背景：assignee 原先是 LLM 从用户话里抽的自由文本，
+            #   用户没指定时它会**编一个名字**（如"张经理"），
+            #   而库里根本没有这个人 —— 派单派给了查无此人。
+            #
+            #   现在后端建单会校验取值有效性（见 work_orders._is_valid_assignee），
+            #   故这里必须兜底：**抽不到有效的人，就派给当前登录人**。
+            #   这是合理的默认 —— 谁让 Agent 建的，就默认谁跟进；
+            #   页面入口也是这个默认值，两个入口行为一致。
+            #
+            #   注意：不在这里抛错。用户在对话里说"帮我建个单"却没提负责人
+            #   是很自然的表达，不该被拒；把它派给发起人并如实显示即可。
+            body = dict(body)
+            cand = str(body.get("assignee") or "").strip()
+            if not cand:
+                body["assignee"] = user.username
+            # 复用既有建单逻辑（含负责人校验、409 互斥、渠道覆盖校验、快照补齐），
             # 不另写一套 —— 否则 Agent 建的工单与页面建的会有口径差异
-            created = await create_work_order(WorkOrderCreate(**body), db=db)
+            # ⚠ 传 request 是为了让建单逻辑里的审计能记到真实客户端 IP
+            created = await create_work_order(
+                WorkOrderCreate(**body), request, user=user, db=db)
             auth_deps.write_audit(
                 db, user=user, action="create_work_order",
                 target=str(created.get("customer_id") or ""),
@@ -211,7 +230,8 @@ async def agent_confirm(payload: dict, request: Request,
             if not fields:
                 raise HTTPException(status_code=422,
                                     detail="update_work_order 至少需要 status/assignee/note 之一")
-            updated = await update_work_order(oid, WorkOrderUpdate(**fields), db=db)
+            updated = await update_work_order(
+                oid, WorkOrderUpdate(**fields), request, user=user, db=db)
             auth_deps.write_audit(
                 db, user=user, action="update_work_order",
                 target=f"#{oid}",
@@ -227,13 +247,13 @@ async def agent_confirm(payload: dict, request: Request,
         # ⚠ 删前先取快照 —— 删掉之后就无法向用户交代"删的是哪一张"
         before = None
         try:
-            detail = await get_work_order(oid, db=db)
+            detail = await get_work_order(oid, user=user, db=db)
             before = {"customer_id": detail.get("customer_id"),
                       "customer_name": detail.get("customer_name"),
                       "status": detail.get("status")}
         except HTTPException:
             pass
-        await delete_work_order(oid, db=db)
+        await delete_work_order(oid, request, user=user, db=db)
         auth_deps.write_audit(
             db, user=user, action="delete_work_order", target=f"#{oid}",
             detail={"order_id": oid, "deleted_order": before, "via": "agent"},
@@ -358,14 +378,24 @@ async def agent_confirm_batch(body: BatchConfirmRequest, request: Request,
                 "balance": detail.get("balance"),
                 "risk_factors": detail.get("risk_factors") or [],
                 "strategy": detail.get("action") or detail.get("strategy") or "",
-                "assignee": body.assignee or "",
+                # ⚠ 与单建路径同一兜底：用户没指定负责人时默认派给**发起人**。
+                #   不这样做的后果（实测逻辑推演）：assignee="" 会被
+                #   create_work_order 的必填校验拒掉，整批全部失败 ——
+                #   而用户在对话里只说"帮这几个人建单"是很自然的表达。
+                "assignee": (body.assignee or "").strip() or user.username,
                 "note": suggested,
                 "channel": detail.get("channel"),
                 "value_tier_snapshot": detail.get("value_tier"),
                 "expected_value_snapshot": detail.get("expected_value"),
             }
             try:
-                created = await create_work_order(WorkOrderCreate(**payload), db=db)
+                # ⚠ 必须与 create_work_order 的签名一致（body, request, user, db）。
+                #   漏掉 request/user 时 Python **导入阶段不报错**，
+                #   只在真正调用时抛 TypeError —— 表现为 Agent 批量建单整条崩掉，
+                #   而静态检查与模块导入都看不出问题（本缺陷即由签名一致性
+                #   检查脚本发现，非人工阅读）。
+                created = await create_work_order(
+                    WorkOrderCreate(**payload), request, user=user, db=db)
                 ok_list.append({
                     "id": created.get("id"),
                     "customer_id": created.get("customer_id"),

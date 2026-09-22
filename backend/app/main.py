@@ -15,6 +15,7 @@ from app.services.data_generator import get_data_generator
 from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers, portfolio
 from app.routers import agent as agent_router
 from app.routers import auth as auth_router
+from app.routers import users as users_router
 
 # 导入模型模块以确保建表时被注册（Base.metadata 只认识已导入的模型）
 from app.models import user as _user_model  # noqa: F401
@@ -57,6 +58,7 @@ app.include_router(customers.router)   # /api/customers/*
 app.include_router(portfolio.router)   # /api/portfolio/* — 价值层 × 风险等级矩阵
 app.include_router(agent_router.router)  # /api/agent/* — 对话式任务型 Agent
 app.include_router(auth_router.router)   # /api/auth/* — 内部登录（4A 仿真）
+app.include_router(users_router.router)  # /api/users/* — 可指派负责人列表（派单）
 
 # 允许查询的字段列表
 ALLOWED_FIELDS = [

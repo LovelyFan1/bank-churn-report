@@ -27,10 +27,11 @@ from app.database import Base
 
 # 角色常量 —— 与前端 auth store 的 ROLE_LABELS 对应
 ROLE_ADMIN = "admin"          # 系统管理员：全部权限，含用户管理与审计查看
-ROLE_MANAGER = "manager"      # 客户经理：查数据 + 办工单（日常业务角色）
+ROLE_MANAGER = "manager"      # 客户经理：查数据 + 建单 + 派单（日常业务角色）
+ROLE_STAFF = "staff"          # 客户专员：只处理**指派给自己**的工单（执行岗）
 ROLE_VIEWER = "viewer"        # 只读分析：只能看，不能建/改/删工单
 
-ROLES = (ROLE_ADMIN, ROLE_MANAGER, ROLE_VIEWER)
+ROLES = (ROLE_ADMIN, ROLE_MANAGER, ROLE_STAFF, ROLE_VIEWER)
 
 
 class User(Base):

@@ -318,7 +318,16 @@ PERM_VIEW = "data:view"            # 查看客户/工单/分析（聚合视图�
 #   故 viewer 只给 data:view；缺本权限时后端**脱敏**（见 privacy.py），
 #   前端连字段都收不到，不是"藏起来"。
 PERM_CUSTOMER_IDENTIFY = "customer:identify"
-PERM_ORDER_WRITE = "order:write"   # 建单/改单/删单
+PERM_ORDER_WRITE = "order:write"   # 建单 / 改任意单 / 删单（派单方）
+# 处理**指派给自己**的工单 —— 只能改状态/结果/备注，不能建单、不能删单、
+# 更不能碰别人的单。
+#
+# ⚠ 为什么不复用 order:write：两者是银行业务里**两个岗位**的能力。
+#   经理决定"该联系谁、交给谁"，助理只执行"联系并回填结果"。
+#   若给助理 order:write，他就能批量建单、删单、改别人的单 ——
+#   等于把派单权一并给了他，职责分离（SoD）就没了。
+#   数据级限制（只能碰自己的单）无法用权限点表达，故在 router 里判。
+PERM_ORDER_ASSIGNED = "order:assigned"
 PERM_AGENT_USE = "agent:use"       # 使用智能助手
 PERM_USER_ADMIN = "user:admin"     # 用户管理
 PERM_AUDIT_VIEW = "audit:view"     # 查看审计日志
@@ -331,10 +340,20 @@ PERM_MODEL_TRAIN = "model:train"
 
 PERMISSIONS = {
     "admin": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_WRITE,
-              PERM_AGENT_USE, PERM_USER_ADMIN, PERM_AUDIT_VIEW,
-              PERM_MODEL_TRAIN],
+              PERM_ORDER_ASSIGNED, PERM_AGENT_USE, PERM_USER_ADMIN,
+              PERM_AUDIT_VIEW, PERM_MODEL_TRAIN],
     "manager": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_WRITE,
-                PERM_AGENT_USE],
+                PERM_ORDER_ASSIGNED, PERM_AGENT_USE],
+    # staff —— 基层执行岗（柜员 / 外呼专员 / 客户经理助理）。
+    #
+    # ⚠ 关键设计：给 `customer:identify`（看得到客户姓名与余额）但**不给**
+    #   `order:write`（不能建单、删单、改别人的单）。
+    #
+    #   为什么必须给 identify：他要给客户打电话，看不到姓名和余额就没法工作。
+    #   为什么不能给 write：派单权在经理手里，给了就破坏职责分离。
+    #   他能做的只有一件 —— 推进**指派给自己**的工单，故给 order:assigned，
+    #   并在 work_orders 路由里用 `_assert_can_touch()` 做数据级限制。
+    "staff": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_ASSIGNED],
     # viewer 只有聚合视图权限 —— 看得到"分布与趋势"，看不到"具体是谁"
     "viewer": [PERM_VIEW],
 }
@@ -342,6 +361,7 @@ PERMISSIONS = {
 ROLE_LABELS = {
     "admin": "系统管理员",
     "manager": "客户经理",
+    "staff": "客户专员",
     "viewer": "只读分析",
 }
 

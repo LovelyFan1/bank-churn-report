@@ -20,6 +20,12 @@ import {
   KEY_TOKEN, KEY_USER,
   clearAuthStorage as _clearAuth,
 } from '../utils/userStorage'
+// ⚠ 行员名单也要在登出时清掉。
+//   它是**模块级单例**（见 utils/assignees.js），不随组件卸载而重置 ——
+//   若不清，甲登出、乙登录后会看到甲的名单（且 can_assign 可能仍是甲的值），
+//   表现为"权限判断用了上一个人的身份"，属安全问题而不仅是显示问题。
+//   注意：这里清的是**内存缓存**，不是用户数据（与对话历史不同，无需保留）。
+import { resetAssignees } from '../utils/assignees'
 
 const TOKEN_KEY = KEY_TOKEN
 const USER_KEY = KEY_USER
@@ -106,6 +112,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function logout() {
     try { await api.post('/auth/logout') } catch (_) { /* 登出失败也要清本地 */ }
     _clearAuth()
+    resetAssignees()
     token.value = ''
     user.value = null
   }
@@ -113,6 +120,7 @@ export const useAuthStore = defineStore('auth', () => {
   /** 清除本地身份（令牌失效 / 会话超时时调用，不发登出请求） */
   function clear() {
     _clearAuth()
+    resetAssignees()
     token.value = ''
     user.value = null
   }

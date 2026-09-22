@@ -1,7 +1,7 @@
 """工单管理 Pydantic Schemas"""
 
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ── 创建工单 ───────────────────────────────────────────
@@ -54,6 +54,36 @@ class WorkOrderCreate(BaseModel):
         if v not in allowed:
             raise ValueError(f"channel must be one of {allowed}")
         return v
+
+
+# ── 批量建单 ───────────────────────────────────────────
+#
+# ⚠ 为什么批量建单要有独立 schema，而不是让前端循环调 POST /work-orders：
+#   1) **每条可以有不同负责人与理由**（经理逐个分配）。前端循环也能做到，
+#      但失败信息要前端自己拼，容易出现"三条成功一条失败但提示含糊"。
+#   2) **一次事务、一次审计** —— 循环调接口会在审计表里留 N 条记录，
+#      而用户的心理模型是"我做了一次批量操作"。
+#   3) 服务端统一做互斥检查（已有进行中工单的人提前标出），
+#      而不是等 409 再回头解释。
+
+class BatchOrderItem(BaseModel):
+    """批量建单中**单条**的指派信息。
+
+    ⚠ 这里刻意**只放"人写的部分"**（负责人 / 理由），不放客户画像字段。
+      画像（姓名/余额/风险等级/价值层）一律由**服务端按 customer_id
+      重新查库**得到 —— 否则前端可以传一个与库里不符的余额，
+      而工单里的快照会被当成"建单时的真实依据"永久留存。
+      这类"客户端声称的事实"是不可信的（与 created_by 同一原则）。
+    """
+    customer_id: str = Field(min_length=1, max_length=32)
+    assignee: str = Field(default="", max_length=64,
+                          description="负责人（工号或姓名）；留空则由服务端取当前登录人")
+    note: str = Field(default="", max_length=2000,
+                      description="建单理由；留空则由服务端生成建议理由")
+
+
+class WorkOrderBatchCreate(BaseModel):
+    items: list[BatchOrderItem] = Field(min_length=1, max_length=50)
 
 
 # ── 更新工单 ───────────────────────────────────────────

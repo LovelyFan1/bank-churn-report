@@ -10,13 +10,21 @@ const collapsed = ref(false)
 const idleWarn = ref(false)         // 即将因无操作退出
 
 // ── 一级导航：业务工作流（看大盘 → 找客户 → 办工单 → 定策略 → 智能助手）──
+//
+// ⚠ 智能助手带 permission: 'agent:use' —— 客户专员（staff）没有该权限，
+//   导航里必须过滤掉。否则他点进去会被后端 403，界面表现为"页面能开、
+//   一发消息就报错"，比直接不显示更让人困惑。
 const navItems = [
   { path: '/dashboard', title: '工作台', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4' },
   { path: '/customers', title: '客户名单', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
   { path: '/work-orders', title: '挽留工单', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
   { path: '/intervention', title: '干预策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
-  { path: '/assistant', title: '智能助手', badge: 'Beta', icon: 'M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-4 4v-4z' },
+  { path: '/assistant', title: '智能助手', badge: 'Beta', permission: 'agent:use', icon: 'M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-4 4v-4z' },
 ]
+
+// 一级导航同样按权限过滤（与下方 visibleAdmin 同一判据）
+const visibleNav = computed(() =>
+  navItems.filter(it => !it.permission || auth.can(it.permission)))
 
 // ── 二级导航：系统管理（技术与分析工具，非日常业务入口）──
 // 审计项带 permission —— 非管理员会被过滤掉（见 visibleAdmin）
@@ -153,7 +161,7 @@ function stayActive() {
       <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
         <!-- 一级：业务工作流 -->
         <div
-          v-for="item in navItems"
+          v-for="item in visibleNav"
           :key="item.path"
           @click="navigateTo(item.path)"
           :class="[

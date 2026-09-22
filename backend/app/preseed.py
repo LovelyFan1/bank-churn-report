@@ -45,11 +45,19 @@ from app.services import data_source
 #   模型类。若把 import 放到 main() 内部（create_all 之后），users 表不会
 #   被建 —— 实测报 `no such table: users`，且播种在每个 worker 里各失败一次。
 from app.models import user as _user_model  # noqa: F401
+from app.models import work_order as _wo_model  # noqa: F401
+from app.migrate import run_migrations
 
 
 def main() -> int:
-    """建表 + 播种（幂等）。成功返回 0，失败返回 1。"""
+    """建表 + 补列 + 播种（幂等）。成功返回 0，失败返回 1。"""
     Base.metadata.create_all(bind=engine)
+
+    # ⚠ 补列必须紧接 create_all，且早于任何 ORM 查询：
+    #   create_all 只建新表，**不会**给已有表加列。缺这一步的话，
+    #   老库上任何 SELECT created_by 都会 500（报 no such column），
+    #   而错误信息不会提示"缺迁移"。
+    run_migrations(engine)
 
     db = SessionLocal()
     try:
@@ -70,14 +78,14 @@ def main() -> int:
         from app.services.user_seed import seed_users
         uinfo = seed_users(db)
         if uinfo.get("seeded"):
-            print(f"[preseed] 已播种演示账号 {uinfo['created']} 个", flush=True)
+            print(f"[preseed] 已补齐演示账号 {uinfo['created']} 个"
+                  f"（现有共 {uinfo.get('total')} 个）", flush=True)
             # ⚠ 把 TOTP 密钥打出来供演示绑定。这是**演示系统**的刻意选择：
             #   真银行由 UKey/APP 自行绑定，密钥绝不落日志。
             for name, secret in (uinfo.get("totp") or {}).items():
                 print(f"[preseed]   TOTP {name}: {secret}", flush=True)
         else:
-            print(f"[preseed] {uinfo.get('reason')}，现有 {uinfo.get('existing')} 个账号",
-                  flush=True)
+            print(f"[preseed] 演示账号已是最新，共 {uinfo.get('existing')} 个", flush=True)
 
         return 0
     except Exception as e:

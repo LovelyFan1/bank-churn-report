@@ -70,7 +70,10 @@ const routes = [
     path: '/assistant',
     name: 'Assistant',
     component: () => import('../views/Assistant.vue'),
-    meta: { title: '智能助手', icon: 'assistant', badge: 'Beta' }
+    // ⚠ permission 与后端一致：staff（客户专员）没有 agent:use，
+    //   直接输网址进来会被守卫弹回工作台 —— 否则页面能打开、
+    //   一发消息就 403，比明确拒绝更让人困惑。
+    meta: { title: '智能助手', icon: 'assistant', badge: 'Beta', permission: 'agent:use' }
   },
   {
     // 操作审计 —— 4A 的 Audit 环节。仅管理员可见（见下方守卫）。

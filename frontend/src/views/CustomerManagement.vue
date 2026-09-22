@@ -100,12 +100,12 @@
       <div v-if="selected.size" class="batch-bar">
         <span class="text-sm text-gray-300">已选 <b class="text-white">{{ selected.size }}</b> 位客户</span>
         <span class="text-xs text-gray-500">
-          每条按该客户自己的价值层渠道建单（零余额 → APP 推送，高价值 → 客户经理）
+          逐张确认派给谁、为什么建（渠道按各客户价值层自动决定）
         </span>
         <span class="flex-1"></span>
         <button class="btn btn-outline btn-sm" @click="clearSelection">取消选择</button>
-        <button class="btn btn-primary btn-sm" :disabled="batchRunning" @click="batchCreate">
-          {{ batchRunning ? '建单中…' : `＋ 批量建单（${selected.size}）` }}
+        <button class="btn btn-primary btn-sm" :disabled="batchRunning" @click="openDispatch">
+          {{ batchRunning ? '准备中…' : `＋ 批量派单（${selected.size}）` }}
         </button>
       </div>
 
@@ -114,6 +114,7 @@
         <div>
           ✅ 成功 <b>{{ batchResult.ok }}</b> 条
           <span v-if="batchResult.fail.length"> · ❌ 失败 <b>{{ batchResult.fail.length }}</b> 条</span>
+          <span v-if="batchResult.skippedIds?.length"> · ⏭ 跳过 <b>{{ batchResult.skippedIds.length }}</b> 条（已有进行中工单）</span>
         </div>
         <ul v-if="batchResult.fail.length" class="fail-list">
           <li v-for="f in batchResult.fail" :key="f.id">{{ f.id }}：{{ f.reason }}</li>
@@ -234,6 +235,117 @@
       </div>
     </template>
 
+    <!-- ══════════════════════════════════════════════════════
+         批量派单 · 卡片翻页
+         ══════════════════════════════════════════════════════
+         为什么是"一张一张确认"而不是"一键全建"：
+         每位客户的渠道由**自己的价值层**决定（零余额走 APP 推送、
+         高价值要上门），且负责人常需分别指派 —— 一套参数打天下
+         必然出现"给零余额客户派了客户经理"这类错误。
+    -->
+    <div v-if="dispatchOpen" class="modal-overlay" @click.self="dispatchOpen = false">
+      <div class="dispatch-card">
+        <div class="modal-header">
+          <h2>
+            批量派单
+            <span class="dispatch-progress">
+              {{ dispatchIndex + 1 }} / {{ dispatchQueue.length }}
+            </span>
+          </h2>
+          <button class="modal-close" @click="dispatchOpen = false">✕</button>
+        </div>
+
+        <!-- 进度条 -->
+        <div class="dispatch-bar">
+          <div class="dispatch-bar-fill"
+               :style="{ width: ((dispatchIndex + 1) / dispatchQueue.length * 100) + '%' }"></div>
+        </div>
+
+        <div class="modal-body">
+          <!-- 客户概要 -->
+          <div v-if="currentCustomer || currentDraft" class="dispatch-cust">
+            <div class="dispatch-cust-head">
+              <span class="dispatch-cid">{{ currentDraft.customer_id || dispatchQueue[dispatchIndex] }}</span>
+              <span class="dispatch-name">{{ currentDraft.customer_name }}</span>
+              <span v-if="currentDraft.risk_level"
+                    class="dispatch-tag" :class="'rl-' + currentDraft.risk_level">
+                {{ riskLabel(currentDraft.risk_level) }}
+              </span>
+              <span v-if="currentDraft.value_tier" class="dispatch-tag vt">
+                {{ valueTierLabel(currentDraft.value_tier) }}
+              </span>
+            </div>
+            <div class="dispatch-cust-body">
+              <div>
+                <span class="k">流失概率</span>
+                <span class="v">{{ currentDraft.probability != null ? (currentDraft.probability * 100).toFixed(1) + '%' : '—' }}</span>
+              </div>
+              <div>
+                <span class="k">账户余额</span>
+                <span class="v">¥{{ currentDraft.balance != null ? Math.round(currentDraft.balance).toLocaleString() : '—' }}</span>
+              </div>
+              <div>
+                <span class="k">触达渠道</span>
+                <span class="v">{{ currentDraft.channel ? channelLabel(currentDraft.channel) : '—' }}</span>
+              </div>
+              <div>
+                <span class="k">推荐动作</span>
+                <span class="v">{{ currentDraft.action || '—' }}</span>
+              </div>
+            </div>
+            <p v-if="currentDraft.load_failed" class="dispatch-warn">
+              ⚠ 该客户详情读取失败，工单画像将由服务端按编号重新查库补齐
+            </p>
+          </div>
+
+          <!-- 负责人 -->
+          <div class="form-group">
+            <label>负责人 <span class="text-red-400">*</span></label>
+            <select :value="currentDraft.assignee"
+                    @change="updateDraft('assignee', $event.target.value)">
+              <option value="" disabled>请选择负责人</option>
+              <option v-for="a in assignees" :key="a.username" :value="a.username">
+                {{ a.display_name }}（{{ a.role_label }}·{{ a.department }}）
+              </option>
+            </select>
+          </div>
+
+          <!-- 建单理由 -->
+          <div class="form-group">
+            <label>
+              建单理由
+              <span class="dispatch-hint">系统已按该客户实时数据生成，可修改</span>
+            </label>
+            <textarea rows="4" :value="currentDraft.note"
+                      @input="updateDraft('note', $event.target.value)"
+                      placeholder="例如：客户近 3 个月登录骤降，余额较高，需客户经理电话回访"></textarea>
+          </div>
+
+          <button type="button" class="btn btn-outline btn-sm" @click="applyToAll">
+            ↧ 把当前负责人与理由应用到其余 {{ Math.max(dispatchQueue.length - dispatchIndex - 1, 0) }} 张
+          </button>
+
+          <p v-if="dispatchError" class="dispatch-err">{{ dispatchError }}</p>
+        </div>
+
+        <div class="dispatch-foot">
+          <button class="btn btn-outline btn-sm" :disabled="dispatchIndex === 0" @click="prevCard">
+            ‹ 上一张
+          </button>
+          <button class="btn btn-outline btn-sm" @click="skipCard">跳过这张</button>
+          <span class="flex-1"></span>
+          <button v-if="dispatchIndex < dispatchQueue.length - 1"
+                  class="btn btn-primary btn-sm" @click="nextCard">
+            下一张 ›
+          </button>
+          <button v-else class="btn btn-primary btn-sm"
+                  :disabled="batchRunning" @click="submitDispatch">
+            {{ batchRunning ? '提交中…' : `确认派单（${dispatchQueue.length} 张）` }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Modal -->
     <div v-if="modalOpen" class="modal-overlay" @click.self="closeModal">
       <div class="modal">
@@ -303,8 +415,20 @@
               <input :value="recommendedAction" readonly class="readonly" />
             </div>
             <div class="form-group">
-              <label>负责人</label>
-              <input v-model="form.assignee" placeholder="输入负责人姓名" />
+              <label>负责人 <span class="text-red-400">*</span></label>
+              <!-- 改为下拉：取值 = 行员工号。
+                   旧实现是自由文本，导致 seed 名单里的虚构人名被写进工单
+                   （派给了查无此人），且无法关联回账号做"我的工单"。
+                   降级：名单拉不到时退化为只读文本（显示当前登录人），
+                   仍可建单 —— 后端会以会话身份兜底。 -->
+              <select v-if="canAssign && assignees.length" v-model="form.assignee">
+                <option value="" disabled>请选择负责人</option>
+                <option v-for="a in assignees" :key="a.username" :value="a.username">
+                  {{ a.display_name }}（{{ a.role_label }}·{{ a.department }}）
+                </option>
+              </select>
+              <input v-else :value="assigneeName(form.assignee)" readonly class="readonly"
+                     title="行员名单不可用，将按当前登录人建单" />
             </div>
             <div class="form-group full">
               <label>备注</label>
@@ -363,6 +487,9 @@ import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, probColor, fmtPercent, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
+import {
+  assignees, canAssign, loadAssignees, defaultAssignee, assigneeName,
+} from '../utils/assignees'
 
 /**
  * 页面级请求作用域 —— 组件卸载时自动取消在途请求。
@@ -515,13 +642,47 @@ function openDetail(c) {
   router.push(`/customers/${c.customer_id}`)
 }
 
-// ── 批量建单 ────────────────────────────────────────
-// 每行的渠道由该客户**自己的价值层**决定，不能一套参数批量提交 ——
-// 否则零余额客户会被当成高价值客户处理（正是本项目要消除的那类错误）。
-// 因此逐条按各行的 channel / action 提交，各记各的账。
+// ── 批量建单（卡片翻页式派单）────────────────────────────
+//
+// ── 为什么从"一键批量"改成"逐张卡片确认" ──────────────────
+//
+// 旧实现是勾选 N 人 → 点一下 → 后台循环建单。三个问题（均为实测）：
+//   1) **没有负责人框** —— 请求体里根本没这个字段，建出来的单负责人为空。
+//      而工单是"派活"，没派出去的单在按人统计时是隐形的。
+//   2) **没有理由** —— 一次勾十几人，事后再没人记得为什么建。
+//   3) **批量统一决定** —— 但渠道由各客户的**价值层**决定，
+//      零余额走 APP 推送、高价值要上门，本就不该一套参数打天下。
+//
+// 现改为：每位客户一张卡片，逐张确认"派给谁 + 为什么"。
+// 选中的人按顺序翻页，可随时跳过或返回上一张。
+//
+// ⚠ 保留"统一默认值"的便利：进入第一张卡片时预填负责人=当前登录人、
+//   理由=系统建议，若后续卡片未改动则沿用上一张的选择 ——
+//   否则 10 张卡要手点 10 次下拉，比原来还慢。
 const selected = ref(new Set())
 const batchRunning = ref(false)
 const batchResult = ref(null)
+
+// ── 派单卡片状态 ─────────────────────────────────────
+const dispatchOpen = ref(false)       // 卡片面板是否展开
+const dispatchIndex = ref(0)          // 当前第几张（0-based）
+// 每张卡的编辑内容：{ [customer_id]: { assignee, note } }
+//
+// ⚠ 用 map 而不是数组：客户可能在翻页过程中被取消勾选，
+//   用 customer_id 做键才不会串位。
+const dispatchDrafts = ref({})
+// 卡片顺序在**打开面板那一刻**固定下来 —— 否则翻页途中表格刷新（如
+// 后台轮询）会让顺序变化，用户看到"同一张卡出现两次"。
+const dispatchQueue = ref([])
+
+const currentDraft = computed(() => {
+  const cid = dispatchQueue.value[dispatchIndex.value]
+  return cid ? (dispatchDrafts.value[cid] || { assignee: '', note: '' }) : { assignee: '', note: '' }
+})
+const currentCustomer = computed(() => {
+  const cid = dispatchQueue.value[dispatchIndex.value]
+  return customers.value.find((c) => c.customer_id === cid) || detailCache.value[cid] || null
+})
 
 const selectableRows = computed(() => customers.value.filter((c) => !c.has_active_order))
 const allSelected = computed(
@@ -548,35 +709,32 @@ function toggleAll() {
 function clearSelection() {
   selected.value = new Set()
   batchResult.value = null
+  dispatchOpen.value = false
+  dispatchDrafts.value = {}
+  dispatchQueue.value = []
 }
 
+/** 跨页补齐用的客户详情缓存（卡片里要显示余额/价值层，当前页之外的需拉取） */
+const detailCache = ref({})
+
 /**
- * 批量建单：逐条提交，汇总成功/失败。
- * 失败原因逐条记录（如并发建单撞上 409），不吞掉 —— 否则用户以为全成功了。
+ * 打开派单卡片面板。
  *
- * ⚠ 修复的缺陷（承诺与行为不一致）：
- *   原实现是 `customers.value.filter(c => selected.value.has(...))`，
- *   而 `customers.value` **只是当前页的 20 条**。跨页勾选时（selected 是
- *   组件级 Set，翻页不清空），按钮显示「批量建单（5）」但实际只提交当前页
- *   命中的那几条 —— 实测第 1 页选 3 + 第 2 页选 2，只发出 2 条 POST。
- *   用户以为建了 5 张单，实际只建了 2 张，且没有任何提示。
- *
- * 现改为**以 selected 集合为准**：当前页能直接取到字段的就用，
- * 取不到的（在别的页）用该客户自己的详情接口补齐 —— 保证「勾了几个就建几张」。
+ * ⚠ 先把**所有**选中客户的详情补齐再翻页：卡片要显示价值层与推荐渠道，
+ *   而这些字段只有详情/列表接口有。跨页勾选时当前页的 map 里没有，
+ *   若在翻页时才逐个拉取，用户会看到卡片内容"跳一下"。
  */
-async function batchCreate() {
+async function openDispatch() {
   const ids = [...selected.value]
   if (!ids.length) return
-  batchRunning.value = true
   batchResult.value = null
+  batchRunning.value = true
 
-  // 当前页的客户可直接复用（省一次请求）；其余的去详情接口补
+  // 预填默认值：负责人=登录人（由 loadAssignees 提供），理由=系统建议
+  const drafts = {}
   const onPage = new Map(customers.value.map((c) => [c.customer_id, c]))
 
-  // ── 批量取建议理由（一次请求，而不是 N 次）──────────────
-  // ⚠ 此前批量建单**不带 note**，而单建有 —— 同一件事两种行为。
-  //   批量恰恰最需要理由：一次勾选十几人，事后更没人记得为什么建。
-  //   失败不阻塞：拿不到理由就按空备注建单，与旧行为一致。
+  // 批量取建议理由（一次请求，而不是 N 次）—— 失败不阻塞
   let noteMap = new Map()
   try {
     const params = new URLSearchParams()
@@ -584,53 +742,146 @@ async function batchCreate() {
     const { data } = await scope.get(`/customers/suggested-notes/batch?${params}`)
     noteMap = new Map((data.items || []).map((r) => [r.customer_id, r.note]))
   } catch (e) {
-    // 静默降级：理由只是辅助信息，不该拦住建单
-    console.warn('批量建议理由获取失败，将按空备注建单：', e.message)
+    console.warn('[批量] 建议理由获取失败，卡片将留空由人工填写：', e.message)
   }
 
-  const okList = []
-  const failList = []
+  const defAssignee = defaultAssignee()
   for (const cid of ids) {
     let c = onPage.get(cid)
     if (!c) {
       try {
         const { data } = await api.get(`/customers/${cid}`)
         c = data
+        detailCache.value[cid] = data
       } catch (e) {
-        failList.push({ id: cid, reason: '获取客户信息失败：' + (e.response?.data?.detail || e.message) })
-        continue
+        c = null
       }
     }
-    try {
-      await api.post('/work-orders', {
-        customer_id: c.customer_id,
-        customer_name: c.surname,
-        geography: c.geography,
-        risk_level: c.risk_level,
-        probability: c.probability,
-        balance: c.balance,
-        risk_factors: c.risk_factors || [],
-        strategy: c.action || c.strategy || '',
-        // 渠道直接用该客户的推荐值 —— 不覆盖，因此无需 override_reason
-        channel: c.channel,
-        thresholds_snapshot: riskInfo.value?.thresholds || null,
-        model_used: riskInfo.value?.model || null,
-        value_tier_snapshot: c.value_tier,
-        expected_value_snapshot: c.expected_value,
-        // 建议理由（批量取回，人可在工单页再编辑）
-        note: noteMap.get(c.customer_id) || '',
-      })
-      okList.push(c.customer_id)
-    } catch (e) {
-      failList.push({ id: c.customer_id, reason: e.response?.data?.detail || e.message })
+    drafts[cid] = {
+      assignee: defAssignee,
+      note: noteMap.get(cid) || '',
+      // 记录该客户自身的渠道/价值层，卡片上要展示（不可能统一）
+      channel: c?.channel || '',
+      value_tier: c?.value_tier || '',
+      action: c?.action || c?.strategy || '',
+      probability: c?.probability ?? null,
+      balance: c?.balance ?? null,
+      risk_level: c?.risk_level || '',
+      customer_name: c?.surname || c?.customer_name || cid,
+      load_failed: !c,
     }
   }
 
-  batchResult.value = { ok: okList.length, fail: failList }
+  dispatchDrafts.value = drafts
+  dispatchQueue.value = ids
+  dispatchIndex.value = 0
+  dispatchOpen.value = true
   batchRunning.value = false
-  clearSelectionOnly()
-  fetchCustomers()
 }
+
+/** 把当前卡的负责人/理由同步到**其余所有卡**（用户主动点的便利操作） */
+function applyToAll() {
+  const cur = currentDraft.value
+  const next = { ...dispatchDrafts.value }
+  for (const cid of dispatchQueue.value) {
+    // ⚠ 不覆盖已经单独改过的卡：否则"应用到全部"会毁掉前面逐张的调整。
+    //   只填那些仍是初始值的（与当前卡不同的说明用户改过）。
+    next[cid] = { ...next[cid] }
+    if (!next[cid].touched) {
+      next[cid].assignee = cur.assignee
+      if (cur.note) next[cid].note = cur.note
+    }
+  }
+  dispatchDrafts.value = next
+  dispatchTouchedAll.value = true
+}
+
+function updateDraft(field, value) {
+  const cid = dispatchQueue.value[dispatchIndex.value]
+  if (!cid) return
+  dispatchDrafts.value = {
+    ...dispatchDrafts.value,
+    [cid]: { ...dispatchDrafts.value[cid], [field]: value, touched: true },
+  }
+}
+
+function nextCard() {
+  if (dispatchIndex.value < dispatchQueue.value.length - 1) dispatchIndex.value++
+}
+function prevCard() {
+  if (dispatchIndex.value > 0) dispatchIndex.value--
+}
+/** 跳过当前卡（不建单） */
+function skipCard() {
+  const cid = dispatchQueue.value[dispatchIndex.value]
+  if (cid) {
+    const next = { ...dispatchDrafts.value }
+    delete next[cid]
+    dispatchDrafts.value = next
+  }
+  if (dispatchIndex.value >= dispatchQueue.value.length - 1) {
+    // 已是最后一张 —— 直接提交剩余
+    submitDispatch()
+  } else {
+    // 队列本身不变（保持下标稳定），只是该卡的草稿被删掉 => 提交时跳过
+    dispatchIndex.value++
+  }
+}
+
+/**
+ * 提交派单：把每张卡的内容作为一个 item 提交给 /work-orders/batch。
+ *
+ * ⚠ 为什么用后端的批量接口而不是前端循环调单建：
+ *   1) 后端会统一做互斥检查与逐条失败汇报，前端不必自己拼错误信息
+ *   2) 审计表里只留**一条**"批量建单"记录，与用户"我做了一次批量操作"
+ *      的心理模型一致（循环调用会留 N 条）
+ */
+async function submitDispatch() {
+  // 只提交仍有草稿的卡（被 skipCard 删掉的不提交）
+  const items = dispatchQueue.value
+    .filter((cid) => dispatchDrafts.value[cid])
+    .map((cid) => ({
+      customer_id: cid,
+      assignee: (dispatchDrafts.value[cid].assignee || '').trim(),
+      note: dispatchDrafts.value[cid].note || '',
+    }))
+
+  if (!items.length) {
+    dispatchOpen.value = false
+    batchResult.value = { ok: 0, fail: [], skipped: dispatchQueue.value.length }
+    return
+  }
+
+  // 前端先拦一道空负责人：后端也会拒，但在这里拦能给出更快的反馈
+  const missing = items.filter((i) => !i.assignee)
+  if (missing.length) {
+    dispatchError.value = `有 ${missing.length} 位客户未选择负责人，请逐张确认后再提交`
+    return
+  }
+
+  batchRunning.value = true
+  dispatchError.value = ''
+  try {
+    const { data } = await api.post('/work-orders/batch', { items })
+    batchResult.value = {
+      ok: data.succeeded || 0,
+      fail: (data.failed || []).map((f) => ({ id: f.customer_id, reason: f.reason })),
+      skippedIds: data.skipped || [],
+    }
+    dispatchOpen.value = false
+    dispatchDrafts.value = {}
+    dispatchQueue.value = []
+    selected.value = new Set()
+    fetchCustomers()
+  } catch (e) {
+    dispatchError.value = e.response?.data?.detail || e.message
+  } finally {
+    batchRunning.value = false
+  }
+}
+
+const dispatchError = ref('')
+const dispatchTouchedAll = ref(false)
 
 /** 清空选择但保留结果提示（批量建单后要展示汇总） */
 function clearSelectionOnly() {
@@ -749,7 +1000,12 @@ function openCreate(c) {
     balance: c.balance || 0,
     risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
     strategy: c.strategy || '',
-    assignee: '',
+    // ⚠ 预填**当前登录人**，而不是留空。
+    //   留空是旧实现的行为，后果：建单人每次都要手打自己的名字，
+    //   批量入口干脆没有这个框，于是建出一堆无负责人的工单。
+    //   默认派给自己是银行业务里最自然的起点（"我建的我自己跟"），
+    //   要转给别人再从下拉里换。
+    assignee: defaultAssignee(),
     note: '',
     thresholds_snapshot: riskInfo.value?.thresholds || null,
     model_used: riskInfo.value?.model || null,
@@ -823,6 +1079,11 @@ async function submitOrder() {
     showToast('请填写客户信息')
     return
   }
+  // 负责人必填（后端也会校验 422，这里提前拦一道给出即时反馈）
+  if (!String(form.assignee || '').trim()) {
+    showToast('请选择负责人（工单必须有人负责）')
+    return
+  }
   // 与后端同一条规则：偏离推荐渠道必须留原因（后端也会校验，这里提前拦一道）
   if (channelOverridden.value && !form.override_reason.trim()) {
     showToast('已偏离推荐渠道，请填写覆盖原因')
@@ -848,6 +1109,9 @@ function showToast(msg) {
 onMounted(async () => {
   // 先按 URL 还原筛选 —— 支持从矩阵下钻跳进来、以及直接分享筛选链接
   readUrl()
+  // 行员名单与客户列表并发拉取：名单很小（8 条），但要用于预填负责人，
+  // 故不能等客户列表回来才发。失败会被 loadAssignees 吞掉并降级。
+  loadAssignees()
   await fetchCustomers()
   loading.value = false
 })
@@ -975,6 +1239,63 @@ tbody tr:hover { background: #f8fafc; }
 }
 .fail-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #c81e1e; }
 .fail-list li { margin-top: 2px; }
+
+/* ── 批量派单卡片 ───────────────────────────────────── */
+.dispatch-card {
+  width: 100%; max-width: 560px; max-height: 90vh; overflow-y: auto;
+  background: #fff; border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(23, 51, 92, .18);
+  display: flex; flex-direction: column;
+}
+.dispatch-progress {
+  margin-left: 8px; font-size: 12px; font-weight: 500;
+  color: #1d4ed8; background: #eef3fb;
+  padding: 2px 9px; border-radius: 10px;
+}
+.dispatch-bar { height: 3px; background: #eef1f6; flex-shrink: 0; }
+.dispatch-bar-fill {
+  height: 100%; background: #1d4ed8; border-radius: 0 2px 2px 0;
+  transition: width .25s ease;
+}
+
+/* 客户概要卡 —— 让"这一单是给谁的"一眼可见 */
+.dispatch-cust {
+  border: 1px solid #e5e9f0; border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 16px; background: #f8fafc;
+}
+.dispatch-cust-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.dispatch-cid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; color: #7c8aa5;
+}
+.dispatch-name { font-size: 14px; font-weight: 600; color: #17335c; }
+.dispatch-tag {
+  font-size: 11px; padding: 2px 8px; border-radius: 5px;
+  background: #eef3fb; color: #1d4ed8;
+}
+.dispatch-cust-body {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px;
+}
+.dispatch-cust-body .k { font-size: 11px; color: #9aa7bd; margin-right: 6px; }
+.dispatch-cust-body .v { font-size: 12.5px; color: #374151; font-weight: 500; }
+.dispatch-warn {
+  margin-top: 10px; font-size: 11.5px; color: #b45309;
+  background: #fdf6e3; padding: 6px 10px; border-radius: 6px;
+}
+.dispatch-hint { font-size: 11px; color: #9aa7bd; font-weight: 400; margin-left: 6px; }
+.dispatch-err {
+  margin-top: 12px; padding: 9px 12px; border-radius: 7px;
+  font-size: 12px; color: #b91c1c; background: #fdecec; border: 1px solid #f5c2c2;
+}
+.dispatch-foot {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 14px 20px; border-top: 1px solid #e5e9f0;
+  background: #fbfcfe; border-radius: 0 0 14px 14px;
+  position: sticky; bottom: 0;
+}
 
 /* ── Mini tags ── */
 .tag-mini { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 11px; }
