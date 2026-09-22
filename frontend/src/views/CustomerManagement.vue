@@ -249,7 +249,10 @@
           <h2>
             批量派单
             <span class="dispatch-progress">
-              {{ dispatchIndex + 1 }} / {{ dispatchQueue.length }}
+              {{ dispatchIndex + 1 }} / {{ dispatchItems.length }}
+            </span>
+            <span v-if="skippedCount" class="dispatch-skipcount">
+              已跳过 {{ skippedCount }}
             </span>
           </h2>
           <button class="modal-close" @click="dispatchOpen = false">✕</button>
@@ -258,42 +261,44 @@
         <!-- 进度条 -->
         <div class="dispatch-bar">
           <div class="dispatch-bar-fill"
-               :style="{ width: ((dispatchIndex + 1) / dispatchQueue.length * 100) + '%' }"></div>
+               :style="{ width: ((dispatchIndex + 1) / dispatchItems.length * 100) + '%' }"></div>
         </div>
 
         <div class="modal-body">
-          <!-- 客户概要 -->
-          <div v-if="currentCustomer || currentDraft" class="dispatch-cust">
+          <!-- 客户概要（画像在打开面板时定格，翻页/跳过都不会变空） -->
+          <div v-if="currentItem" class="dispatch-cust"
+               :class="{ 'is-skipped': currentItem.skipped }">
             <div class="dispatch-cust-head">
-              <span class="dispatch-cid">{{ currentDraft.customer_id || dispatchQueue[dispatchIndex] }}</span>
-              <span class="dispatch-name">{{ currentDraft.customer_name }}</span>
-              <span v-if="currentDraft.risk_level"
-                    class="dispatch-tag" :class="'rl-' + currentDraft.risk_level">
-                {{ riskLabel(currentDraft.risk_level) }}
+              <span class="dispatch-cid">{{ currentItem.customer_id }}</span>
+              <span class="dispatch-name">{{ currentItem.customer_name }}</span>
+              <span v-if="currentItem.risk_level"
+                    class="dispatch-tag" :class="'rl-' + currentItem.risk_level">
+                {{ riskLabel(currentItem.risk_level) }}
               </span>
-              <span v-if="currentDraft.value_tier" class="dispatch-tag vt">
-                {{ valueTierLabel(currentDraft.value_tier) }}
+              <span v-if="currentItem.value_tier" class="dispatch-tag vt">
+                {{ valueTierLabel(currentItem.value_tier) }}
               </span>
+              <span v-if="currentItem.skipped" class="dispatch-tag skip">本次不派单</span>
             </div>
             <div class="dispatch-cust-body">
               <div>
                 <span class="k">流失概率</span>
-                <span class="v">{{ currentDraft.probability != null ? (currentDraft.probability * 100).toFixed(1) + '%' : '—' }}</span>
+                <span class="v">{{ currentItem.probability != null ? (currentItem.probability * 100).toFixed(1) + '%' : '—' }}</span>
               </div>
               <div>
                 <span class="k">账户余额</span>
-                <span class="v">¥{{ currentDraft.balance != null ? Math.round(currentDraft.balance).toLocaleString() : '—' }}</span>
+                <span class="v">¥{{ currentItem.balance != null ? Math.round(currentItem.balance).toLocaleString() : '—' }}</span>
               </div>
               <div>
                 <span class="k">触达渠道</span>
-                <span class="v">{{ currentDraft.channel ? channelLabel(currentDraft.channel) : '—' }}</span>
+                <span class="v">{{ currentItem.channel ? channelLabel(currentItem.channel) : '—' }}</span>
               </div>
               <div>
                 <span class="k">推荐动作</span>
-                <span class="v">{{ currentDraft.action || '—' }}</span>
+                <span class="v">{{ currentItem.action || '—' }}</span>
               </div>
             </div>
-            <p v-if="currentDraft.load_failed" class="dispatch-warn">
+            <p v-if="currentItem.load_failed" class="dispatch-warn">
               ⚠ 该客户详情读取失败，工单画像将由服务端按编号重新查库补齐
             </p>
           </div>
@@ -301,8 +306,9 @@
           <!-- 负责人 -->
           <div class="form-group">
             <label>负责人 <span class="text-red-400">*</span></label>
-            <select :value="currentDraft.assignee"
-                    @change="updateDraft('assignee', $event.target.value)">
+            <select :value="currentItem?.assignee || ''"
+                    :disabled="currentItem?.skipped"
+                    @change="updateCurrent('assignee', $event.target.value)">
               <option value="" disabled>请选择负责人</option>
               <option v-for="a in assignees" :key="a.username" :value="a.username">
                 {{ a.display_name }}（{{ a.role_label }}·{{ a.department }}）
@@ -316,13 +322,18 @@
               建单理由
               <span class="dispatch-hint">系统已按该客户实时数据生成，可修改</span>
             </label>
-            <textarea rows="4" :value="currentDraft.note"
-                      @input="updateDraft('note', $event.target.value)"
+            <textarea rows="4" :value="currentItem?.note || ''"
+                      :disabled="currentItem?.skipped"
+                      @input="updateCurrent('note', $event.target.value)"
                       placeholder="例如：客户近 3 个月登录骤降，余额较高，需客户经理电话回访"></textarea>
           </div>
 
-          <button type="button" class="btn btn-outline btn-sm" @click="applyToAll">
-            ↧ 把当前负责人与理由应用到其余 {{ Math.max(dispatchQueue.length - dispatchIndex - 1, 0) }} 张
+          <!-- 应用到其余：只影响**还没被单独改过、且未跳过**的卡，
+               故数量要如实算出来（此前用 queue 长度，把已跳过的也算进去了） -->
+          <button type="button" class="btn btn-outline btn-sm"
+                  :disabled="!currentItem || currentItem.skipped || restCount === 0"
+                  @click="applyToAll">
+            ↧ 把当前负责人与理由应用到其余 {{ restCount }} 张
           </button>
 
           <p v-if="dispatchError" class="dispatch-err">{{ dispatchError }}</p>
@@ -332,15 +343,25 @@
           <button class="btn btn-outline btn-sm" :disabled="dispatchIndex === 0" @click="prevCard">
             ‹ 上一张
           </button>
-          <button class="btn btn-outline btn-sm" @click="skipCard">跳过这张</button>
+          <!-- 跳过 / 恢复：跳过只打标记不删数据，故可随时恢复改主意 -->
+          <button v-if="!currentItem?.skipped" class="btn btn-outline btn-sm"
+                  @click="skipCurrent">
+            跳过这张
+          </button>
+          <button v-else class="btn btn-outline btn-sm" @click="restoreCurrent">
+            ↩ 恢复这张
+          </button>
           <span class="flex-1"></span>
-          <button v-if="dispatchIndex < dispatchQueue.length - 1"
-                  class="btn btn-primary btn-sm" @click="nextCard">
+          <!-- ⚠ 翻页与提交分开：无论在第几张，都只有按钮写明的那件事会发生。
+               v1 在最后一张点「跳过」会直接提交 —— 说的和做的不一样。 -->
+          <button v-if="dispatchIndex < dispatchItems.length - 1"
+                  class="btn btn-outline btn-sm" @click="nextCard">
             下一张 ›
           </button>
-          <button v-else class="btn btn-primary btn-sm"
-                  :disabled="batchRunning" @click="submitDispatch">
-            {{ batchRunning ? '提交中…' : `确认派单（${dispatchQueue.length} 张）` }}
+          <button class="btn btn-primary btn-sm"
+                  :disabled="batchRunning || pendingCount === 0"
+                  @click="submitDispatch">
+            {{ batchRunning ? '提交中…' : `确认派单（${pendingCount} 张）` }}
           </button>
         </div>
       </div>
@@ -659,30 +680,58 @@ function openDetail(c) {
 // ⚠ 保留"统一默认值"的便利：进入第一张卡片时预填负责人=当前登录人、
 //   理由=系统建议，若后续卡片未改动则沿用上一张的选择 ——
 //   否则 10 张卡要手点 10 次下拉，比原来还慢。
+// ── 派单卡片状态 ─────────────────────────────────────
+//
+// ⚠ 这里踩过一个坑，记下来避免再犯（用户实测："跳过这张之后点上一张，
+//   啥也没有了"）：
+//
+//   v1 把「卡片显示数据」和「派单决定」塞进了**同一个对象**：
+//       drafts[cid] = { assignee, note, customer_name, probability, balance, ... }
+//   跳过用 `delete drafts[cid]`，于是客户姓名/概率/余额**一起被删掉** ——
+//   往回翻时卡片成了一个空壳（表单还在，客户信息没了）。
+//
+//   同源衍生缺陷（一并修掉）：
+//     · updateDraft 会 `{...undefined, field:val}` 造出半截对象，
+//       把已跳过的卡"复活"成一条没有画像的工单
+//     · applyToAll 对已删除的键同样会复活
+//     · 提交按钮的张数用 queue.length，把已跳过的也算进去
+//     · 最后一张点「跳过这张」会**直接提交**（按钮说的和做的不一样）
+//
+//   v2（当前）按**生命周期**拆开：
+//     卡片画像 = 不可变事实（打开面板时定格，翻页/跳过都不动）
+//     派单决定 = 可变状态（assignee / note / skipped）
+//   两者放在同一个 item 里但**跳过只置 skipped 标记，不删对象** ——
+//   于是往回翻能看到"这张已跳过"，还能点「恢复」改主意。
+//
+// 用**数组**而非以 customer_id 为键的 map：数组天然有稳定顺序与下标，
+// 翻页就是 index++/--，不必再维护一份 queue 与 drafts 的对应关系
+// （v1 那两份结构正是上面那些 bug 的温床）。
 const selected = ref(new Set())
 const batchRunning = ref(false)
 const batchResult = ref(null)
 
-// ── 派单卡片状态 ─────────────────────────────────────
-const dispatchOpen = ref(false)       // 卡片面板是否展开
-const dispatchIndex = ref(0)          // 当前第几张（0-based）
-// 每张卡的编辑内容：{ [customer_id]: { assignee, note } }
-//
-// ⚠ 用 map 而不是数组：客户可能在翻页过程中被取消勾选，
-//   用 customer_id 做键才不会串位。
-const dispatchDrafts = ref({})
-// 卡片顺序在**打开面板那一刻**固定下来 —— 否则翻页途中表格刷新（如
-// 后台轮询）会让顺序变化，用户看到"同一张卡出现两次"。
-const dispatchQueue = ref([])
+const dispatchOpen = ref(false)   // 卡片面板是否展开
+const dispatchIndex = ref(0)      // 当前第几张（0-based）
+const dispatchItems = ref([])     // 派单项数组（顺序在打开面板时定格）
+const dispatchError = ref('')
 
-const currentDraft = computed(() => {
-  const cid = dispatchQueue.value[dispatchIndex.value]
-  return cid ? (dispatchDrafts.value[cid] || { assignee: '', note: '' }) : { assignee: '', note: '' }
+const currentItem = computed(() => dispatchItems.value[dispatchIndex.value] || null)
+/** 待派单张数（排除已跳过的）—— 提交按钮与提示都用它 */
+const pendingCount = computed(() => dispatchItems.value.filter((i) => !i.skipped).length)
+/** 已跳过的张数 */
+const skippedCount = computed(() => dispatchItems.value.filter((i) => i.skipped).length)
+/**
+ * 「应用到其余」实际会影响的张数 = 排除当前卡、已跳过的、以及用户单独改过的。
+ * ⚠ 必须与 applyToAll 的过滤条件**完全一致**，否则按钮上的数字与实际
+ *   被改动的数量对不上 —— 那比不显示数字更糟。
+ */
+const restCount = computed(() => {
+  const i = dispatchIndex.value
+  return dispatchItems.value.filter(
+    (it, idx) => idx !== i && !it.skipped && !it.touched
+  ).length
 })
-const currentCustomer = computed(() => {
-  const cid = dispatchQueue.value[dispatchIndex.value]
-  return customers.value.find((c) => c.customer_id === cid) || detailCache.value[cid] || null
-})
+
 
 const selectableRows = computed(() => customers.value.filter((c) => !c.has_active_order))
 const allSelected = computed(
@@ -710,28 +759,29 @@ function clearSelection() {
   selected.value = new Set()
   batchResult.value = null
   dispatchOpen.value = false
-  dispatchDrafts.value = {}
-  dispatchQueue.value = []
+  dispatchItems.value = []
+  dispatchIndex.value = 0
+  dispatchError.value = ''
 }
-
-/** 跨页补齐用的客户详情缓存（卡片里要显示余额/价值层，当前页之外的需拉取） */
-const detailCache = ref({})
 
 /**
  * 打开派单卡片面板。
  *
- * ⚠ 先把**所有**选中客户的详情补齐再翻页：卡片要显示价值层与推荐渠道，
- *   而这些字段只有详情/列表接口有。跨页勾选时当前页的 map 里没有，
+ * ⚠ 先把**所有**选中客户的画像补齐再翻页：卡片要显示价值层与推荐渠道，
+ *   而这些字段只有列表/详情接口有。跨页勾选时当前页的 map 里没有，
  *   若在翻页时才逐个拉取，用户会看到卡片内容"跳一下"。
+ *
+ * ⚠ 画像数据在**打开这一刻定格**，之后翻页/跳过都不再重新拉取 ——
+ *   它描述的是"建单时这个客户是什么样"，本身就是需冻结的快照语义
+ *   （与工单表的 thresholds_snapshot / value_tier_snapshot 同一道理）。
  */
 async function openDispatch() {
   const ids = [...selected.value]
   if (!ids.length) return
   batchResult.value = null
+  dispatchError.value = ''
   batchRunning.value = true
 
-  // 预填默认值：负责人=登录人（由 loadAssignees 提供），理由=系统建议
-  const drafts = {}
   const onPage = new Map(customers.value.map((c) => [c.customer_id, c]))
 
   // 批量取建议理由（一次请求，而不是 N 次）—— 失败不阻塞
@@ -746,90 +796,112 @@ async function openDispatch() {
   }
 
   const defAssignee = defaultAssignee()
+  const items = []
   for (const cid of ids) {
     let c = onPage.get(cid)
     if (!c) {
       try {
         const { data } = await api.get(`/customers/${cid}`)
         c = data
-        detailCache.value[cid] = data
       } catch (e) {
         c = null
       }
     }
-    drafts[cid] = {
-      assignee: defAssignee,
-      note: noteMap.get(cid) || '',
-      // 记录该客户自身的渠道/价值层，卡片上要展示（不可能统一）
-      channel: c?.channel || '',
+    items.push({
+      // ── 画像（不可变事实，仅用于显示）──
+      customer_id: cid,
+      customer_name: c?.surname || c?.customer_name || cid,
+      risk_level: c?.risk_level || '',
       value_tier: c?.value_tier || '',
-      action: c?.action || c?.strategy || '',
       probability: c?.probability ?? null,
       balance: c?.balance ?? null,
-      risk_level: c?.risk_level || '',
-      customer_name: c?.surname || c?.customer_name || cid,
+      channel: c?.channel || '',
+      action: c?.action || c?.strategy || '',
       load_failed: !c,
-    }
+      // ── 派单决定（可变）──
+      assignee: defAssignee,
+      note: noteMap.get(cid) || '',
+      skipped: false,
+      touched: false,   // 用户是否单独改过（applyToAll 不覆盖已改的）
+    })
   }
 
-  dispatchDrafts.value = drafts
-  dispatchQueue.value = ids
+  dispatchItems.value = items
   dispatchIndex.value = 0
   dispatchOpen.value = true
   batchRunning.value = false
 }
 
-/** 把当前卡的负责人/理由同步到**其余所有卡**（用户主动点的便利操作） */
+/** 把当前卡的负责人/理由同步到**其余未跳过的卡** */
 function applyToAll() {
-  const cur = currentDraft.value
-  const next = { ...dispatchDrafts.value }
-  for (const cid of dispatchQueue.value) {
-    // ⚠ 不覆盖已经单独改过的卡：否则"应用到全部"会毁掉前面逐张的调整。
-    //   只填那些仍是初始值的（与当前卡不同的说明用户改过）。
-    next[cid] = { ...next[cid] }
-    if (!next[cid].touched) {
-      next[cid].assignee = cur.assignee
-      if (cur.note) next[cid].note = cur.note
+  const cur = currentItem.value
+  if (!cur) return
+  dispatchItems.value = dispatchItems.value.map((it) => {
+    // ⚠ 不覆盖：已跳过的（用户明确不要了）、以及用户单独改过的
+    //   （否则"应用到全部"会毁掉前面逐张的调整）
+    if (it.skipped || it.touched) return it
+    return {
+      ...it,
+      assignee: cur.assignee,
+      note: cur.note || it.note,
     }
-  }
-  dispatchDrafts.value = next
-  dispatchTouchedAll.value = true
+  })
 }
 
-function updateDraft(field, value) {
-  const cid = dispatchQueue.value[dispatchIndex.value]
-  if (!cid) return
-  dispatchDrafts.value = {
-    ...dispatchDrafts.value,
-    [cid]: { ...dispatchDrafts.value[cid], [field]: value, touched: true },
-  }
+/** 修改当前卡的某个字段（负责人 / 理由） */
+function updateCurrent(field, value) {
+  const i = dispatchIndex.value
+  const it = dispatchItems.value[i]
+  if (!it) return
+  // ⚠ 已跳过的卡不再接受编辑：它还显示在屏幕上，但语义上"不参与本次派单"。
+  //   若允许编辑，用户会以为改了就能建单 —— 实际提交时会被跳过，产生误解。
+  //   要改就先点「恢复这张」。
+  if (it.skipped) return
+  const next = dispatchItems.value.slice()
+  next[i] = { ...it, [field]: value, touched: true }
+  dispatchItems.value = next
 }
 
 function nextCard() {
-  if (dispatchIndex.value < dispatchQueue.value.length - 1) dispatchIndex.value++
+  if (dispatchIndex.value < dispatchItems.value.length - 1) dispatchIndex.value++
 }
 function prevCard() {
   if (dispatchIndex.value > 0) dispatchIndex.value--
 }
-/** 跳过当前卡（不建单） */
-function skipCard() {
-  const cid = dispatchQueue.value[dispatchIndex.value]
-  if (cid) {
-    const next = { ...dispatchDrafts.value }
-    delete next[cid]
-    dispatchDrafts.value = next
-  }
-  if (dispatchIndex.value >= dispatchQueue.value.length - 1) {
-    // 已是最后一张 —— 直接提交剩余
-    submitDispatch()
-  } else {
-    // 队列本身不变（保持下标稳定），只是该卡的草稿被删掉 => 提交时跳过
-    dispatchIndex.value++
-  }
+
+/**
+ * 跳过当前卡（本次不建单）。
+ *
+ * ⚠ 只置 skipped 标记，**不删对象** —— 这样往回翻仍能看到该客户是谁、
+ *   并显示"已跳过"状态与「恢复这张」按钮。
+ *   v1 用 delete 删掉整个对象，导致往回翻时卡片是空的（用户实测反馈）。
+ *
+ * ⚠ 也不自动提交。v1 在最后一张点跳过会**直接提交**，而按钮上写的是
+ *   "跳过这张" —— 说的和做的不一样。现在一律只翻页，提交由用户显式点。
+ */
+function skipCurrent() {
+  const i = dispatchIndex.value
+  const it = dispatchItems.value[i]
+  if (!it) return
+  const next = dispatchItems.value.slice()
+  next[i] = { ...it, skipped: true }
+  dispatchItems.value = next
+  // 往后翻一张；已是最后一张则停在原地（按钮会变成「确认派单」）
+  if (i < dispatchItems.value.length - 1) dispatchIndex.value = i + 1
+}
+
+/** 恢复当前卡（撤销跳过） */
+function restoreCurrent() {
+  const i = dispatchIndex.value
+  const it = dispatchItems.value[i]
+  if (!it) return
+  const next = dispatchItems.value.slice()
+  next[i] = { ...it, skipped: false }
+  dispatchItems.value = next
 }
 
 /**
- * 提交派单：把每张卡的内容作为一个 item 提交给 /work-orders/batch。
+ * 提交派单：把每张**未跳过**的卡作为一个 item 提交给 /work-orders/batch。
  *
  * ⚠ 为什么用后端的批量接口而不是前端循环调单建：
  *   1) 后端会统一做互斥检查与逐条失败汇报，前端不必自己拼错误信息
@@ -837,23 +909,16 @@ function skipCard() {
  *      的心理模型一致（循环调用会留 N 条）
  */
 async function submitDispatch() {
-  // 只提交仍有草稿的卡（被 skipCard 删掉的不提交）
-  const items = dispatchQueue.value
-    .filter((cid) => dispatchDrafts.value[cid])
-    .map((cid) => ({
-      customer_id: cid,
-      assignee: (dispatchDrafts.value[cid].assignee || '').trim(),
-      note: dispatchDrafts.value[cid].note || '',
-    }))
+  const pending = dispatchItems.value.filter((it) => !it.skipped)
+  const skipped = dispatchItems.value.length - pending.length
 
-  if (!items.length) {
-    dispatchOpen.value = false
-    batchResult.value = { ok: 0, fail: [], skipped: dispatchQueue.value.length }
+  if (!pending.length) {
+    dispatchError.value = '所有客户都被跳过了，没有可派单的对象'
     return
   }
 
   // 前端先拦一道空负责人：后端也会拒，但在这里拦能给出更快的反馈
-  const missing = items.filter((i) => !i.assignee)
+  const missing = pending.filter((it) => !String(it.assignee || '').trim())
   if (missing.length) {
     dispatchError.value = `有 ${missing.length} 位客户未选择负责人，请逐张确认后再提交`
     return
@@ -862,15 +927,22 @@ async function submitDispatch() {
   batchRunning.value = true
   dispatchError.value = ''
   try {
-    const { data } = await api.post('/work-orders/batch', { items })
+    const { data } = await api.post('/work-orders/batch', {
+      items: pending.map((it) => ({
+        customer_id: it.customer_id,
+        assignee: String(it.assignee).trim(),
+        note: it.note || '',
+      })),
+    })
     batchResult.value = {
       ok: data.succeeded || 0,
       fail: (data.failed || []).map((f) => ({ id: f.customer_id, reason: f.reason })),
       skippedIds: data.skipped || [],
+      // 用户手动跳过的张数（与后端 skipped 不同：那是"已有进行中工单"）
+      userSkipped: skipped,
     }
     dispatchOpen.value = false
-    dispatchDrafts.value = {}
-    dispatchQueue.value = []
+    dispatchItems.value = []
     selected.value = new Set()
     fetchCustomers()
   } catch (e) {
@@ -879,9 +951,6 @@ async function submitDispatch() {
     batchRunning.value = false
   }
 }
-
-const dispatchError = ref('')
-const dispatchTouchedAll = ref(false)
 
 /** 清空选择但保留结果提示（批量建单后要展示汇总） */
 function clearSelectionOnly() {
@@ -1286,6 +1355,19 @@ tbody tr:hover { background: #f8fafc; }
   background: #fdf6e3; padding: 6px 10px; border-radius: 6px;
 }
 .dispatch-hint { font-size: 11px; color: #9aa7bd; font-weight: 400; margin-left: 6px; }
+/* 已跳过的卡：视觉上"退到后面"，但仍完整可读（画像不丢） */
+.dispatch-cust.is-skipped { background: #f1f5f9; border-style: dashed; opacity: .78; }
+.dispatch-tag.skip { background: #f1f5f9; color: #64748b; }
+.dispatch-skipcount {
+  margin-left: 8px; font-size: 11px; font-weight: 500;
+  color: #92400e; background: #fdf6e3;
+  padding: 2px 8px; border-radius: 10px;
+}
+/* 已跳过时输入框禁用 —— 要改先点「恢复这张」，避免"改了却没提交"的误解 */
+.dispatch-card select:disabled,
+.dispatch-card textarea:disabled {
+  background: #f8fafc; color: #94a3b8; cursor: not-allowed;
+}
 .dispatch-err {
   margin-top: 12px; padding: 9px 12px; border-radius: 7px;
   font-size: 12px; color: #b91c1c; background: #fdecec; border: 1px solid #f5c2c2;
