@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 
 import * as echarts from 'echarts'
 import api, { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
+import InfoTip from '../components/InfoTip.vue'
 import { riskLabel, riskBadgeClass, probColor, fmtPercent, channelLabel } from '../utils/risk'
 
 // 页面级请求作用域：本页一次并发 7~9 个请求（全站最多），
@@ -471,7 +472,20 @@ function showOrderToast(msg) {
         <!-- ⚠ 徽章由「实测口径」改为「工单记录」：数据确实来自工单表，
              但该表初始内容是播种的演示记录（见下方说明），
              称"实测"会让人以为这是真实客户反馈。 -->
-        <div class="retention-title">挽留战报 <span class="badge">工单记录（含演示数据）</span></div>
+        <div class="retention-title">
+          挽留战报 <span class="badge">工单记录（含演示数据）</span>
+          <InfoTip>
+            <b class="tip-hd">口径说明</b>
+            以上来自 <code>work_orders</code> 表，其初始内容为<b>播种的演示工单</b>
+            （<code>seed_work_orders.py</code> 生成，处理结果取自硬编码比例表，
+            <b>非真实客户回访结果</b>），故成功率在接入真实反馈前不具备统计意义。
+            <span class="tip-row">
+              本处「已执行 ROI」的分母只含<b>实际已建单完成</b>的工单；
+              上方「期望可挽回金额」旁的 ROI 分母是<b>模型决策线覆盖的全量人群</b>
+              —— 两者分母相差数百倍，<b>不可直接比较</b>。
+            </span>
+          </InfoTip>
+        </div>
         <div class="retention-items">
           <div class="retention-item">
             <div class="retention-num">{{ retention.total_completed }}</div>
@@ -498,17 +512,6 @@ function showOrderToast(msg) {
             <div class="retention-label">已执行 ROI</div>
           </div>
         </div>
-        <!-- 口径与数据来源说明：这段是本次修复的核心 —— 此前页面把
-             播种的演示工单当作"实测口径"展示，且不说明与推算 ROI 不可比。 -->
-        <p class="retention-note">
-          ⚠ 口径说明：以上来自 <code>work_orders</code> 表，其初始内容为
-          <b>播种的演示工单</b>（<code>seed_work_orders.py</code> 生成，处理结果取自
-          硬编码比例表，<b>非真实客户回访结果</b>），故成功率在接入真实反馈前
-          不具备统计意义。<br>
-          另：本处「已执行 ROI」的分母只含<b>实际已建单完成</b>的工单；
-          上方「模型可挽回金额」旁的 ROI 分母是<b>模型决策线覆盖的全量人群</b>
-          —— 两者分母相差数百倍，<b>不可直接比较</b>。
-        </p>
       </div>
 
       <!-- Key Insights + Top Customers -->
@@ -646,11 +649,13 @@ function showOrderToast(msg) {
           <div class="model-status">
             <span v-if="modelMetrics" class="text-xs" style="color:#7c8aa5">
               AUC {{ modelMetrics.auc?.toFixed(4) }} · 5 折 CV {{ modelMetrics.cv_auc_mean?.toFixed(4) }} ± {{ modelMetrics.cv_auc_std?.toFixed(4) }}
+              <InfoTip>
+                <b class="tip-hd">口径说明</b>
+                损失基于历史流失标签（<code>exited=1</code>）与客单价假设折算，
+                属<b>推算值</b>而非预测。
+              </InfoTip>
             </span>
             <span v-else class="text-xs" style="color:#9aa7bd">暂无指标</span>
-            <span class="text-xs mt-1" style="color:#9aa7bd">
-              口径：损失基于历史流失标签（exited=1）与客单价假设折算，属推算值而非预测。
-            </span>
           </div>
         </div>
       </div>
@@ -839,15 +844,6 @@ function showOrderToast(msg) {
 .retention-item { text-align: center; }
 .retention-num { font-size: 22px; font-weight: 700; color: #17335c; }
 .retention-label { font-size: 11px; color: #7c8aa5; margin-top: 3px; }
-/* 口径说明 —— 说明数据来源（播种演示数据）与两个 ROI 分母不可比 */
-.retention-note {
-  margin-top: 14px; padding-top: 12px; border-top: 1px dashed #e5e9f0;
-  font-size: 11px; line-height: 1.75; color: #7c8aa5;
-}
-.retention-note code {
-  background: #f1f5f9; padding: 1px 5px; border-radius: 4px;
-  font-size: 10px; color: #475569;
-}
 
 /* Section Title */
 .section-title {

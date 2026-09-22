@@ -21,6 +21,7 @@
  */
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import api from '../api'
+import InfoTip from '../components/InfoTip.vue'
 import { AGENT_KEY_PREFIX, KEY_USER, agentKeyFor } from '../utils/userStorage'
 
 /**
@@ -506,8 +507,12 @@ function warnClass(level) {
       <div>
         <h1 class="agent-title">智能助手</h1>
         <p class="agent-sub">
-          基于系统真实数据的任务型助手。数字全部来自系统计算，不经过模型推算；
-          建单等写操作需你确认后执行。
+          基于系统真实数据的任务型助手
+          <InfoTip>
+            <b class="tip-hd">说明</b>
+            数字全部来自系统计算，<b>不经过模型推算</b>；
+            建单等写操作需你确认后执行。
+          </InfoTip>
         </p>
       </div>
       <div class="agent-status">

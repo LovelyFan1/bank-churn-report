@@ -4,6 +4,7 @@ import * as echarts from 'echarts'
 import api, { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
+import InfoTip from '../components/InfoTip.vue'
 import { useAuthStore } from '../stores/auth'
 
 // 页面级请求作用域：本页并发 5 个请求（其中 roc-curves 响应体 525 KB），
@@ -462,22 +463,27 @@ onBeforeUnmount(() => {
     <template v-else>
       <!-- Model Comparison Table -->
       <div class="glass-card p-5 overflow-x-auto">
-        <h3 class="text-sm font-medium text-gray-400 mb-1">模型性能对比</h3>
-        <!-- 口径说明：表格是各模型在【同一阈值】下的公平对比；
-             真实运营用的是决策阈值，两者 recall 差异很大，必须讲清楚 -->
-        <p class="text-xs mb-3" style="color:#7c8aa5">
-          下表为各模型在<strong>同一判定阈值</strong>下的公平对比。
-          <template v-if="riskInfo?.decision_metrics">
-            系统实际按<strong>决策阈值 {{ riskInfo.decision_metrics.threshold }}</strong>
-            （净收益最优，覆盖约 {{ ((riskInfo.decision_coverage || 0) * 100).toFixed(0) }}% 客户）挑客户，
-            该口径下最优模型的实测
-            <span style="color:#1d4ed8">
-              召回率 {{ (riskInfo.decision_metrics.recall * 100).toFixed(1) }}% ·
-              精确率 {{ (riskInfo.decision_metrics.precision * 100).toFixed(1) }}%
-            </span>
-            （测试集 {{ riskInfo.decision_metrics.sample_size?.toLocaleString() }} 人）。
-          </template>
-        </p>
+        <h3 class="text-sm font-medium text-gray-400 mb-3">
+          模型性能对比
+          <!-- 口径说明：表格是各模型在【同一阈值】下的公平对比；
+               真实运营用的是决策阈值，两者 recall 差异很大，必须讲清楚 -->
+          <InfoTip>
+            <b class="tip-hd">阈值口径</b>
+            下表为各模型在<strong>同一判定阈值</strong>下的公平对比。
+            <template v-if="riskInfo?.decision_metrics">
+              <span class="tip-row">
+                系统实际按<strong>决策阈值 {{ riskInfo.decision_metrics.threshold }}</strong>
+                （净收益最优，覆盖约 {{ ((riskInfo.decision_coverage || 0) * 100).toFixed(0) }}% 客户）挑客户，
+                该口径下最优模型的实测
+                <strong>
+                  召回率 {{ (riskInfo.decision_metrics.recall * 100).toFixed(1) }}% ·
+                  精确率 {{ (riskInfo.decision_metrics.precision * 100).toFixed(1) }}%
+                </strong>
+                （测试集 {{ riskInfo.decision_metrics.sample_size?.toLocaleString() }} 人）。
+              </span>
+            </template>
+          </InfoTip>
+        </h3>
         <table v-if="comparison" class="w-full text-sm">
           <thead>
             <tr class="text-gray-500 border-b border-[#e5e9f0]">

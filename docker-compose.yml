@@ -140,6 +140,11 @@ services:
       - API_PROXY_TARGET=http://backend:8000
     volumes:
       - ./frontend/src:/app/src
+      # ⚠ 必须一并挂载配置文件：镜像里烤的是**构建时**的那一份，
+      #   只挂 src 会导致改了 vite.config.js 却不生效（表现为
+      #   「明明加了 allowedHosts，隧道访问仍 403」）。
+      #   单文件挂载，不动 node_modules。
+      - ./frontend/vite.config.js:/app/vite.config.js
     depends_on:
       - backend
     command: npm run dev

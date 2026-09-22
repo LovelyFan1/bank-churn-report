@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
+import InfoTip from '../components/InfoTip.vue'
 import { fmtPercent, fmtWan, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
 
 // 页面级请求作用域：本页并发 5 个请求，离开时取消在途请求
@@ -248,35 +249,47 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 口径标注：上面的数是「模型推算」，下面的是「工单记录」，两者不可混为一谈 -->
-    <div v-if="businessSummary" class="src-note src-model">
-      <b>📐 推算值</b>：以上四项由模型测试集指标 × 假设客单价
-      ¥{{ businessSummary.avg_customer_value?.toLocaleString() }} ×
-      <b>假设挽留成功率 {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%</b>
-      推算得出，<b>不是</b>实际发生的业务结果。
-      模型召回率 {{ (businessSummary.model_recall * 100).toFixed(1) }}% 意味着约
-      {{ (100 - businessSummary.model_recall * 100).toFixed(1) }}% 的流失客户未被识别。<br>
-      <!-- ⚠ ROI 的公式必须写出来，否则读者无法判断它依赖哪些假设。
-           ROI = COST_RATIO × precision × success_rate，三项里有两项是假设值。 -->
-      ROI = 成本比 {{ businessSummary.cost_ratio ?? 5 }} × 精准率
-      {{ (businessSummary.model_precision * 100).toFixed(1) }}% × 挽留成功率
-      {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%
-      = <b>{{ businessSummary.roi }}x</b>。
-      「期望可挽留」= 判对人数(TP) {{ (businessSummary.tp_at_threshold ?? businessSummary.retained_customers ?? 0).toLocaleString() }}
-      × 挽留成功率 —— <b>不是</b>模型判对的人数本身。
+    <div v-if="businessSummary" class="src-line">
+      <span class="text-xs text-gray-500">📐 推算值</span>
+      <InfoTip>
+        <b class="tip-hd">推算口径</b>
+        以上四项由模型测试集指标 × 假设客单价
+        ¥{{ businessSummary.avg_customer_value?.toLocaleString() }} ×
+        <b>假设挽留成功率 {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%</b>
+        推算得出，<b>不是</b>实际发生的业务结果。
+        模型召回率 {{ (businessSummary.model_recall * 100).toFixed(1) }}% 意味着约
+        {{ (100 - businessSummary.model_recall * 100).toFixed(1) }}% 的流失客户未被识别。
+        <span class="tip-row">
+          <!-- ⚠ ROI 的公式必须写出来，否则读者无法判断它依赖哪些假设。
+               ROI = COST_RATIO × precision × success_rate，三项里有两项是假设值。 -->
+          ROI = 成本比 {{ businessSummary.cost_ratio ?? 5 }} × 精准率
+          {{ (businessSummary.model_precision * 100).toFixed(1) }}% × 挽留成功率
+          {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%
+          = <b>{{ businessSummary.roi }}x</b>。
+          「期望可挽留」= 判对人数(TP)
+          {{ (businessSummary.tp_at_threshold ?? businessSummary.retained_customers ?? 0).toLocaleString() }}
+          × 挽留成功率 —— <b>不是</b>模型判对的人数本身。
+        </span>
+      </InfoTip>
     </div>
 
     <!-- 挽留效果复盘（工单记录） -->
     <div class="glass-card p-5">
-      <h3 class="text-sm font-medium text-gray-400 mb-2">挽留效果复盘（工单记录）</h3>
-      <p class="text-xs text-gray-600 mb-4">
-        数据来源：<code>work_orders</code> 表的 <code>result</code> 字段，按已办结工单聚合。
-        <b class="text-amber-500">⚠ 该表初始内容为播种的演示工单</b>
-        （<code>seed_work_orders.py</code> 生成，处理结果取自硬编码比例表，
-        <b>非真实客户回访结果</b>），故成功率在接入真实反馈前不具备统计意义。<br>
-        <b class="text-amber-500">⚠ 与上方「推算值」的 ROI 不可直接比较</b>：
-        本处 ROI 的分母只含<b>实际已建单完成</b>的工单，
-        而上方推算 ROI 的分母是<b>模型决策线覆盖的全量人群</b>，两者分母相差数百倍。
-      </p>
+      <h3 class="text-sm font-medium text-gray-400 mb-4">
+        挽留效果复盘（工单记录）
+        <InfoTip>
+          <b class="tip-hd">数据来源与口径</b>
+          数据来源：<code>work_orders</code> 表的 <code>result</code> 字段，按已办结工单聚合。
+          <span class="tip-warn">该表初始内容为播种的演示工单</span>
+          （<code>seed_work_orders.py</code> 生成，处理结果取自硬编码比例表，
+          <b>非真实客户回访结果</b>），故成功率在接入真实反馈前不具备统计意义。
+          <span class="tip-row">
+            <span class="tip-warn">与上方「推算值」的 ROI 不可直接比较</span>：
+            本处 ROI 的分母只含<b>实际已建单完成</b>的工单，
+            而上方推算 ROI 的分母是<b>模型决策线覆盖的全量人群</b>，两者分母相差数百倍。
+          </span>
+        </InfoTip>
+      </h3>
 
       <div v-if="retention && retention.has_data" class="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div class="metric-card text-center">
@@ -359,18 +372,33 @@ onBeforeUnmount(() => {
 
     <!-- 价值层 × 风险等级 矩阵 -->
     <div class="glass-card p-6">
-      <div class="flex items-start justify-between mb-1">
+      <div class="flex items-start justify-between mb-4">
         <h3 class="text-sm font-medium text-gray-400">
           价值层 × 风险等级 —— 该优先做什么
+          <InfoTip>
+            <b class="tip-hd">口径说明</b>
+            风险等级来自模型（会不会跑），价值层来自余额（跑了值多少）。
+            同样一个「高危」，高价值客户要客户经理上门，零余额客户一条 APP 推送即可。
+            <span class="tip-row">
+              人数 / 历史流失率 / 平均余额 / 可挽回金额均为测试集实测
+              （描述性统计，不外推未来收益）。
+              可挽回金额 = 该格流失客户余额合计 × 全局召回率 {{ fmtPercent(matrix.recall_used) }}。
+            </span>
+            <span class="tip-row">
+              <span class="tip-warn">「紧急」整行历史流失率为 100%，属实</span> ——
+              该档在训练集/测试集/全量上稳定为 100%，模型在此已接近规则
+              （多产品且非活跃的组合几乎必然流失），不是统计口径错误。
+            </span>
+            <span class="tip-row">
+              「建议动作」取自后端统一策略规则（与客户列表、建单弹窗同源），
+              非实测结果；上方统计量为测试集实测。
+            </span>
+          </InfoTip>
         </h3>
         <span v-if="matrix" class="text-xs text-gray-600">
           测试集 {{ matrixTotals.testSize.toLocaleString() }} 人 · 模型 {{ matrix.model }}
         </span>
       </div>
-      <p class="text-xs text-gray-600 mb-4">
-        风险等级来自模型（会不会跑），价值层来自余额（跑了值多少）。
-        同样一个「高危」，高价值客户要客户经理上门，零余额客户一条 APP 推送即可。
-      </p>
 
       <div v-if="matrixError" class="empty-state">
         <div class="text-2xl mb-2">🧠</div>
@@ -438,24 +466,26 @@ onBeforeUnmount(() => {
             </tbody>
           </table>
         </div>
-
-        <div class="mt-4 pt-3 border-t border-[#e5e9f0] text-xs text-gray-600 leading-relaxed">
-          <span class="text-gray-500">口径：</span>
-          人数 / 历史流失率 / 平均余额 / 可挽回金额均为测试集实测（描述性统计，不外推未来收益）。
-          可挽回金额 = 该格流失客户余额合计 × 全局召回率 {{ fmtPercent(matrix.recall_used) }}。
-          <br>
-          <span class="text-amber-500/80">⚠</span>
-          「紧急」整行历史流失率为 100%，属实 —— 该档在训练集/测试集/全量上稳定为 100%，
-          模型在此已接近规则（多产品且非活跃的组合几乎必然流失），不是统计口径错误。
-          <br>
-          <span class="text-gray-600">「建议动作」取自后端统一策略规则（与客户列表、建单弹窗同源），非实测结果；上方统计量为测试集实测。</span>
-        </div>
       </template>
     </div>
 
     <!-- Cost-Benefit Summary -->
     <div v-if="businessSummary" class="glass-card p-6">
-      <h3 class="text-sm font-medium text-gray-400 mb-4">模型干预效果（推算）</h3>
+      <h3 class="text-sm font-medium text-gray-400 mb-4">
+        模型干预效果（推算）
+        <InfoTip>
+          <b class="tip-hd">推算口径</b>
+          以上为模型推算值，非工单执行结果。ROI = 成本比
+          {{ businessSummary.cost_ratio ?? 5 }} × 精准率
+          {{ (businessSummary.model_precision * 100).toFixed(1) }}% × 挽留成功率
+          {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%
+          —— 其中「挽留成功率」是<b>业务假设值</b>，成功率越低则该值越小、最优阈值越高。
+          <span class="tip-row">
+            请与上方「挽留效果复盘（工单记录）」区分阅读，
+            两者的 ROI 分母口径不同、不可直接比较。
+          </span>
+        </InfoTip>
+      </h3>
       <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
         <div class="text-center p-4 rounded-xl bg-white/3">
           <div class="text-2xl font-bold text-indigo-400">{{ (businessSummary.model_recall * 100).toFixed(1) }}%</div>
@@ -485,28 +515,16 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </div>
-      <p class="src-note src-model mt-4" style="margin-bottom:0">
-        ⚠ 以上为模型推算值，非工单执行结果。ROI = 成本比
-        {{ businessSummary.cost_ratio ?? 5 }} × 精准率
-        {{ (businessSummary.model_precision * 100).toFixed(1) }}% × 挽留成功率
-        {{ Math.round((businessSummary.success_rate ?? 0) * 100) }}%
-        —— 其中「挽留成功率」是<b>业务假设值</b>，成功率越低则该值越小、最优阈值越高。
-        请与上方「挽留效果复盘（工单记录）」区分阅读，两者的 ROI 分母口径不同、不可直接比较。
-      </p>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* 口径来源标注 —— 让「推算值」与「实测值」在视觉上不可混淆 */
-.src-note {
-  font-size: 11.5px; line-height: 1.65;
-  padding: 10px 14px; border-radius: 8px;
-  border-left: 3px solid #1d4ed8;
-  background: #eef3fb;
-  color: #1d4ed8;
+/* 口径来源标注 —— 说明收进 InfoTip 后只剩一行标签 */
+.src-line {
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 2px;
 }
-.src-note b { color: #17335c; }
 
 .mini-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .mini-table th {
