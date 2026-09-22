@@ -94,8 +94,17 @@ console.log(`填错误编号 C999999 → 提示「${err2 || '(无)'}」`)
 if (!err2.includes('未找到')) fails.push('错误编号未给出"未找到客户"提示')
 
 console.log()
-console.log('控制台错误', errors.length, '条')
-errors.slice(0, 5).forEach(e => console.log('  ·', e.slice(0, 140)))
+// ⚠ 这里预期会有 404：上面第 88 行**故意**填了不存在的客户编号 C999999，
+//   用来验证"编号填错要给出明确提示"这条路径。
+//   因此 404 是**测试设计的一部分**，不是缺陷。
+//   但也不能无条件放过 —— 只允许 404，其它错误（500/控制台异常）仍需报警。
+const EXPECTED_404 = 2   // 前端会请求两次（详情 + 建议理由）
+const nonExpected = errors.filter(e => !e.includes('404'))
+const n404 = errors.length - nonExpected.length
+console.log(`控制台错误 ${errors.length} 条（其中 404 ${n404} 条为故意触发，预期 ${EXPECTED_404} 条）`)
+nonExpected.slice(0, 5).forEach(e => console.log('  · [非预期]', e.slice(0, 140)))
+if (nonExpected.length) fails.push(`出现非预期控制台错误 ${nonExpected.length} 条`)
+
 console.log()
 if (fails.length) {
   console.log(`结论：FAIL —— ${fails.length} 项`)

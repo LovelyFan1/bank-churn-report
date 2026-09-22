@@ -128,6 +128,35 @@ def node_guard(state: AgentState) -> dict:
     }
 
 
+def node_meta(state: AgentState) -> dict:
+    """①b 元问题 —— 确定性回答（问系统自身），不调 LLM。
+
+    ⚠ 为什么单独一个节点、且放在 Guard 之后、Agent 之前：
+      实测（diag126）问「可调用工具？」模型答「当前无可用工具」，
+      而系统实际有 9 个工具 —— 错误答案配 `llm_verified`。
+      根因是模型看不见自己的工具清单，只能凭"没有数据"来搪塞。
+
+      这类问题的答案**有唯一事实来源**（工具注册表 / 拒答规则 / 依赖清单），
+      因此拼出来即可，零幻觉可能，也省一次 LLM 调用。
+      放在 Agent 之前是为了**根本不给模型瞎答的机会**。
+
+    不是元问题时返回空 dict，图继续走 Agent。
+    """
+    from app.agent import meta
+
+    ans = meta.answer(state.get("question", ""))
+    if ans is None:
+        return {}
+    logger.info("agent: 元问题由确定性模板回答 kind=%s", ans.get("meta_kind"))
+    return {
+        "answer": ans,
+        "final": ans.get("text") or ans.get("headline") or "",
+        # 口径：系统模板生成，与 LLM 无关
+        "answer_basis": "system_meta",
+        "citations": [f"meta://{ans.get('meta_kind')}"],
+    }
+
+
 def node_agent(state: AgentState) -> dict:
     """② LLM 决策节点 —— 决定调工具还是直接答。
 
@@ -255,6 +284,13 @@ def node_tools(state: AgentState) -> dict:
     """③ 执行工具。
 
     只读工具立即执行；写工具**不执行**，转为 pending_action 交给前端确认。
+
+    ⚠ 去重（实测缺陷 diag126）：模型会**在同一个 AIMessage 里重复发起
+      相同的工具调用**。实测问「你有哪些工具」时，3 个工具各被调了 **4 遍**
+      （共 12 次调用），延迟与 token 都翻了几倍。
+      这是模型行为，不是我们代码的 bug —— 但**执行侧应该挡住**：
+      同一轮内 (工具名, 参数) 完全相同的调用只执行一次，后续直接复用结果。
+      跨轮不去重：模型可能确实需要重查（例如先查列表再查某一项）。
     """
     last = None
     for m in reversed(state.get("messages", [])):
@@ -268,12 +304,25 @@ def node_tools(state: AgentState) -> dict:
     results = list(state.get("tool_results", []))
     pending = None
 
+    # 本轮内的去重表：key = (工具名, 参数 JSON) → 已执行的结果。
+    # ⚠ 作用域仅限**本轮**（本函数一次调用）—— 跨轮不去重，
+    #    因为模型可能确实需要重查（先查列表、再查其中某一项）。
+    seen_this_round: dict[str, dict] = {}
+
     for tc in last.tool_calls:
         name = tc["name"]
         args = tc.get("args") or {}
+        dedup_key = f"{name}::{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+
+        if dedup_key in seen_this_round:
+            cached = seen_this_round[dedup_key]
+            logger.info("agent: 跳过重复工具调用 %s（本轮已执行）", name)
+            continue
+
         if name in tools.WRITE_TOOL_NAMES:
             # 写操作：生成待确认动作，**不落库**
             r = tools.call_tool(name, args)
+            seen_this_round[dedup_key] = r
             made.append({"name": name, "args": args, "ok": r.get("ok", False),
                          "result": r.get("result"), "error": r.get("error")})
             if r.get("ok"):
@@ -282,6 +331,7 @@ def node_tools(state: AgentState) -> dict:
             continue
 
         r = tools.call_tool(name, args)
+        seen_this_round[dedup_key] = r
         made.append({"name": name, "args": args, "ok": r.get("ok", False),
                      "result": r.get("result"), "error": r.get("error")})
         results.append({
@@ -534,34 +584,49 @@ def node_verify(state: AgentState) -> dict:
         logger.warning("agent: 写手文字数字校验未通过，孤儿=%s", orphans)
         headline, insights = "", []
 
-    # ── 关键：无工具调用 + 需要数据 = 无依据的断言，**不得**给高可信度徽章 ──
+    # ── 徽章判据：只有「真的查到过数据」才配叫「数字已校验」 ──
     #
-    # ⚠ 实测缺陷（diag116）：问「帮我取消已建单待处理状态客户」，模型没调
-    #   任何工具就答「没有已建单待处理状态的客户」，而库里实际有 1 张
-    #   pending 工单。它拿到的却是 `llm_verified`（"数字已校验"）——
-    #   因为校验器只查"数字有没有出处"，一个数字都没有自然"通过"。
+    # ⚠ 实测缺陷演进（两个阶段，都是同一个病）：
     #
-    #   这是**最危险的一类错误**：错误答案配高可信度标记。
-    #   修法：把「有没有真的查过数据」纳入口径判定。
-    #   没查过数据却回答需要数据的问题 → `ungrounded`，
-    #   前端必须显著警示，不能显示"已校验"。
+    #   阶段一（diag116）：问「帮我取消已建单待处理状态客户」，模型没调任何
+    #     工具就答「没有已建单待处理状态的客户」，而库里实际有 1 张 pending
+    #     工单。它拿到的是 `llm_verified` —— 因为校验器只查"数字有没有出处"，
+    #     一个数字都没有自然"通过"。
+    #
+    #   阶段二（diag126，当前修的就是这个）：我当时的修法是
+    #        `if not retrieved and _needs_data(question)`
+    #    即**依赖问题分类**。结果元问题（「你是谁」「可调用工具？」）被判为
+    #    "不需要数据"，**完美绕过**该检查，照样拿到 llm_verified。实测
+    #    「可调用工具？」答**"当前无可用工具"**，而系统实际有 9 个工具 ——
+    #    又是"错误答案配高可信度徽章"。
+    #
+    #   根本问题：**用问题分类当判据必然有漏网**（分类表永远不全）。
+    #   正确判据与问题无关：
+    #       调过工具且成功 → 可以给 llm_verified
+    #       零工具调用     → 一律不给（无论问的是什么）
+    #
+    #   这样把"问什么"从判据里彻底去掉 —— 不用维护关键词表，也不会再有
+    #   漏网。代价是纯知识性提问（"什么是流失率"）也会被标为无依据，
+    #   但那是**诚实**的：模型确实没有依据，它只是凭训练知识作答。
     retrieved = [t for t in tool_results if t.get("ok")]
-    if not retrieved and _needs_data(state.get("question", "")):
-        logger.warning("agent: 未查数据即作答，标记 ungrounded q=%s",
+    if not retrieved:
+        logger.warning("agent: 零工具调用即作答，标记 no_data q=%s",
                        state.get("question", "")[:40])
         ans = answer_builder.build(tool_results, state["question"],
                                    llm_headline=headline, llm_insights=insights)
+        # 答案本身来自模型（可能是常识性回答），但**没有系统数据支撑**，
+        # 故不冠以"已校验"，并明确告知用户这一点的含义。
         ans["warning"] = {
-            "level": "guard",
-            "text": "⚠ 本次回答**没有查询系统数据**，可能不准确。",
-            "hint": "模型没有调用任何查询工具。请换个问法重试，或直接在对应页面查看。",
+            "level": "info",
+            "text": "本次回答未经系统数据核对（模型未查询任何数据）。",
+            "hint": "若问的是客户/工单/阈值等业务数据，请换个问法重试。",
         }
         return {
-            "verify_passed": False,
-            "verify_fail": [],
+            "verify_passed": ok,
+            "verify_fail": orphans,
             "final": state.get("draft", ""),
             "answer": ans,
-            "answer_basis": "ungrounded",
+            "answer_basis": "no_data",
             "citations": [],
         }
 
@@ -906,6 +971,15 @@ def route_after_guard(state: AgentState) -> str:
     return "blocked" if state.get("guard_block") else "continue"
 
 
+def route_after_meta(state: AgentState) -> str:
+    """meta 之后：已给出确定性答案就结束，否则交给 LLM 决策。
+
+    ⚠ 判据用 `answer` 是否存在，而不是重新调一次 meta.detect() ——
+      避免"判断两次"导致两处结论不一致（本项目反复踩过的坑）。
+    """
+    return "done" if state.get("answer") else "agent"
+
+
 def route_after_agent(state: AgentState) -> str:
     """LLM 决策之后：有工具调用则执行，否则进入措辞。
 
@@ -1052,6 +1126,7 @@ def build_graph():
     g = StateGraph(AgentState)
 
     g.add_node("guard", node_guard)
+    g.add_node("meta", node_meta)
     g.add_node("agent", node_agent)
     g.add_node("force_tools", node_force_tools)
     g.add_node("force_write", node_force_write)
@@ -1062,7 +1137,9 @@ def build_graph():
 
     g.set_entry_point("guard")
     g.add_conditional_edges("guard", route_after_guard,
-                            {"blocked": END, "continue": "agent"})
+                            {"blocked": END, "continue": "meta"})
+    g.add_conditional_edges("meta", route_after_meta,
+                            {"done": END, "agent": "agent"})
     g.add_conditional_edges("agent", route_after_agent,
                             {"tools": "tools", "synthesize": "synthesize",
                              "force_tools": "force_tools"})

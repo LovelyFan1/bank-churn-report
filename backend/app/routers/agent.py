@@ -68,14 +68,20 @@ async def agent_capabilities():
         "tools": [
             {"name": n,
              "write": s["write"],
+             # label 是面向用户的中文说明（见 tools.TOOL_SPECS 的说明）
+             "label": s.get("label") or s["description"],
              "description": s["description"]}
             for n, s in tools_mod.TOOL_SPECS.items()
         ],
+        # ⚠ `blocked` 保留在接口里（供其它调用方与测试使用），
+        #   但**前端能力面板不再展示它** —— 用户要求能力范围只列可做项。
+        #   拦截逻辑本身不受影响：guard_rules 仍在调用模型前拦下这三类问题。
         "blocked": guard_rules.known_topics(),
         "basis_meaning": {
             "llm_verified": "模型作答，且其中每个数字都已通过溯源校验",
             "llm_partial_dropped": "模型解读含无法溯源的数字，已丢弃该段；数据卡片不受影响",
-            "ungrounded": "⚠ 模型未查询任何系统数据即作答，回答可能不准确",
+            "system_meta": "系统信息类问题，由确定性模板回答（不经过模型）",
+            "no_data": "模型未查询任何系统数据即作答，未经数据核对",
             "guard_blocked": "该问题触及本系统答不了的边界，已在调用模型前拦截",
             "system_pending_action": "系统生成的待确认操作说明（未执行写操作）",
             "disabled": "智能体未启用",

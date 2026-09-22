@@ -15,6 +15,7 @@
  *   生产库 62 条工单是真实数据。
  */
 import { chromium } from 'playwright-core'
+import { installReadOnlyGuard } from './_guard.mjs'
 
 const EXE = process.env.USERPROFILE +
   '\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe'
@@ -27,21 +28,14 @@ const errors = []
 page.on('console', m => { if (m.type() === 'error') errors.push(m.text()) })
 page.on('pageerror', e => errors.push('pageerror: ' + e.message))
 
-const batchCalls = []
-await page.route('**/api/agent/confirm-batch', route => {
-  batchCalls.push(JSON.parse(route.request().postData() || '{}'))
-  return route.fulfill({
-    status: 200, contentType: 'application/json',
-    body: JSON.stringify({
-      requested: 2, succeeded: 2, failed_count: 0, skipped_count: 0,
-      created: [
-        { id: 9001, customer_id: 'C034525', customer_name: 'Goddard', assignee: '' },
-        { id: 9002, customer_id: 'C062858', customer_name: 'Pirogov', assignee: '' },
-      ],
-      failed: [], skipped: [],
-    }),
-  })
-})
+// ⚠ 用共享只读护栏（唯一一条兜底路由，内部按 URL/method 分发）。
+//   历史事故：本脚本原先只拦 confirm-batch，而**不拦 /agent/confirm** ——
+//   如果页面走了单条确认路径，请求就会穿透到后端真实建单。
+//   详见 _guard.mjs 说明。
+const guard = await installReadOnlyGuard(page)
+// batchCalls 是护栏里的**活数组**（只含批量建单的解析后 payload）。
+// ⚠ 不能在这里 map 一次就存下 —— 那是注册时刻的快照，永远是空的。
+const batchCalls = guard.batchPayloads
 
 const fails = []
 const grayed = []

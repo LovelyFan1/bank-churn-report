@@ -431,51 +431,66 @@ def propose_delete_work_order(order_id: int) -> dict:
 
 # ── 注册表 ───────────────────────────────────────────────
 # name 必须与 LLM 看到的 function name 一致。
-# 新增工具时**只改这一处**，graph/tools 两边都从这里读。
+# 新增工具时**只改这一处**，graph / tools / 前端能力清单三边都从这里读。
+#
+# ⚠ `label` 是**面向用户的中文说明**，与 `description`（取自 docstring，
+#   给 LLM 看的、可能含实现细节）**分开维护**：
+#     · description 可能写得很长或带内部术语，直接展示给用户不合适
+#     · 用户要的是"我能用它做什么"，不是"这个函数内部怎么实现的"
+#   两者同源于本表，因此不会出现"界面说的和实际工具不符"。
 TOOL_SPECS = {
     "get_customer_risk": {
         "fn": get_customer_risk,
         "write": False,
+        "label": "查单个客户的流失风险详情",
         "description": get_customer_risk.__doc__.strip().split("\n")[0],
     },
     "list_customers": {
         "fn": list_customers,
         "write": False,
+        "label": "按条件查客户名单",
         "description": list_customers.__doc__.strip().split("\n")[0],
     },
     "get_model_thresholds": {
         "fn": get_model_thresholds,
         "write": False,
+        "label": "查当前模型的口径：决策阈值、分位数分级线、成本比、挽留成功率",
         "description": get_model_thresholds.__doc__.strip().split("\n")[0],
     },
     "get_business_summary": {
         "fn": get_business_summary,
         "write": False,
+        "label": "查成本收益推算：年度流失、期望挽留人数、干预投入、ROI",
         "description": get_business_summary.__doc__.strip().split("\n")[0],
     },
     "get_workorder_stats": {
         "fn": get_workorder_stats,
         "write": False,
+        "label": "查工单统计：各状态数量、负责人清单",
         "description": get_workorder_stats.__doc__.strip().split("\n")[0],
     },
     "list_work_orders": {
         "fn": list_work_orders,
         "write": False,
+        "label": "列出具体工单（含编号、客户、负责人、状态）",
         "description": list_work_orders.__doc__.strip().split("\n")[0],
     },
     "propose_create_work_order": {
         "fn": propose_create_work_order,
         "write": True,
+        "label": "提议给某个客户创建挽留工单（不会立即执行）",
         "description": propose_create_work_order.__doc__.strip().split("\n")[0],
     },
     "propose_update_work_order": {
         "fn": propose_update_work_order,
         "write": True,
+        "label": "提议修改工单（改状态 / 负责人 / 备注），不会立即执行",
         "description": propose_update_work_order.__doc__.strip().split("\n")[0],
     },
     "propose_delete_work_order": {
         "fn": propose_delete_work_order,
         "write": True,
+        "label": "提议删除工单（即「取消这张单」），不会立即执行",
         "description": propose_delete_work_order.__doc__.strip().split("\n")[0],
     },
 }

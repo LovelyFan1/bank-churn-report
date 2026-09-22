@@ -11,6 +11,7 @@
  * ⚠ 只读：拦截所有写请求，不真的删单（用户手工建的 #63 必须保留）。
  */
 import { chromium } from 'playwright-core'
+import { installReadOnlyGuard } from './_guard.mjs'
 
 const EXE = process.env.USERPROFILE +
   '\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe'
@@ -23,18 +24,12 @@ const errors = []
 page.on('console', m => { if (m.type() === 'error') errors.push(m.text()) })
 page.on('pageerror', e => errors.push('pageerror: ' + e.message))
 
-const writes = []
-await page.route('**/api/agent/confirm', route => {
-  writes.push(route.request().postData())
-  return route.fulfill({ status: 200, contentType: 'application/json',
-                         body: JSON.stringify({ created: false, deleted: true, order_id: 9999 }) })
-})
-await page.route('**/api/agent/confirm-batch', route => {
-  writes.push(route.request().postData())
-  return route.fulfill({ status: 200, contentType: 'application/json',
-                         body: JSON.stringify({ requested: 0, succeeded: 0, failed_count: 0,
-                                                skipped_count: 0, created: [], failed: [], skipped: [] }) })
-})
+// ⚠ 用共享只读护栏（唯一一条兜底路由，内部按 URL/method 分发）。
+//   历史事故：本脚本原先自己注册多条 page.route，导致 confirm 请求
+//   穿透到后端，把用户手工创建的工作单 #63 真实删除了。
+//   详见 docs/audit/_guard.mjs 顶部说明。
+const guard = await installReadOnlyGuard(page)
+const writes = guard.blocked   // 兼容下方既有断言：被拦下的写请求
 
 const fails = []
 
@@ -107,9 +102,51 @@ if (turns2 < 4) fails.push(`新标签页会话未恢复（turns=${turns2}）`)
 await page2.close()
 
 // ── 5) 取消工单按钮 ────────────────────────────────
+// ⚠ 前置夹具：必须**先自己造一张 pending 工单**，不能依赖"库里恰好有"。
+//   实测教训：本脚本原先假设库里存在待处理工单，而那张单被之前的测试
+//   事故删掉了（详见 _guard.mjs）。于是"未出现取消按钮"被误报成产品缺陷，
+//   实际上 Agent 回答「当前无待处理工单，无需取消」是**正确的**。
+//
+// ⚠ 夹具必须用 page.request 发（实测 diag125：page.request **绕过**
+//   page.route，护栏拦不住它），因此**必须自己负责删除**。
+//   这是唯一允许真实写库的地方，且严格限定在 finally 里清理。
 console.log()
 console.log('=' .repeat(88))
-console.log('五、问「帮我取消已建单待处理状态客户」')
+console.log('五、造夹具：新建一张处于 pending 的工单')
+const API = 'http://localhost:8000/api'
+let fixtureOrderId = null
+let fixtureCreated = false    // 只有本测试**新建**的才删；复用的不动
+{
+  const r = await page.request.post(`${API}/work-orders`, {
+    data: {
+      customer_id: 'C062858', customer_name: 'Pirogov', geography: 'France',
+      risk_level: 'CRITICAL', probability: 0.8883, balance: 225534.51,
+      risk_factors: [], strategy: '客户经理上门 + 定制挽留方案',
+      assignee: '', channel: 'relationship', value_tier_snapshot: 'HIGH',
+      expected_value_snapshot: 200331.86,
+    },
+  })
+  if (r.status() === 201) {
+    fixtureOrderId = (await r.json()).id
+    fixtureCreated = true
+    console.log('  已建夹具工单 #' + fixtureOrderId)
+  } else {
+    const body = await r.text()
+    console.log('  建夹具返回 ' + r.status() + '：' + body.slice(0, 130))
+    const m = body.match(/#(\d+)/)
+    if (m) {
+      fixtureOrderId = Number(m[1])
+      console.log('  复用已有进行中工单 #' + fixtureOrderId + '（不删，非本测试创建）')
+    } else {
+      fails.push('无法准备夹具工单，取消流程无法验证')
+    }
+  }
+}
+
+try {
+console.log()
+console.log('=' .repeat(88))
+console.log('五之二、问「帮我取消已建单待处理状态客户」')
 await ask('帮我取消已建单待处理状态客户')
 const last = page.locator('.turn.agent').last()
 const basis = (await last.locator('.basis').innerText()).trim()
@@ -170,6 +207,25 @@ console.log('  清空后 turns 数:', turns)
 console.log('  localStorage:', lsAfter === null ? '已清除' : `仍有 ${lsAfter.length} 字节`)
 if (turns !== 0) fails.push(`清空后仍有 ${turns} 条消息`)
 if (lsAfter !== null) fails.push('清空后 localStorage 未被清除')
+
+} finally {
+  // ── 夹具清理（必须无条件的）───────────────────────────
+  // ⚠ 夹具是用 page.request 真实写库的（绕过护栏，见上面说明），
+  //   所以这里必须删掉。放在 finally：即使断言失败/抛异常也要清理，
+  //   否则测试会在库里留垃圾 —— 之前的事故正是"以为清干净了"。
+  console.log()
+  console.log('=' .repeat(88))
+  console.log('七、清理夹具')
+  if (fixtureOrderId && fixtureCreated) {
+    const del = await page.request.delete(`${API}/work-orders/${fixtureOrderId}`)
+    console.log(`  删除夹具工单 #${fixtureOrderId} → HTTP ${del.status()}`)
+    if (del.status() !== 204) fails.push('夹具清理失败，库中残留测试工单')
+  } else if (fixtureOrderId) {
+    console.log(`  工单 #${fixtureOrderId} 非本测试创建，保留不动`)
+  } else {
+    console.log('  （无夹具需要清理）')
+  }
+}
 
 console.log()
 console.log('=' .repeat(88))

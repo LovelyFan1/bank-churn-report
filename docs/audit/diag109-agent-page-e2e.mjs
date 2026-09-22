@@ -14,6 +14,7 @@
  *   生产库 62 条工单是真实数据。
  */
 import { chromium } from 'playwright-core'
+import { installReadOnlyGuard } from './_guard.mjs'
 
 const EXE = process.env.USERPROFILE +
   '\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe'
@@ -26,14 +27,11 @@ const errors = []
 page.on('console', m => { if (m.type() === 'error') errors.push(m.text()) })
 page.on('pageerror', e => errors.push('pageerror: ' + e.message))
 
-const confirmAttempts = []
-await page.route('**/api/agent/confirm', route => {
-  confirmAttempts.push(route.request().postData())
-  return route.fulfill({
-    status: 200, contentType: 'application/json',
-    body: JSON.stringify({ created: true, order: { id: 9999 } }),
-  })
-})
+// ⚠ 用共享只读护栏（唯一一条兜底路由，内部按 URL/method 分发）。
+//   历史事故：多个脚本各自注册 page.route 拦写请求，实测有 confirm
+//   请求穿透到后端，真实删除了用户创建的工单。详见 _guard.mjs 说明。
+const guard = await installReadOnlyGuard(page)
+const confirmAttempts = guard.blocked   // 兼容下方断言
 
 const fails = []
 
@@ -53,14 +51,21 @@ console.log('可用性状态:', statusTxt)
 console.log('=' .repeat(88))
 if (!statusTxt.includes('已连接')) fails.push('未显示已连接状态')
 
-// 2) 能力边界
+// 2) 能力范围面板
+// ⚠ 断言已按用户要求更新：能力面板**只列可做项**，不再展示"答不了"那一栏。
+//   （拦截逻辑不受影响 —— 下方第三节仍验证三类问题被拒答。）
 const capsTxt = (await page.locator('.caps summary').innerText()).replace(/\s+/g, ' ').trim()
-console.log('能力边界:', capsTxt)
+console.log('能力范围:', capsTxt)
 await page.locator('.caps summary').click()
 await page.waitForTimeout(400)
 const capsBody = (await page.locator('.caps-body').innerText()).replace(/\s+/g, ' ').trim()
 console.log('  展开内容:', capsBody.slice(0, 160), '…')
-if (!capsBody.includes('答不了')) fails.push('能力边界未列出答不了的主题')
+const capItems = await page.locator('.caps-col li').count()
+console.log('  可查项数量:', capItems)
+if (capItems !== 9) fails.push(`能力面板应列 9 项，实得 ${capItems}`)
+if (capsBody.includes('答不了')) {
+  fails.push('能力面板不应展示「答不了」（用户要求只列可做项）')
+}
 
 // 辅助：问一个问题并等回答
 // ⚠ 选择器随结构化渲染改版更新：旧的 `.answer` 单一文本块已拆分为

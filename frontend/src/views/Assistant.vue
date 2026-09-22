@@ -163,9 +163,12 @@ function clearSession() {
 const BASIS = {
   llm_verified: { label: '模型作答 · 数字已校验', cls: 'b-verified' },
   llm_partial_dropped: { label: '模型解读含未溯源数字 · 已丢弃该段，数据不受影响', cls: 'b-fallback' },
-  // ⚠ ungrounded = 模型**没有查任何数据**就作答。这是最危险的一类，
-  //   因为答案可能完全错误却读起来很确定。必须显著警示。
-  ungrounded: { label: '⚠ 未查询数据 · 回答可能不准确', cls: 'b-ungrounded' },
+  // system_meta = 系统模板直接回答（你是谁/能做什么/技术栈）。
+  // 与 LLM 无关，因此不存在幻觉可能，但也不是"数据查询"。
+  system_meta: { label: '系统信息 · 确定性回答', cls: 'b-meta' },
+  // no_data = 模型没查任何数据就作答。可能是常识性回答，
+  // 但没有系统数据支撑，不能显示"已校验"。
+  no_data: { label: '未经数据核对', cls: 'b-nodata' },
   guard_blocked: { label: '触及系统边界 · 已在调用模型前拦截', cls: 'b-guard' },
   system_pending_action: { label: '系统生成的待确认操作', cls: 'b-pending' },
   disabled: { label: '智能体未启用', cls: 'b-guard' },
@@ -401,26 +404,23 @@ function warnClass(level) {
       </div>
     </div>
 
+    <!-- 能力范围：只列「能做什么」。
+         ⚠ 按用户要求**不展示"答不了"那一栏**。
+           边界拦截逻辑本身不受影响（guard_rules 仍在调模型前拦下三类问题），
+           只是不把它摆在能力面板上。 -->
     <details v-if="caps" class="caps">
       <summary>
-        能力范围：{{ caps.tools.length }} 个可查项 · {{ caps.blocked.length }} 类问题答不了
+        能力范围：{{ caps.tools.length }} 个可查项
       </summary>
       <div class="caps-body">
         <div class="caps-col">
-          <h4>可以查</h4>
+
           <ul>
             <li v-for="t in caps.tools" :key="t.name">
               <code>{{ t.name }}</code>
-              <span v-if="t.write" class="write-tag">需确认</span> — {{ t.description }}
+              <span v-if="t.write" class="write-tag">需确认</span> — {{ t.label || t.description }}
             </li>
           </ul>
-        </div>
-        <div class="caps-col">
-          <h4>答不了（数据不支持）</h4>
-          <ul><li v-for="t in caps.blocked" :key="t.key"><b>{{ t.key }}</b></li></ul>
-          <p class="caps-note">
-            这三类问题会在调用模型之前被拦截，因为系统里没有相应数据。
-          </p>
         </div>
       </div>
     </details>
@@ -700,7 +700,8 @@ function warnClass(level) {
 
 .caps { background: #fff; border: 1px solid #e5e9f0; border-radius: 8px; padding: 10px 14px; }
 .caps summary { font-size: 12.5px; color: #7c8aa5; cursor: pointer; }
-.caps-body { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 10px; }
+/* 只剩一栏（能力范围不展示"答不了"），故不再用两列网格 */
+.caps-body { margin-top: 10px; }
 .caps-col h4 { font-size: 12px; color: #17335c; margin: 0 0 6px; }
 .caps-col ul { margin: 0; padding-left: 16px; }
 .caps-col li { font-size: 11.5px; color: #5b6b85; line-height: 1.7; }
@@ -733,8 +734,10 @@ function warnClass(level) {
          margin-bottom: 8px; font-weight: 600; }
 .b-verified { color: #0f766e; background: #e6f6f3; border: 1px solid #b7e4dc; }
 .b-fallback { color: #b45309; background: #fdf6e3; border: 1px solid #f0dfa8; }
-/* ungrounded 用最强的警示色 —— 错误答案配高可信度徽章是最危险的组合 */
-.b-ungrounded { color: #fff; background: #dc2626; border: 1px solid #b91c1c; }
+/* system_meta：系统模板回答（非 LLM），中性偏冷色 */
+.b-meta { color: #1d4ed8; background: #eef3fb; border: 1px solid #c7d6ee; }
+/* no_data：未经数据核对。用琥珀色提示（不是红色 —— 答案未必错，只是没依据） */
+.b-nodata { color: #b45309; background: #fdf6e3; border: 1px solid #f0dfa8; }
 .b-guard    { color: #1d4ed8; background: #eef3fb; border: 1px solid #c7d6ee; }
 .b-pending  { color: #6d28d9; background: #f3f0ff; border: 1px solid #ddd6fe; }
 
