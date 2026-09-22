@@ -43,7 +43,7 @@ def call(method, path, body=None, token=None):
             return e.code, {"raw": raw[:200]}
 
 
-def login(u, p="Bank@2025"):
+def login(u, p="Bank@2026"):
     c, d = call("POST", "/api/auth/login", {"username": u, "password": p})
     return d.get("token")
 
@@ -124,7 +124,7 @@ try:
                         .User).filter_by(username="zhaomin").first().totp_secret
         _db.close()
         c1, d1 = call("POST", "/api/auth/login",
-                      {"username": "zhaomin", "password": "Bank@2025"})
+                      {"username": "zhaomin", "password": "Bank@2026"})
         c2, d2 = call("POST", "/api/auth/login/totp",
                       {"ticket": d1.get("ticket"), "code": A.totp_now(sec)})
         admin = d2.get("token")

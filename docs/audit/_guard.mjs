@@ -40,7 +40,7 @@ import { createHmac } from 'node:crypto'
  * ⚠ 令牌通过真实接口取得（不是伪造），故仍然是端到端有效的。
  */
 export async function loginAs(page, username = 'liming',
-                              password = 'Bank@2025',
+                              password = 'Bank@2026',
                               base = 'http://localhost:5173') {
   // 用页面上下文发请求，确保同源且走真实的鉴权链路
   const resp = await page.request.post(`${base}/api/auth/login`, {

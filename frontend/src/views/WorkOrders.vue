@@ -42,20 +42,25 @@
         <button class="btn btn-primary btn-sm" @click="openCreate()">＋ 创建工单</button>
       </div>
 
+      <!-- 脱敏提示：说明"为什么看不到客户信息" -->
+      <div v-if="masked" class="mask-banner">
+        <span>🔒</span><span>{{ maskNotice }}</span>
+      </div>
+
       <!-- Table -->
       <div class="glass-card overflow-hidden">
         <table class="w-full">
           <thead>
             <tr>
-              <th>客户</th>
+              <th>{{ masked ? '客户（匿名）' : '客户' }}</th>
               <th>风险等级</th>
-              <th>流失概率</th>
+              <th v-if="!masked">流失概率</th>
               <th>触达渠道</th>
-              <th>期望价值</th>
+              <th v-if="!masked">期望价值</th>
               <th>工单状态</th>
               <th>负责人</th>
               <th>创建时间</th>
-              <th>操作</th>
+              <th v-if="!masked">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -72,7 +77,14 @@
                        "点整行任意位置"打开（实测行内 hasChevronOrIcon=false）。
                        补上箭头并随展开旋转，让"这行可以点开"变得显然。 -->
                   <span class="chev" :class="{ open: expandedId === o.id }">▸</span>
-                  <div class="flex items-center gap-2.5">
+                  <!-- 脱敏：只显示序号，不显示姓名/编号/地区 -->
+                  <template v-if="masked">
+                    <div>
+                      <div class="font-semibold text-sm">{{ o.display_name || ('客户 #' + o.seq) }}</div>
+                      <div class="text-xs text-gray-400">身份信息已隐藏</div>
+                    </div>
+                  </template>
+                  <div v-else class="flex items-center gap-2.5">
                     <div class="w-9 h-9 rounded-lg flex items-center justify-center text-white font-bold text-sm flex-shrink-0" :style="{ background: riskColor(o.risk_level) }">
                       {{ o.customer_name?.charAt(0)?.toUpperCase() }}
                     </div>
@@ -83,7 +95,7 @@
                   </div>
                 </td>
                 <td><span class="risk-badge" :class="riskBadgeClass(o.risk_level)">{{ riskLabel(o.risk_level) }}</span></td>
-                <td>
+                <td v-if="!masked">
                   <div class="flex items-center gap-2">
                     <div class="w-16 h-1.5 rounded-full bg-[#eef1f6] overflow-hidden">
                       <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(o.probability), background: probColor(o.probability, o.thresholds_snapshot) }"></div>
@@ -96,15 +108,17 @@
                   <span class="text-xs text-gray-300">{{ o.channel ? channelLabel(o.channel) : '—' }}</span>
                   <span v-if="o.channel_overridden" class="text-amber-400 ml-1 text-xs" title="人工覆盖了推荐渠道">⚠</span>
                 </td>
-                <td class="tabular-nums text-emerald-400 text-xs">
+                <td v-if="!masked" class="tabular-nums text-emerald-400 text-xs">
                   {{ o.expected_value_snapshot != null ? fmtWan(o.expected_value_snapshot) : '—' }}
                 </td>
                 <td @click.stop>
-                  <!-- 状态下拉：列表内直接切换，无需先展开详情。
-                       ⚠ 这是"状态无法调整"的主因修复 —— 原实现把状态按钮
-                       藏在详情面板里，而面板只能靠点整行触发、行上无任何提示。
-                       现在列表即可改，且终态（已完成/已流失）也能改回。 -->
+                  <!-- 脱敏角色同时也没有 order:write 权限，故不显示状态下拉 ——
+                       避免"能点但保存报 403"的坏体验（状态文字仍可见，只是只读） -->
+                  <span v-if="masked" class="text-xs" :class="'st-' + o.status">
+                    {{ statusLabel(o.status) }}
+                  </span>
                   <select
+                    v-else
                     class="status-select"
                     :class="o.status"
                     :value="o.status"
@@ -118,19 +132,20 @@
                 </td>
                 <td>{{ o.assignee || '—' }}</td>
                 <td class="text-gray-500 text-xs">{{ fmtDate(o.created_at) }}</td>
-                <td @click.stop>
+                <td v-if="!masked" @click.stop>
                   <button class="btn btn-outline btn-xs" @click="openEdit(o)">✎</button>
                   <button class="btn btn-outline btn-xs ml-1" @click="deleteOrder(o.id)">✕</button>
                 </td>
               </tr>
               <!-- Detail Panel -->
               <tr v-if="expandedId === o.id">
-                <td colspan="9" class="p-0">
+                <td :colspan="masked ? 7 : 9" class="p-0">
                   <div class="detail-panel">
                     <div class="grid grid-cols-2 gap-4">
-                      <div><dt>风险因素</dt><dd><span v-for="f in o.risk_factors" :key="f" class="risk-tag">{{ f }}</span></dd></div>
-                      <div><dt>推荐策略</dt><dd class="text-indigo-300">{{ o.strategy || '—' }}</dd></div>
-                      <div><dt>备注</dt><dd class="text-gray-400">{{ o.note || '—' }}</dd></div>
+                      <!-- 脱敏：风险因素/推荐策略/备注都会复述客户画像，故隐藏 -->
+                      <div v-if="!masked"><dt>风险因素</dt><dd><span v-for="f in o.risk_factors" :key="f" class="risk-tag">{{ f }}</span></dd></div>
+                      <div v-if="!masked"><dt>推荐策略</dt><dd class="text-indigo-300">{{ o.strategy || '—' }}</dd></div>
+                      <div v-if="!masked"><dt>备注</dt><dd class="text-gray-400">{{ o.note || '—' }}</dd></div>
                       <div><dt>处理结果</dt><dd>{{ o.result === 'retained' ? '✅ 已挽留' : o.result === 'lost' ? '❌ 已流失' : '—' }}</dd></div>
                       <div><dt>更新时间</dt><dd class="text-gray-400">{{ fmtDate(o.updated_at) }}</dd></div>
                       <div><dt>完成时间</dt><dd class="text-gray-400">{{ fmtDate(o.completed_at) || '—' }}</dd></div>
@@ -146,11 +161,12 @@
                         <dd v-else class="text-gray-600">该工单创建于快照功能上线前，无留存依据</dd>
                       </div>
                       <!-- 价值层快照：与等级快照配套 —— 价值层边界同样是被调整的业务假设 -->
+                      <!-- 脱敏时只显示价值层标签，不显示具体金额 -->
                       <div style="grid-column: 1 / -1">
                         <dt>价值层（建单时快照）</dt>
                         <dd v-if="o.value_tier_snapshot" class="text-gray-400">
-                          {{ valueTierLabel(o.value_tier_snapshot) }} ·
-                          期望价值 ¥{{ Math.round(o.expected_value_snapshot || 0).toLocaleString() }}
+                          {{ valueTierLabel(o.value_tier_snapshot) }}<span v-if="!masked"> ·
+                          期望价值 ¥{{ Math.round(o.expected_value_snapshot || 0).toLocaleString() }}</span>
                         </dd>
                         <dd v-else class="text-gray-600">该工单创建于快照功能上线前，无留存依据</dd>
                       </div>
@@ -373,6 +389,10 @@ const scope = useRequestScope()
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
 const orders = ref([])
+// 后端是否已脱敏客户身份（无 customer:identify 权限时为 true）。
+// ⚠ 由后端下发，前端不自己判角色 —— 权限口径只有一处来源。
+const masked = ref(false)
+const maskNotice = ref('')
 const stats = reactive({ total: 0, pending: 0, in_progress: 0, completed: 0, lost: 0 })
 const currentFilter = ref('all')
 const searchText = ref('')
@@ -832,6 +852,8 @@ async function fetchOrders() {
     const { data } = await scope.get('/work-orders', { params })
     orders.value = data.items
     totalPages.value = data.total_pages
+    masked.value = !!data.masked
+    maskNotice.value = data.mask_notice || ''
   } catch (_) {
     orders.value = []
   }
@@ -994,6 +1016,20 @@ tbody tr.expanded { background: #f1f5f9; }
   background: #f8fafc; border: 1px solid #e5e9f0;
   border-radius: 10px; padding: 18px 22px; margin: 4px 16px 12px;
 }
+
+/* 脱敏提示条 —— 说明"为什么看不到客户信息" */
+.mask-banner {
+  display: flex; align-items: center; gap: 9px;
+  padding: 10px 14px; margin-bottom: 12px;
+  background: #fffbeb; border: 1px solid #fde68a;
+  border-radius: 9px; font-size: 12.5px; color: #92400e;
+  line-height: 1.6;
+}
+/* 脱敏时的只读状态文字（替代状态下拉） */
+.st-pending { color: #b45309; }
+.st-in_progress { color: #1d4ed8; }
+.st-completed { color: #15803d; }
+.st-lost { color: #9aa7bd; }
 .detail-panel dt { font-size: 11px; color: #9aa7bd; margin-bottom: 2px; }
 .detail-panel dd { font-size: 13px; color: #374151; }
 

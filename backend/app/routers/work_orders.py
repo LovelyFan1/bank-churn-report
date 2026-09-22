@@ -11,6 +11,7 @@ from app.models.user import User
 from app.models.work_order import WorkOrder
 from app.services import auth_deps
 from app.services import auth_service as auth
+from app.services import privacy
 from app.services import risk_scoring
 from app.schemas.work_order import (
     WorkOrderCreate,
@@ -105,9 +106,18 @@ async def list_work_orders(
     search: str | None = Query(default=None, description="搜索客户姓名 / 编号"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    user: User = Depends(auth_deps.current_user),
     db: Session = Depends(get_db),
 ):
-    """工单列表 - 支持筛选、搜索、分页"""
+    """工单列表 - 支持筛选、搜索、分页
+
+    ⚠ 脱敏：无 `customer:identify` 权限时，工单的**管理属性**（状态、
+      负责人、时间、渠道）保留，但客户身份（姓名、编号、余额、概率、
+      风险因素、备注）**不返回** —— 见 services/privacy.py。
+
+      备注尤其必须去掉：系统生成的建单理由会逐项复述客户姓名、
+      余额与风险因素，留着它等于把脱敏白做。
+    """
     q = db.query(WorkOrder)
 
     if status:
@@ -132,26 +142,43 @@ async def list_work_orders(
         .all()
     )
 
+    items = [_order_to_response(o) for o in orders]
+    masked = not privacy.can_identify(user)
+    if masked:
+        items = privacy.mask_orders(items)
+
     return {
-        "items": [_order_to_response(o) for o in orders],
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,
+        "masked": masked,
+        "mask_notice": privacy.MASK_NOTICE if masked else "",
     }
 
 
 # ── 活跃客户查询（用于前端按钮状态）───────────────────
 
 @router.get("/active-customers")
-async def get_active_customers(db: Session = Depends(get_db)):
-    """返回所有有进行中工单的客户 ID 列表"""
+async def get_active_customers(user: User = Depends(auth_deps.current_user),
+                               db: Session = Depends(get_db)):
+    """返回所有有进行中工单的客户 ID 列表
+
+    ⚠ 无 `customer:identify` 权限时返回**空列表**：这份名单本身就是
+      96,418 人中"哪些人有在途工单"的精确索引，是一份身份信息。
+      前端不依赖它也能工作 —— 列表接口的每一行已带 `has_active_order`，
+      该字段在脱敏后仍然保留（它不指向具体是谁）。
+    """
+    if not privacy.can_identify(user):
+        return {"customer_ids": [], "masked": True,
+                "mask_notice": privacy.MASK_NOTICE}
     orders = (
         db.query(WorkOrder.customer_id)
         .filter(WorkOrder.status.in_(["pending", "in_progress"]))
         .all()
     )
-    return {"customer_ids": [o[0] for o in orders]}
+    return {"customer_ids": [o[0] for o in orders], "masked": False}
 
 
 # ── 创建工单 ───────────────────────────────────────────
@@ -262,12 +289,25 @@ async def create_work_order(body: WorkOrderCreate,
 # ── 工单详情 ───────────────────────────────────────────
 
 @router.get("/{order_id}")
-async def get_work_order(order_id: int, db: Session = Depends(get_db)):
-    """获取单个工单详情"""
+async def get_work_order(order_id: int,
+                         user: User = Depends(auth_deps.current_user),
+                         db: Session = Depends(get_db)):
+    """获取单个工单详情
+
+    ⚠ 无 `customer:identify` 权限时同样脱敏 —— 否则列表脱敏了、
+      点进去却能看到全部客户信息，等于绕过了限制。
+    """
     order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="工单不存在")
-    return _order_to_response(order)
+    data = _order_to_response(order)
+    if not privacy.can_identify(user):
+        data = privacy.mask_order(data)
+        data["masked"] = True
+        data["mask_notice"] = privacy.MASK_NOTICE
+    else:
+        data["masked"] = False
+    return data
 
 
 # ── 更新工单 ───────────────────────────────────────────

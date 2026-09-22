@@ -12,6 +12,9 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.user import User
+from app.services import auth_deps
+from app.services import privacy
 from app.services.customer_service import (
     _filtered_customers,
     get_customer_detail,
@@ -55,10 +58,19 @@ async def get_customers(
     has_order: bool | None = Query(default=None, description="是否已有进行中工单"),
     sort_by: str = Query(default="probability", description="probability / expected_value / balance / age / credit_score"),
     sort_order: str = Query(default="desc", description="asc / desc"),
+    user: User = Depends(auth_deps.current_user),
     db: Session = Depends(get_db),
 ):
-    """客户列表 — 支持搜索、筛选、排序、分页，返回实时风险打分。"""
-    return list_customers(
+    """客户列表 — 支持搜索、筛选、排序、分页，返回实时风险打分。
+
+    ⚠ 脱敏（见 services/privacy.py）：无 `customer:identify` 权限的角色
+      （当前是「只读分析」）只能拿到**匿名条目** —— 序号 + 风险等级 +
+      价值层 + 是否有在途工单。姓名、编号、余额、概率等一律**不返回**。
+
+      「不返回」而非「前端隐藏」是刻意的：数据若在响应体里，
+      打开 devtools 或直接 curl 就能拿到全部名单，那不叫脱敏。
+    """
+    result = list_customers(
         db=db,
         page=page,
         page_size=page_size,
@@ -72,6 +84,18 @@ async def get_customers(
         sort_order=sort_order,
     )
 
+    if not privacy.can_identify(user):
+        offset = (page - 1) * page_size
+        result["items"] = privacy.mask_customers(result.get("items") or [],
+                                                 offset=offset)
+        # 明确告知前端"这不是故障，是权限"
+        result["masked"] = True
+        result["mask_notice"] = privacy.MASK_NOTICE
+    else:
+        result["masked"] = False
+
+    return result
+
 
 @router.get("/export")
 async def export_customers(
@@ -83,6 +107,7 @@ async def export_customers(
     has_order: bool | None = Query(default=None),
     sort_by: str = Query(default="expected_value"),
     sort_order: str = Query(default="desc"),
+    user: User = Depends(auth_deps.current_user),
     db: Session = Depends(get_db),
 ):
     """导出当前筛选结果为 CSV。
@@ -91,7 +116,17 @@ async def export_customers(
     是同一批人 —— 否则一线拿着名单打电话，会发现和系统里对不上。
 
     编码用 utf-8-sig（带 BOM）：Excel 打开中文 CSV 不带 BOM 会乱码。
+
+    ⚠ 无 `customer:identify` 权限时**拒绝导出**（403）。导出是脱敏最需要
+      防的出口 —— 它一次性把全量结果落成文件带离系统，比逐页截图严重得多。
+      若将来确有"导出匿名明细"的需求，应另开接口并只导出聚合字段，
+      而不是在这里放宽。
     """
+    if not privacy.can_identify(user):
+        raise HTTPException(
+            status_code=403,
+            detail="当前角色无权导出客户明细（导出含姓名、编号、余额等身份信息）",
+        )
     items, _ = _filtered_customers(
         db, search=search, geography=geography, risk_level=risk_level,
         value_tier=value_tier, exited=exited, has_order=has_order,
@@ -135,8 +170,21 @@ async def export_customers(
 
 
 @router.get("/{customer_id}")
-async def get_customer(customer_id: str, db: Session = Depends(get_db)):
-    """单客户详情 —— 与列表/矩阵同源，不重新推理，保证数字一致。"""
+async def get_customer(customer_id: str,
+                       user: User = Depends(auth_deps.current_user),
+                       db: Session = Depends(get_db)):
+    """单客户详情 —— 与列表/矩阵同源，不重新推理，保证数字一致。
+
+    ⚠ 无 `customer:identify` 权限时**直接拒绝**（403），而不是返回脱敏详情。
+      理由：详情页的存在意义就是"看这个人的完整画像"（风险因素、建议动作、
+      经济性）。把它脱敏成"客户 #N + 风险等级"没有使用价值，反而让调用方
+      以为拿到了详情。故此处明确拒绝，语义比空壳响应更清楚。
+    """
+    if not privacy.can_identify(user):
+        raise HTTPException(
+            status_code=403,
+            detail=privacy.MASK_NOTICE + "（详情页需要客户身份权限）",
+        )
     detail = get_customer_detail(db, customer_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"客户 {customer_id} 不存在或模型未训练")
@@ -155,14 +203,26 @@ async def get_customer(customer_id: str, db: Session = Depends(get_db)):
 #   系统预填后必须由人确认 —— 这也是本系统一贯的"建议而非替代"原则。
 
 @router.get("/{customer_id}/suggested-note")
-async def get_suggested_note(customer_id: str, db: Session = Depends(get_db)):
+async def get_suggested_note(customer_id: str,
+                             user: User = Depends(auth_deps.current_user),
+                             db: Session = Depends(get_db)):
     """生成该客户的建单建议理由（预填用，可修改）。
 
     返回 note 全文 + 经济性判定 + 口径标注 + 组成数字。
 
     ⚠ note 由**确定性模板**拼装，非 LLM 生成：句中每个数字都来自
       risk_scoring 的实时打分结果，不存在幻觉可能。见 note_service 模块说明。
+
+    ⚠ 无 `customer:identify` 权限时拒绝：note 会**逐项复述**客户姓名、
+      余额、命中风险因素与建议动作 —— 这不只是"客户信息"，而是一份
+      成文的个体画像。且它的正常用途是"建单预填"，而建单本身就需要
+      `order:write`，故不存在"无身份权限却需要它"的合理场景。
     """
+    if not privacy.can_identify(user):
+        raise HTTPException(
+            status_code=403,
+            detail="当前角色无权查看客户建单理由（其中含姓名、余额与风险因素）",
+        )
     detail = get_customer_detail(db, customer_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"客户 {customer_id} 不存在或模型未训练")
@@ -192,6 +252,7 @@ async def get_suggested_note(customer_id: str, db: Session = Depends(get_db)):
 @router.get("/suggested-notes/batch")
 async def get_batch_suggested_notes(
     customer_ids: list[str] = Query(default=[], description="重复传参：?customer_ids=A&customer_ids=B"),
+    user: User = Depends(auth_deps.current_user),
     db: Session = Depends(get_db),
 ):
     """批量生成建单建议理由 —— 供「批量建单」预填，避免 N 次往返。
@@ -204,12 +265,21 @@ async def get_batch_suggested_notes(
       本接口只负责把理由算好。
 
     单次上限 200 个 —— 防止有人构造超长 URL 拖垮服务。
+
+    ⚠ 无 `customer:identify` 权限时返回空列表（而非 403）：本接口是
+      **批量建单的预填辅助**，调用方按 id 逐条取理由。直接 403 会让
+      前端整体报错；返回空 + 说明更贴合它的辅助定位（它本来就不该被
+      无身份权限的角色调用 —— 那些角色也没有建单权限）。
     """
     if len(customer_ids) > 200:
         raise HTTPException(
             status_code=422,
             detail=f"单次最多查询 200 个客户，收到 {len(customer_ids)} 个",
         )
+
+    if not privacy.can_identify(user):
+        return {"items": [], "missing": list(customer_ids),
+                "masked": True, "mask_notice": privacy.MASK_NOTICE}
 
     scored = risk_scoring.get_scored_customers(db)
     if scored is None:

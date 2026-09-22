@@ -375,7 +375,8 @@ def _check_password_strength(pw: str) -> str | None:
     has_digit = any(c.isdigit() for c in pw)
     if not (has_alpha and has_digit):
         return "新口令需同时包含字母与数字"
-    if pw.lower() in ("bank@2025", "password", "12345678", "admin123"):
+    if pw.lower() in ("bank@2026", "bank@2025", "password", "12345678",
+                      "admin123"):
         return "该口令过于常见，请更换"
     return None
 

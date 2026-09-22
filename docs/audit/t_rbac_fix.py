@@ -36,7 +36,7 @@ def call(p, body=None, tok=None, m="GET"):
 def login(u):
     r = urllib.request.Request(
         B + "/api/auth/login",
-        data=json.dumps({"username": u, "password": "Bank@2025"}).encode(),
+        data=json.dumps({"username": u, "password": "Bank@2026"}).encode(),
         headers={"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(r, timeout=30).read().decode())["token"]
 
@@ -119,7 +119,7 @@ print("\n四、管理员：应具备全部权限")
 # ⚠ 管理员绑了 TOTP，不能用简化的 login()（那个只取 token，会 KeyError）。
 #   走完整两步流程。
 c, d = call("/api/auth/login",
-            {"username": "zhaomin", "password": "Bank@2025"}, None, "POST")
+            {"username": "zhaomin", "password": "Bank@2026"}, None, "POST")
 adm = d.get("token")
 if d.get("need_totp"):
     from app.services import auth_service as A

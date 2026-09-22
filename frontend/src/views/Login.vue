@@ -158,7 +158,7 @@ function back() {
 
 function useDemo(row) {
   username.value = row.u
-  password.value = 'Bank@2025'
+  password.value = 'Bank@2026'
   showDemo.value = false
 }
 </script>
@@ -265,7 +265,7 @@ function useDemo(row) {
             <span class="dn">{{ d.name }} · {{ d.role }}</span>
             <span class="dm">{{ d.note }}</span>
           </div>
-          <p class="demo-hint">统一口令 <code>Bank@2025</code>；管理员需动态口令</p>
+          <p class="demo-hint">统一口令 <code>Bank@2026</code>；管理员需动态口令</p>
         </div>
       </div>
     </div>

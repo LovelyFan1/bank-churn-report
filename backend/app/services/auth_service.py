@@ -308,7 +308,16 @@ def decode_token(token: str) -> dict:
 # 来源，前端也调 /api/auth/me 拿到同一份，避免前后端各写一套权限表
 # （那必然会出现"按钮能点但接口拒绝"的不一致）。
 
-PERM_VIEW = "data:view"            # 查看客户/工单/分析
+PERM_VIEW = "data:view"            # 查看客户/工单/分析（聚合视图）
+# 查看**客户身份信息**：姓名、客户编号、余额、风险因素等可定位到具体
+# 自然人的字段。
+#
+# ⚠ 为什么与 data:view 分开：银行业务里"看得到统计"与"看得到人"是两种
+#   授权。只读分析岗（风控/审计/运营）需要前者来核对分布与趋势，但不应
+#   把客户名单带走 —— 那是客户经理的职责范围，也是个人信息保护的要求。
+#   故 viewer 只给 data:view；缺本权限时后端**脱敏**（见 privacy.py），
+#   前端连字段都收不到，不是"藏起来"。
+PERM_CUSTOMER_IDENTIFY = "customer:identify"
 PERM_ORDER_WRITE = "order:write"   # 建单/改单/删单
 PERM_AGENT_USE = "agent:use"       # 使用智能助手
 PERM_USER_ADMIN = "user:admin"     # 用户管理
@@ -321,9 +330,12 @@ PERM_AUDIT_VIEW = "audit:view"     # 查看审计日志
 PERM_MODEL_TRAIN = "model:train"
 
 PERMISSIONS = {
-    "admin": [PERM_VIEW, PERM_ORDER_WRITE, PERM_AGENT_USE,
-              PERM_USER_ADMIN, PERM_AUDIT_VIEW, PERM_MODEL_TRAIN],
-    "manager": [PERM_VIEW, PERM_ORDER_WRITE, PERM_AGENT_USE],
+    "admin": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_WRITE,
+              PERM_AGENT_USE, PERM_USER_ADMIN, PERM_AUDIT_VIEW,
+              PERM_MODEL_TRAIN],
+    "manager": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_WRITE,
+                PERM_AGENT_USE],
+    # viewer 只有聚合视图权限 —— 看得到"分布与趋势"，看不到"具体是谁"
     "viewer": [PERM_VIEW],
 }
 

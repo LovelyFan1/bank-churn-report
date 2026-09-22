@@ -14,6 +14,13 @@ const loading = ref(true)
 const overview = ref(null)
 const businessSummary = ref(null)
 const topCustomers = ref([])
+// 后端是否脱敏了 Top10 客户身份（无 customer:identify 权限时为 true）。
+// ⚠ 由后端下发，前端不自己判角色 —— 权限口径只有一处来源。
+//   脱敏后 Top10 条目**只有** risk_level / value_tier / seq / display_name，
+//   故模板里所有取 surname / balance / probability 的地方都必须按 masked 分支，
+//   否则 `c.balance.toLocaleString()` 会对 undefined 抛异常，整页白屏。
+const masked = ref(false)
+const maskNotice = ref('')
 const activeCustomerIds = ref(new Set())
 // 风险分级口径 + 最优模型指标 —— 均由后端给出，不在前端写死
 const riskInfo = ref(null)
@@ -83,6 +90,9 @@ onMounted(async () => {
       riskDist.value = dash.risk_distribution
       topCustomers.value = dash.top_customers || []
     }
+    // 后端是否脱敏了 Top10 的客户身份（无 customer:identify 权限时为 true）
+    masked.value = !!dash.masked
+    maskNotice.value = dash.mask_notice || ''
 
     // 成本收益指标
     const summaryResult = dash.business_summary
@@ -536,30 +546,40 @@ function showOrderToast(msg) {
             暂无符合条件的客户
           </div>
           <div v-else class="overflow-x-auto">
+            <!-- 脱敏提示：说明 Top10 为什么没有姓名 -->
+            <div v-if="masked" class="mask-banner">
+              <span>🔒</span><span>{{ maskNotice }}</span>
+            </div>
             <table class="action-table">
               <thead>
                 <tr>
-                  <th>客户</th>
+                  <th>{{ masked ? '客户（匿名）' : '客户' }}</th>
                   <th>风险</th>
-                  <th>流失概率</th>
-                  <th>余额</th>
-                  <th>期望价值</th>
-                  <th>风险因素</th>
-                  <th>操作</th>
+                  <th v-if="!masked">流失概率</th>
+                  <th v-if="!masked">余额</th>
+                  <th v-if="!masked">期望价值</th>
+                  <th v-if="!masked">风险因素</th>
+                  <th v-if="!masked">操作</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="c in topCustomers" :key="c.id">
+                <tr v-for="c in topCustomers" :key="c.id ?? c.seq">
                   <td>
-                    <div class="cust-name">{{ c.surname }}</div>
-                    <div class="cust-id">{{ c.customer_id }} · {{ c.geography }}</div>
+                    <template v-if="masked">
+                      <div class="cust-name">{{ c.display_name || ('客户 #' + c.seq) }}</div>
+                      <div class="cust-id">身份信息已隐藏</div>
+                    </template>
+                    <template v-else>
+                      <div class="cust-name">{{ c.surname }}</div>
+                      <div class="cust-id">{{ c.customer_id }} · {{ c.geography }}</div>
+                    </template>
                   </td>
                   <td>
                     <span class="risk-badge" :class="riskBadgeClass(c.risk_level)">
                       {{ riskLabel(c.risk_level) }}
                     </span>
                   </td>
-                  <td>
+                  <td v-if="!masked">
                     <div class="prob-cell">
                       <div class="prob-bar">
                         <div class="prob-fill" :style="{ width: fmtPercent(c.probability), background: probColor(c.probability, riskInfo?.thresholds) }"></div>
@@ -567,14 +587,16 @@ function showOrderToast(msg) {
                       <span :style="{ color: probColor(c.probability, riskInfo?.thresholds) }">{{ fmtPercent(c.probability) }}</span>
                     </div>
                   </td>
-                  <td class="text-gray-300">¥{{ c.balance.toLocaleString() }}</td>
-                  <td class="tabular-nums text-emerald-400">¥{{ Math.round(c.expected_value || 0).toLocaleString() }}</td>
-                  <td>
+                  <!-- ⚠ balance 可能缺失（脱敏）：必须先判空再 toLocaleString，
+                       否则对 undefined 调用会抛异常导致整页白屏 -->
+                  <td v-if="!masked" class="text-gray-300">¥{{ (c.balance ?? 0).toLocaleString() }}</td>
+                  <td v-if="!masked" class="tabular-nums text-emerald-400">¥{{ Math.round(c.expected_value || 0).toLocaleString() }}</td>
+                  <td v-if="!masked">
                     <div class="risk-factors">
                       <span v-for="f in c.risk_factors" :key="f" class="factor-tag">{{ f }}</span>
                     </div>
                   </td>
-                  <td>
+                  <td v-if="!masked">
                     <button
                       v-if="activeCustomerIds.has(c.customer_id)"
                       class="btn-action-done"
@@ -847,6 +869,15 @@ function showOrderToast(msg) {
 .view-all-link:hover { background: #e0ebfb; }
 
 /* Top10 错误态 / 空态 —— 不留空白表格 */
+/* 脱敏提示条 —— 说明 Top10 为什么没有姓名/金额 */
+.mask-banner {
+  display: flex; align-items: center; gap: 9px;
+  padding: 10px 14px; margin-bottom: 12px;
+  background: #fffbeb; border: 1px solid #fde68a;
+  border-radius: 9px; font-size: 12.5px; color: #92400e;
+  line-height: 1.6;
+}
+
 .dash-error {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 14px 16px; border-radius: 10px; font-size: 12.5px; color: #c81e1e;

@@ -26,7 +26,7 @@ console.log('  policy.demo_show_totp =', pol.demo_show_totp)
 ok(pol.demo_show_totp === false, '开关处于关闭状态（默认值）')
 
 await page.locator('input[autocomplete="username"]').fill('zhaomin')
-await page.locator('input[autocomplete="current-password"]').fill('Bank@2025')
+await page.locator('input[autocomplete="current-password"]').fill('Bank@2026')
 await page.locator('button[type="submit"]').click()
 await page.waitForTimeout(3000)
 

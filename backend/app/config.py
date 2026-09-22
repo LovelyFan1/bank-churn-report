@@ -203,7 +203,7 @@ class Settings(BaseSettings):
 
     # 演示账号口令（仅播种用）。首次登录后应修改。
     # ⚠ 放在配置而非硬编码在播种脚本里，便于演示时统一改。
-    AUTH_DEMO_PASSWORD: str = "Bank@2025"
+    AUTH_DEMO_PASSWORD: str = "Bank@2026"
 
     # ── 演示辅助：在登录页显示动态口令 ─────────────────────
     #

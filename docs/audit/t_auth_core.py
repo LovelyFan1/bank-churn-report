@@ -17,15 +17,15 @@ def ok(cond, msg):
 
 
 print("一、口令派生（PBKDF2-SHA256）")
-h = a.hash_password("Bank@2025")
+h = a.hash_password("Bank@2026")
 ok(h.startswith("pbkdf2_sha256$"), "格式含算法标识与迭代数")
-ok(a.verify_password("Bank@2025", h), "正确口令通过")
+ok(a.verify_password("Bank@2026", h), "正确口令通过")
 ok(not a.verify_password("bank@2025", h), "大小写不同应失败")
 ok(not a.verify_password("", h), "空口令失败")
 ok(not a.verify_password("x", "坏格式"), "损坏哈希失败（不放行）")
-h2 = a.hash_password("Bank@2025")
+h2 = a.hash_password("Bank@2026")
 ok(h != h2, "同一口令两次派生结果不同（随机盐生效）")
-ok(a.verify_password("Bank@2025", h2), "第二个哈希也能验证")
+ok(a.verify_password("Bank@2026", h2), "第二个哈希也能验证")
 
 print("\n二、TOTP（RFC 6238）")
 s = a.gen_totp_secret()

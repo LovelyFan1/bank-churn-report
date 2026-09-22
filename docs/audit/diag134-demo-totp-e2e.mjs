@@ -49,7 +49,7 @@ async function gotoLoginClean() {
 
 async function toStep2() {
   await page.locator('input[autocomplete="username"]').fill('zhaomin')
-  await page.locator('input[autocomplete="current-password"]').fill('Bank@2025')
+  await page.locator('input[autocomplete="current-password"]').fill('Bank@2026')
   await page.locator('button[type="submit"]').click()
   // ⚠ 不能只等固定时长：第二步渲染后**还要异步拉取**动态口令
   //   （POST /auth/demo/totp）。固定 2200ms 在实测中不够 ——

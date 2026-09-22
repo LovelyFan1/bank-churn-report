@@ -49,7 +49,7 @@ def call(method, path, body=None, token=None):
         return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
-PWD = "Bank@2025"
+PWD = "Bank@2026"
 
 print("=" * 74)
 print("一、策略接口免鉴权")
@@ -175,7 +175,7 @@ ok(len(fails_logged) > 0, f"记录了失败尝试 {len(fails_logged)} 条（审�
 #   action 名 `change_password` 本身就含这个词，早先的宽断言会误报
 #   （实测确认：库里 0 条记录含真实口令或 pbkdf2 哈希，是断言写错了）
 _leak = [i for i in items
-         if "Bank@2025" in json.dumps(i, ensure_ascii=False)
+         if "Bank@2026" in json.dumps(i, ensure_ascii=False)
          or "pbkdf2" in json.dumps(i, ensure_ascii=False)]
 ok(not _leak, "⚠ 审计中不含真实口令或口令哈希")
 lk = [i for i in items if i.get("action") == "login" and i.get("username") == "liming"

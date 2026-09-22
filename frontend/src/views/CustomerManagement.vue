@@ -80,7 +80,8 @@
           <option value="1">已流失</option>
           <option value="0">未流失</option>
         </select>
-        <button class="btn btn-outline btn-sm" @click="exportCsv">⬇ 导出</button>
+        <!-- 脱敏时不显示导出：后端对该角色直接 403，留着按钮只会让用户点了报错 -->
+        <button v-if="!masked" class="btn btn-outline btn-sm" @click="exportCsv">⬇ 导出</button>
         <span class="flex-1"></span>
         <select v-model="sortBy" class="select" @change="onFilter">
           <option value="expected_value">按期望价值 ↓</option>
@@ -120,12 +121,18 @@
         <button class="btn btn-outline btn-xs mt-2" @click="batchResult = null">关闭</button>
       </div>
 
+      <!-- 脱敏提示：明确告知"为什么看不到"，避免用户以为页面坏了 -->
+      <div v-if="masked" class="mask-banner">
+        <span class="mask-icon">🔒</span>
+        <span>{{ maskNotice }}</span>
+      </div>
+
       <!-- Table -->
       <div class="glass-card overflow-hidden">
         <table class="w-full">
           <thead>
             <tr>
-              <th style="width:36px">
+              <th v-if="!masked" style="width:36px">
                 <!-- indeterminate 是 DOM 属性不是 HTML 特性，必须用 .prop 绑定，
                      否则 Vue 会写成 attribute 而无效 -->
                 <input type="checkbox" :checked="allSelected"
@@ -133,42 +140,53 @@
                        :disabled="!selectableRows.length"
                        @change="toggleAll" />
               </th>
-              <th>客户</th>
+              <th>{{ masked ? '客户（匿名）' : '客户' }}</th>
               <th>风险等级</th>
-              <th>流失概率</th>
-              <th>余额</th>
+              <th v-if="!masked">流失概率</th>
+              <th v-if="!masked">余额</th>
               <th>价值层</th>
-              <th>产品 / 活跃</th>
-              <th>工单状态</th>
-              <th class="text-right">操作</th>
+              <th v-if="!masked">产品 / 活跃</th>
+              <th v-if="!masked">工单状态</th>
+              <th v-if="!masked" class="text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="customers.length === 0">
-              <td colspan="9" class="text-center py-16 text-gray-500">
+              <td :colspan="masked ? 3 : 9" class="text-center py-16 text-gray-500">
                 <div class="text-4xl mb-2">🔍</div>
                 <p>没有匹配的客户，换个筛选条件试试</p>
               </td>
             </tr>
-            <tr v-for="c in customers" :key="c.id" class="row-clickable" @click="openDetail(c)">
-              <td @click.stop>
+            <!-- ⚠ 脱敏模式：行不可点进详情（详情接口对该角色返回 403），
+                 故不加 row-clickable，避免"点了没反应" -->
+            <tr v-for="c in customers" :key="c.id ?? c.seq"
+                :class="masked ? '' : 'row-clickable'"
+                @click="masked ? null : openDetail(c)">
+              <td v-if="!masked" @click.stop>
                 <!-- 已建单的客户不可再选（后端也会 409 拒掉） -->
                 <input type="checkbox" :checked="selected.has(c.customer_id)"
                        :disabled="c.has_active_order" @change="toggleRow(c.customer_id)" />
               </td>
               <td>
-                <div class="flex items-center gap-2.5">
-                  <div class="w-9 h-9 rounded-lg flex items-center justify-center text-white font-bold text-sm flex-shrink-0" :style="{ background: avatarColor(c.surname) }">
-                    {{ c.surname?.charAt(0)?.toUpperCase() }}
+                <!-- 脱敏：只显示序号，不显示姓名/编号/地区 -->
+                <template v-if="masked">
+                  <div class="font-semibold text-sm">{{ c.display_name }}</div>
+                  <div class="text-xs text-gray-400">身份信息已隐藏</div>
+                </template>
+                <template v-else>
+                  <div class="flex items-center gap-2.5">
+                    <div class="w-9 h-9 rounded-lg flex items-center justify-center text-white font-bold text-sm flex-shrink-0" :style="{ background: avatarColor(c.surname) }">
+                      {{ c.surname?.charAt(0)?.toUpperCase() }}
+                    </div>
+                    <div>
+                      <div class="font-semibold text-sm">{{ c.surname }}</div>
+                      <div class="text-xs text-gray-500">{{ c.customer_id }} · {{ c.geography }}</div>
+                    </div>
                   </div>
-                  <div>
-                    <div class="font-semibold text-sm">{{ c.surname }}</div>
-                    <div class="text-xs text-gray-500">{{ c.customer_id }} · {{ c.geography }}</div>
-                  </div>
-                </div>
+                </template>
               </td>
               <td><span class="risk-badge" :class="riskBadgeClass(c.risk_level)">{{ riskLabel(c.risk_level) }}</span></td>
-              <td>
+              <td v-if="!masked">
                 <div class="flex items-center gap-2">
                   <div class="w-16 h-1.5 rounded-full bg-[#eef1f6] overflow-hidden">
                     <div class="h-full rounded-full transition-all" :style="{ width: fmtPercent(c.probability), background: probColor(c.probability, riskInfo?.thresholds) }"></div>
@@ -176,24 +194,24 @@
                   <span class="text-xs font-semibold" :style="{ color: probColor(c.probability, riskInfo?.thresholds) }">{{ fmtPercent(c.probability) }}</span>
                 </div>
               </td>
-              <td class="tabular-nums">{{ fmtMoney(c.balance) }}</td>
+              <td v-if="!masked" class="tabular-nums">{{ fmtMoney(c.balance) }}</td>
               <td>
                 <!-- 价值层与风险等级正交：等级说「会不会跑」，这里说「跑了值多少」 -->
                 <span class="tag-mini" :style="{ color: valueTierColor(c.value_tier), background: valueTierColor(c.value_tier) + '1f' }">
                   {{ valueTierLabel(c.value_tier) }}
                 </span>
               </td>
-              <td>
+              <td v-if="!masked">
                 {{ c.num_products }} 个产品 ·
                 <span class="tag-mini" :class="c.is_active_member ? 'tag-active' : 'tag-inactive'">
                   {{ c.is_active_member ? '活跃' : '非活跃' }}
                 </span>
               </td>
-              <td>
+              <td v-if="!masked">
                 <span v-if="c.has_active_order" class="tag-mini tag-order">已建单</span>
                 <span v-else class="text-gray-600">—</span>
               </td>
-              <td class="text-right">
+              <td v-if="!masked" class="text-right">
                 <button v-if="c.has_active_order" class="btn-disabled" disabled>已建单</button>
                 <button v-else class="btn btn-primary btn-sm" @click.stop="openCreate(c)">＋ 创建工单</button>
               </td>
@@ -358,6 +376,11 @@ const summary = reactive({ total_customers: 0, high_risk: 0, exited: 0, active_o
 const modelUsed = ref('')
 const riskInfo = ref(null)
 const total = ref(0)
+// 后端是否对客户信息做了脱敏（无 customer:identify 权限时为 true）。
+// ⚠ 由**后端**决定，前端不自己判角色 —— 权限口径只有一处来源，
+//   否则会出现"前端以为能看到、后端不给"的不一致。
+const masked = ref(false)
+const maskNotice = ref('')
 
 const currentRisk = ref('all')
 // URL 同步用的路由 —— 筛选状态写进 query，支持前进/后退/分享链接
@@ -700,6 +723,8 @@ async function fetchCustomers() {
     totalPages.value = data.total_pages || 1
     modelUsed.value = data.model_used || ''
     riskInfo.value = data.risk || null
+    masked.value = !!data.masked
+    maskNotice.value = data.mask_notice || ''
     if (data.summary) Object.assign(summary, data.summary)
   } catch (e) {
     if (token !== loadToken) return   // 过期请求的报错同样不该弹给用户
@@ -918,6 +943,16 @@ tbody tr:hover { background: #f8fafc; }
 /* 整行可点进详情 —— 给出指针与悬停反馈，否则用户不知道能点 */
 .row-clickable { cursor: pointer; }
 .row-clickable:hover { background: #eef3fb !important; }
+
+/* 脱敏提示条 —— 说明"为什么看不到"，而非让用户以为页面坏了 */
+.mask-banner {
+  display: flex; align-items: center; gap: 9px;
+  padding: 10px 14px; margin-bottom: 12px;
+  background: #fffbeb; border: 1px solid #fde68a;
+  border-radius: 9px; font-size: 12.5px; color: #92400e;
+  line-height: 1.6;
+}
+.mask-icon { font-size: 14px; flex-shrink: 0; }
 
 /* 批量操作条 —— 选中时出现 */
 .batch-bar {

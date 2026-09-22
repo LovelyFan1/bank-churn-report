@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -8,8 +8,9 @@ import threading
 from app.config import settings
 from app.database import engine, Base, get_db
 from app.models.customer import Customer
+from app.models.user import User
 from app.models.work_order import WorkOrder
-from app.services import data_source
+from app.services import auth_deps, data_source
 from app.services.data_generator import get_data_generator
 from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers, portfolio
 from app.routers import agent as agent_router
@@ -166,8 +167,14 @@ async def get_field_distribution(field: str):
 # 把首屏 4 个请求合并为 1 个，绕过 Docker Desktop 转发链路的并发瓶颈。
 # 实测：8 并发 ~9000ms → 1 请求 ~300ms（30 倍提升）。
 @app.get("/api/dashboard/summary")
-async def get_dashboard_summary():
-    """Dashboard 首屏聚合数据：概览 + Top10 + 成本收益 + 风险口径。"""
+async def get_dashboard_summary(user: User = Depends(auth_deps.current_user)):
+    """Dashboard 首屏聚合数据：概览 + Top10 + 成本收益 + 风险口径。
+
+    ⚠ 脱敏：Top10 客户名单含姓名与编号，对无 `customer:identify` 权限的
+      角色（只读分析）替换为匿名条目。概览、风险分布、成本收益这些
+      **聚合数字不受影响** —— 那正是该角色需要看的。
+    """
+    from app.services import privacy
     from app.services import risk_scoring
     from app.services.cost_benefit_service import get_cost_benefit_service
 
@@ -217,6 +224,11 @@ async def get_dashboard_summary():
         # 4) 风险分级口径
         risk_info = risk_scoring.get_risk_info()
 
+        # 5) 脱敏 Top10（无身份权限时替换为匿名条目）
+        masked = not privacy.can_identify(user)
+        if masked:
+            top_customers = privacy.mask_customers(top_customers)
+
         return {
             "overview": overview,
             "top_customers": top_customers,
@@ -224,6 +236,8 @@ async def get_dashboard_summary():
             "business_summary": summary,
             "risk_info": risk_info,
             "model_error": model_error,
+            "masked": masked,
+            "mask_notice": privacy.MASK_NOTICE if masked else "",
         }
     finally:
         db.close()
