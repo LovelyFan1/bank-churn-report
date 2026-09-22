@@ -528,6 +528,146 @@ def expected_value(prob: float, balance: float) -> float:
     return round(float(prob) * float(balance), 2)
 
 
+# ── 个体经济性（单一来源）────────────────────────────────
+#
+# ⚠ 为什么必须有这一节：本系统此前只有一个**总体**成本模型
+#   （net_profit 吃的是混淆矩阵 TP/FP/FN），它能回答「整条名单划不划算」，
+#   却回答不了「**这一个人**划不划算」。
+#
+#   实测后果（diag88/diag89，96,418 行、决策线 0.60）：
+#     决策线内 6,582 人，其中 2,001 人（30.4%）按个体经济是**净亏**的，
+#     剔除后总净收益**反增 19,804,925 元**。
+#
+#     ⚠ 关键证据（这组数字是本功能存在的全部理由）：
+#         净亏者  平均概率 0.7793   平均余额 492（中位 0）
+#         值得者  平均概率 0.8005
+#       两者概率只差 **2.1 个百分点** —— 靠概率**根本区分不出来**这 2,001 人。
+#       真正的区分变量是**余额**：净亏者中 1,975/2,001（98.7%）是 ZERO 价值层。
+#       ⇒ 「判得准」≠「值得救」。概率回答"会不会跑"，余额回答"跑了亏多少"。
+#         总成本模型 net_profit 只有混淆矩阵一个维度，因此**结构上无法**发现
+#         这件事 —— 必须引入第二个维度（个体余额）才能看见。
+#
+#   公式（与 net_profit 严格同构，推导见 diag91）：
+#     个体净收益 = 概率 × 余额 × 成功率 − 单次干预成本
+#     总体净收益 = TP×(s×CR−1) − FP           （单位 = 一次干预成本）
+#   两式同构的前提是「流失客户平均余额 = AVG_CUSTOMER_VALUE」。
+#   ⚠ 实测该前提**不成立**：真实流失客户平均余额 ¥90,960 vs 假设 ¥50,000，
+#     偏差 81.9%。这意味着个体口径与总体口径在**金额**上不可直接相加，
+#     只可用于**同口径内**的排序与是否划得来的判断。
+#     此事已登记在假设登记簿，不得在此处悄悄抹平。
+
+
+def cost_per_intervention() -> float:
+    """单次干预成本（元）= 平均客户价值 / 成本比。
+
+    与 cost_benefit_service 同源（都读 settings），不另设常数。
+    """
+    return settings.AVG_CUSTOMER_VALUE / COST_RATIO
+
+
+def breakeven_expected_value(
+    success_rate: float | None = None,
+    cost_ratio: float | None = None,
+) -> float:
+    """个体盈亏平衡的「期望价值」门槛（元）。
+
+    期望价值 EV = p × balance。只有当 EV 超过本门槛时，
+    对**这一个**客户做干预的期望收益才为正：
+
+        p × balance × s > cost_per
+        ⇒ EV > cost_per / s = (AVG/CR) / s
+
+    默认参数下 = (50000/5.0) / 0.30 = 33,333.33 元。
+
+    ⚠ 注意门槛随 s 移动：s 越低，要求 EV 越高（越只救"值钱的把握大的"）。
+      这与 _optimal_threshold 的移动方向一致，是同一件事的两种表述。
+    """
+    s = RETENTION_SUCCESS_RATE if success_rate is None else float(success_rate)
+    cr = COST_RATIO if cost_ratio is None else float(cost_ratio)
+    if s <= 0 or cr <= 0:
+        return float("inf")
+    return (settings.AVG_CUSTOMER_VALUE / cr) / s
+
+
+def individual_net_profit(
+    prob: float,
+    balance: float,
+    success_rate: float | None = None,
+    cost_ratio: float | None = None,
+) -> float:
+    """单个客户的期望净收益（元）。正 = 值得干预，负 = 净亏。
+
+    与 net_profit() 同构（推导见文件内「个体经济性」节说明）。
+    零余额客户恒为 -cost_per（花了钱、可挽回资产为 0）。
+    """
+    s = RETENTION_SUCCESS_RATE if success_rate is None else float(success_rate)
+    c = cost_per_intervention() if cost_ratio is None else \
+        settings.AVG_CUSTOMER_VALUE / float(cost_ratio)
+    if prob is None or balance is None:
+        return -c
+    return float(prob) * float(balance) * s - c
+
+
+def worthiness(
+    prob: float,
+    balance: float,
+    success_rate: float | None = None,
+    expected_value: float | None = None,
+) -> dict:
+    """判断**这一个**客户是否值得投入干预 —— 供建单预检与「建议理由」使用。
+
+    返回：
+      verdict   worth / marginal / not_worth / no_asset
+      net       期望净收益（元）
+      breakeven 平衡门槛（元）
+      ratio     EV / breakeven，<1 即净亏
+      label     中文结论，可直接拼进理由文本
+
+    四档语义（`no_asset` 单列，不与 `not_worth` 混）：
+      no_asset   余额为 0 —— 抓到了也无资产可留，应走零成本渠道
+      not_worth  EV 不足平衡门槛的一半 —— 花钱买不到等值回报
+      marginal   EV 在门槛的 0.5~1.0 倍之间 —— 边界地带，由人判断
+      worth      EV 达到门槛 —— 期望收益为正
+
+    ⚠ 边界选 0.5 倍而非 1.0：1.0 是数学平衡点，但假设值本身有不确定性
+      （s 尤其），把 0.5~1.0 判为"由人判断"比硬判净亏更稳。
+
+    ⚠ `expected_value` 参数的必要性（自查修正）：不传时本函数用
+      `prob × balance` 现算 EV，而调用方若同时持有 `expected_value` 字段
+      （由**未舍入**概率算得，见 _build_scored_result），两者会差约 0.1 元。
+      建单理由里同时出现"期望可挽回"（用字段算）与"净收益"（用现算 EV）
+      就会构成**同一句话内两个口径** —— 虽小，但正是本项目一直在消除的病。
+      故允许调用方传入权威 EV，使两者严格同源。
+    """
+    s = RETENTION_SUCCESS_RATE if success_rate is None else float(success_rate)
+    c = cost_per_intervention()
+    be = breakeven_expected_value(success_rate=s)
+    if expected_value is not None:
+        ev = float(expected_value)
+    else:
+        ev = (float(prob) * float(balance)) if (prob is not None and balance) else 0.0
+    net = ev * s - c
+
+    if balance is None or float(balance) <= 0:
+        return {
+            "verdict": "no_asset", "net": round(net, 2),
+            "breakeven": round(be, 2), "ratio": 0.0,
+            "label": "余额为 0，无可挽回资产",
+        }
+    ratio = ev / be if be > 0 else 0.0
+    if ratio >= 1.0:
+        verdict, label = "worth", "期望收益为正，值得投入"
+    elif ratio >= 0.5:
+        verdict, label = "marginal", "处于盈亏边界，建议人工判断"
+    else:
+        verdict, label = "not_worth", "期望收益低于干预成本，不建议投入人工"
+    return {
+        "verdict": verdict, "net": round(net, 2),
+        "breakeven": round(be, 2), "ratio": round(ratio, 4), "label": label,
+    }
+
+
+
 # ── 干预策略（全系统单一来源）────────────────────────────
 #
 # 此前系统有**三套互不相同**的策略来源：本模块的 FACTOR_STRATEGY_MAP、
@@ -672,6 +812,17 @@ CHANNEL_LABELS = {
     "outbound": "主动外呼",
     "automated": "APP 推送 / 短信",
 }
+
+# ── 两个维度中文名（后端侧唯一来源）─────────────────────
+# ⚠ 为什么后端也需要：建单「建议理由」是**后端生成的自然语言**，
+#   里面必须出现「极高」「高价值」这些中文标签。若在 note_service 里
+#   再写一份，就与前端 utils/risk.js 的 LABELS 构成第三处定义 ——
+#   本模块顶部明确要求"等级名称全局唯一"。故收敛到此处。
+#   前端仍保留自己的 utils/risk.js（它不做后端渲染），两者取值必须一致。
+RISK_LABELS = {
+    "CRITICAL": "极高", "HIGH": "高危", "MEDIUM": "中等", "LOW": "低风险",
+}
+VALUE_TIER_LABELS = {"HIGH": "高价值", "LOW": "低价值", "ZERO": "零余额"}
 
 # 渠道 → 对应的价值层。渠道被人工覆盖后，需要据此反查动作表。
 _CHANNEL_TIER = {v: k for k, v in CHANNEL_BY_TIER.items()}

@@ -284,7 +284,40 @@
             </div>
             <div class="form-group full">
               <label>备注</label>
-              <textarea v-model="form.note" placeholder="添加备注信息..." rows="2"></textarea>
+              <textarea v-model="form.note" placeholder="添加备注信息..." rows="4"></textarea>
+              <!-- 建议理由：系统按当前客户实时数据生成，可自由修改。
+                   生成逻辑见 backend/app/services/note_service.py ——
+                   确定性模板拼装，非 LLM，句中每个数字都有出处。 -->
+              <div class="note-assist">
+                <div class="note-assist-head">
+                  <span class="note-assist-title">
+                    🤖 建议理由
+                    <span class="note-assist-badge">系统生成 · 可修改</span>
+                  </span>
+                  <button type="button" class="note-assist-btn"
+                          :disabled="noteLoading || noteFailed"
+                          @click="regenerateNote">
+                    {{ noteLoading ? '生成中…' : '重新生成' }}
+                  </button>
+                </div>
+                <p v-if="noteLoading" class="note-assist-hint">正在读取该客户实时打分结果…</p>
+                <p v-else-if="noteFailed" class="note-assist-hint note-assist-err">
+                  生成失败：{{ noteFailed }}
+                  <button type="button" class="note-assist-link" @click="regenerateNote">重试</button>
+                </p>
+                <template v-else-if="suggestion">
+                  <div :class="['note-assist-verdict', verdictClass(suggestion.worthiness.verdict)]">
+                    <strong>{{ verdictLabel(suggestion.worthiness.verdict) }}</strong>
+                    <span class="note-assist-num">
+                      个体净收益 {{ fmtSignedYuan(suggestion.worthiness.net) }}
+                      · 盈亏平衡点 {{ fmtYuan(suggestion.worthiness.breakeven) }}
+                    </span>
+                  </div>
+                  <p class="note-assist-hint">
+                    系统已把上述内容写入备注框，可直接编辑或清空后自行填写。
+                  </p>
+                </template>
+              </div>
             </div>
           </div>
         </div>
@@ -350,6 +383,17 @@ const riskTabs = [
 ]
 
 const modalOpen = ref(false)
+// 建议理由的生成状态 —— 与 note 文本框配合：
+//   suggestion 非空时把 note 预填进去，人可自由改写
+//   noteLoading  首次打开弹窗需请求后端（数百毫秒），期间给提示
+//   noteFailed   生成失败不阻塞建单，只提示并允许手写
+const noteLoading = ref(false)
+const noteFailed = ref('')
+const suggestion = ref(null)
+// 每次打开弹窗自增，用于丢弃过期响应 —— 快速连点不同客户时，
+// 先发的请求可能后返回，会把 A 客户的理由写到 B 客户的弹窗里
+let noteToken = 0
+
 const form = reactive({
   customer_id: '', customer_name: '', geography: '',
   risk_level: 'MEDIUM', probability: 0, balance: 0,
@@ -383,6 +427,32 @@ let searchTimer = null
 // —— 阈值口径与配色必须全局唯一，四个视图原先各写一份且取值不同。
 function fmtMoney(v) {
   return '¥' + (v || 0).toLocaleString()
+}
+/** 金额 → ¥1,234（整数元），用于盈亏平衡点、干预成本这类标量 */
+function fmtYuan(v) {
+  if (v == null || !isFinite(v)) return '—'
+  return '¥' + Math.round(v).toLocaleString()
+}
+/** 金额 → +¥1,234 / −¥1,234 —— 净收益必须带符号，否则正负看不出 */
+function fmtSignedYuan(v) {
+  if (v == null || !isFinite(v)) return '—'
+  const s = v >= 0 ? '+' : '−'
+  return s + '¥' + Math.abs(Math.round(v)).toLocaleString()
+}
+/** 经济性判定 → 中文（与后端 risk_scoring.worthiness 的 label 语义一致） */
+function verdictLabel(v) {
+  return {
+    worth: '值得投入',
+    marginal: '盈亏边界 · 建议人工判断',
+    not_worth: '不建议投入人工',
+    no_asset: '无可挽回资产',
+  }[v] || v
+}
+function verdictClass(v) {
+  return {
+    worth: 'v-worth', marginal: 'v-marginal',
+    not_worth: 'v-notworth', no_asset: 'v-noasset',
+  }[v] || ''
 }
 function avatarColor(name) {
   const palette = ['#6366f1', '#8b5cf6', '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#14b8a6']
@@ -474,6 +544,21 @@ async function batchCreate() {
   // 当前页的客户可直接复用（省一次请求）；其余的去详情接口补
   const onPage = new Map(customers.value.map((c) => [c.customer_id, c]))
 
+  // ── 批量取建议理由（一次请求，而不是 N 次）──────────────
+  // ⚠ 此前批量建单**不带 note**，而单建有 —— 同一件事两种行为。
+  //   批量恰恰最需要理由：一次勾选十几人，事后更没人记得为什么建。
+  //   失败不阻塞：拿不到理由就按空备注建单，与旧行为一致。
+  let noteMap = new Map()
+  try {
+    const params = new URLSearchParams()
+    ids.forEach((id) => params.append('customer_ids', id))
+    const { data } = await scope.get(`/customers/suggested-notes/batch?${params}`)
+    noteMap = new Map((data.items || []).map((r) => [r.customer_id, r.note]))
+  } catch (e) {
+    // 静默降级：理由只是辅助信息，不该拦住建单
+    console.warn('批量建议理由获取失败，将按空备注建单：', e.message)
+  }
+
   const okList = []
   const failList = []
   for (const cid of ids) {
@@ -503,6 +588,8 @@ async function batchCreate() {
         model_used: riskInfo.value?.model || null,
         value_tier_snapshot: c.value_tier,
         expected_value_snapshot: c.expected_value,
+        // 建议理由（批量取回，人可在工单页再编辑）
+        note: noteMap.get(c.customer_id) || '',
       })
       okList.push(c.customer_id)
     } catch (e) {
@@ -642,9 +729,62 @@ function openCreate(c) {
     override_reason: '',
   })
   modalOpen.value = true
+  fetchSuggestedNote(c.customer_id)
 }
+
+/**
+ * 取「建议理由」并预填到备注框。
+ *
+ * 设计取舍：**失败不阻塞建单**。理由只是辅助信息，若接口挂了就让人自己写，
+ * 不能因此拦住业务。故 catch 里只记错误、不弹 toast、不禁用「确认创建」。
+ *
+ * 覆盖行为：仅在备注框为空时预填。若用户已手工输入，重新生成**不覆盖** ——
+ * 否则点一下按钮就把人写的东西冲掉了。
+ */
+async function fetchSuggestedNote(customerId) {
+  const token = ++noteToken
+  noteLoading.value = true
+  noteFailed.value = ''
+  suggestion.value = null
+  try {
+    const { data } = await scope.get(`/customers/${customerId}/suggested-note`)
+    if (token !== noteToken) return      // 过期响应：客户已切换，丢弃
+    suggestion.value = data
+    if (!form.note.trim()) form.note = data.note || ''
+  } catch (e) {
+    if (token !== noteToken) return
+    noteFailed.value = e.response?.data?.detail || e.message
+  } finally {
+    if (token === noteToken) noteLoading.value = false
+  }
+}
+
+/** 「重新生成」按钮 —— 强制覆盖当前备注（用户主动点的，覆盖是预期行为） */
+async function regenerateNote() {
+  if (!form.customer_id) return
+  noteLoading.value = true
+  noteFailed.value = ''
+  const token = ++noteToken
+  try {
+    const { data } = await scope.get(`/customers/${form.customer_id}/suggested-note`)
+    if (token !== noteToken) return
+    suggestion.value = data
+    form.note = data.note || ''
+  } catch (e) {
+    if (token !== noteToken) return
+    noteFailed.value = e.response?.data?.detail || e.message
+  } finally {
+    if (token === noteToken) noteLoading.value = false
+  }
+}
+
 function closeModal() {
   modalOpen.value = false
+  // 作废在途请求并清空生成态 —— 否则下次打开会先闪出上一客户的理由
+  noteToken++
+  noteLoading.value = false
+  noteFailed.value = ''
+  suggestion.value = null
 }
 
 async function submitOrder() {
@@ -706,6 +846,50 @@ watch(() => route.query, () => {
   background: #eef3fb; border: 1px solid #c7d6ee;
 }
 .risk-banner-item { font-weight: 700; }
+
+/* ── 建议理由辅助区（建单弹窗内）── */
+/* 与备注框紧邻，视觉上属于同一组：上方是文本框，下方是系统的建议与出处 */
+.note-assist {
+  margin-top: 8px; padding: 10px 12px;
+  background: #f8fafc; border: 1px solid #e5e9f0; border-radius: 8px;
+}
+.note-assist-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+.note-assist-title {
+  font-size: 12px; font-weight: 600; color: #1f2937;
+  display: flex; align-items: center; gap: 6px;
+}
+.note-assist-badge {
+  font-size: 10px; font-weight: 500; color: #1d4ed8;
+  background: #e8f0fe; padding: 1px 7px; border-radius: 10px;
+}
+.note-assist-btn {
+  font-size: 11px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  color: #1d4ed8; background: #fff; border: 1px solid #c7d6ee;
+  transition: .15s; white-space: nowrap;
+}
+.note-assist-btn:hover:not(:disabled) { background: #eef3fb; }
+.note-assist-btn:disabled { color: #9aa7bd; border-color: #e5e9f0; cursor: default; }
+.note-assist-hint { font-size: 11.5px; color: #7c8aa5; line-height: 1.6; margin: 0; }
+.note-assist-err { color: #b45309; }
+.note-assist-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: #1d4ed8; text-decoration: underline; font-size: 11.5px;
+}
+/* 四档判定色 —— 语义色，与客户列表的风险徽章互不冲突（此处是经济性，
+   不是风险等级，故不复用 .risk-* 类名，避免读成"风险等级"） */
+.note-assist-verdict {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  font-size: 12px; padding: 6px 10px; border-radius: 6px; margin-bottom: 6px;
+}
+.note-assist-verdict strong { font-weight: 700; }
+.note-assist-num { font-size: 11.5px; opacity: .85; }
+.v-worth    { color: #0f766e; background: #e6f6f3; border: 1px solid #b7e4dc; }
+.v-marginal { color: #a16207; background: #fdf6e3; border: 1px solid #f0dfa8; }
+.v-notworth { color: #b45309; background: #fdf1e7; border: 1px solid #f3d5ba; }
+.v-noasset  { color: #b91c1c; background: #fdecec; border: 1px solid #f5c2c2; }
 
 /* ── Tabs ── */
 .tabs { display: flex; gap: 4px; background: #f1f5f9; padding: 4px; border-radius: 8px; }

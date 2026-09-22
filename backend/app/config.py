@@ -132,6 +132,27 @@ class Settings(BaseSettings):
     # Chunked data loading (for 10M+ scale)
     DATA_CHUNK_SIZE: int = 50000
 
+    # ── 智能体（对话式任务型 Agent）────────────────────────
+    #
+    # ⚠ 与上面三个业务假设不同，这一组是**工程配置**，不是业务口径，
+    #   因此不参与任何金额/阈值计算，改它们不会移动名单线。
+    #
+    # ⚠ key 一律从环境变量注入（docker-compose 的 env_file 读 .env，
+    #   .env 已在 .gitignore 中），**不得**写进源码或提交进仓库。
+    #   留空时 /api/agent/* 返回 503 并说明原因，而不是静默降级成
+    #   规则匹配 —— 后者会让调用方以为"大模型在回答"，实际没有。
+    AGENT_ENABLED: bool = False
+    AGENT_LLM_API_KEY: str = ""
+    # 任何 OpenAI 兼容端点均可（DeepSeek / 通义 / 智谱 / Kimi …）
+    AGENT_LLM_BASE_URL: str = "https://api.deepseek.com/v1"
+    AGENT_LLM_MODEL: str = "deepseek-chat"
+    # 工具调用循环上限 —— 防止 LLM 反复调同一个工具陷入死循环。
+    # 取 4：实测一个问题最多需要 2 次工具调用（先列表再查详情），
+    # 留一倍余量即可；再大只是在掩盖"模型选错工具"这个真问题。
+    AGENT_MAX_TOOL_ROUNDS: int = 4
+    # 单轮对话超时（秒）。DeepSeek 实测 2~8 秒；取 60 覆盖慢网络。
+    AGENT_TIMEOUT: int = 60
+
     class Config:
         env_file = ".env"
 

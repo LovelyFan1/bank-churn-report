@@ -14,5 +14,19 @@ joblib==1.4.2
 celery[redis]==5.4.0
 redis==5.2.1
 
+# ── 智能体编排（对话式任务型 Agent）─────────────────────
+# 选型依据（实测，非印象）：
+#   · 只装 openai SDK 需 +6 个包；LangGraph 全套需 +32 个包，
+#     但实测**全部核心依赖不受影响**（fastapi/sqlalchemy/pydantic/
+#     numpy/pandas/scikit-learn/lightgbm/xgboost/celery 均未被触碰），
+#     `pip check` 无冲突 —— 即纯增量安装，不动训练与推理链路。
+#   · 为什么不用 LangChain 的 Chain：Chain 是线性管道，做不了
+#     「条件回退」（数字校验不过就退回模板）与「图内中断」（写操作
+#     等人确认），而这两条正是本项目防幻觉的核心机制。
+#   · 暂不装 vector store / embedding：MVP 语料仅约 300 块，
+#     检索层二期再加，见 app/agent/README.md 的路线说明。
+langgraph==0.2.60
+langchain-openai==0.2.14
+
 # Production database (for 10M+ scale; SQLite still works for dev)
 # psycopg2-binary==2.9.9

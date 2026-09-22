@@ -12,6 +12,7 @@ from app.models.work_order import WorkOrder
 from app.services import data_source
 from app.services.data_generator import get_data_generator
 from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers, portfolio
+from app.routers import agent as agent_router
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -36,6 +37,7 @@ app.include_router(cost_benefit.router)  # /api/cost-benefit/*
 app.include_router(work_orders.router)  # /api/work-orders/*
 app.include_router(customers.router)   # /api/customers/*
 app.include_router(portfolio.router)   # /api/portfolio/* — 价值层 × 风险等级矩阵
+app.include_router(agent_router.router)  # /api/agent/* — 对话式任务型 Agent
 
 # 允许查询的字段列表
 ALLOWED_FIELDS = [

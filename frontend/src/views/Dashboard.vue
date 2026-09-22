@@ -279,6 +279,28 @@ const orderChannelOverridden = computed(
 const orderToast = ref('')
 let orderToastTimer = null
 
+// 建议理由生成态 —— 与客户管理页同一机制、同一后端接口。
+// 失败不阻塞建单：理由只是辅助信息，接口挂了就让人自己写。
+const orderNoteLoading = ref(false)
+const orderNoteFailed = ref('')
+const orderSuggestion = ref(null)
+let orderNoteToken = 0
+
+function fmtYuan(v) {
+  if (v == null || !isFinite(v)) return '—'
+  return '¥' + Math.round(v).toLocaleString()
+}
+function fmtSignedYuan(v) {
+  if (v == null || !isFinite(v)) return '—'
+  return (v >= 0 ? '+' : '−') + '¥' + Math.abs(Math.round(v)).toLocaleString()
+}
+function verdictLabel(v) {
+  return {
+    worth: '值得投入', marginal: '盈亏边界 · 建议人工判断',
+    not_worth: '不建议投入人工', no_asset: '无可挽回资产',
+  }[v] || v
+}
+
 function openCreateOrder(c) {
   orderForm.value = {
     customer_id: c.customer_id || c.id || '',
@@ -300,6 +322,45 @@ function openCreateOrder(c) {
     override_reason: '',
   }
   orderModalOpen.value = true
+  fetchOrderNote(orderForm.value.customer_id)
+}
+
+/** 取建议理由并预填（仅在备注为空时，避免冲掉用户已写的内容） */
+async function fetchOrderNote(customerId) {
+  const token = ++orderNoteToken
+  orderNoteLoading.value = true
+  orderNoteFailed.value = ''
+  orderSuggestion.value = null
+  try {
+    const { data } = await scope.get(`/customers/${customerId}/suggested-note`)
+    if (token !== orderNoteToken) return
+    orderSuggestion.value = data
+    if (!orderForm.value.note.trim()) orderForm.value.note = data.note || ''
+  } catch (e) {
+    if (token !== orderNoteToken) return
+    orderNoteFailed.value = e.response?.data?.detail || e.message
+  } finally {
+    if (token === orderNoteToken) orderNoteLoading.value = false
+  }
+}
+
+/** 「重新生成」—— 用户主动点击，覆盖是预期行为 */
+async function regenOrderNote() {
+  if (!orderForm.value.customer_id) return
+  orderNoteLoading.value = true
+  orderNoteFailed.value = ''
+  const token = ++orderNoteToken
+  try {
+    const { data } = await scope.get(`/customers/${orderForm.value.customer_id}/suggested-note`)
+    if (token !== orderNoteToken) return
+    orderSuggestion.value = data
+    orderForm.value.note = data.note || ''
+  } catch (e) {
+    if (token !== orderNoteToken) return
+    orderNoteFailed.value = e.response?.data?.detail || e.message
+  } finally {
+    if (token === orderNoteToken) orderNoteLoading.value = false
+  }
 }
 
 async function submitOrder() {
@@ -643,7 +704,36 @@ function showOrderToast(msg) {
           </div>
           <div class="form-group" style="grid-column: 1 / -1">
             <label>备注</label>
-            <textarea v-model="orderForm.note" placeholder="添加备注..." rows="2"></textarea>
+            <textarea v-model="orderForm.note" placeholder="添加备注..." rows="4"></textarea>
+            <!-- 建议理由 —— 与客户管理页同一机制、同一来源
+                 （GET /api/customers/{id}/suggested-note）。
+                 两处若各写一套，就又是本项目一直在消除的"同一件事两种行为"。 -->
+            <div class="note-assist">
+              <div class="note-assist-head">
+                <span class="note-assist-title">
+                  🤖 建议理由
+                  <span class="note-assist-badge">系统生成 · 可修改</span>
+                </span>
+                <button type="button" class="note-assist-btn"
+                        :disabled="orderNoteLoading || orderNoteFailed"
+                        @click="regenOrderNote">
+                  {{ orderNoteLoading ? '生成中…' : '重新生成' }}
+                </button>
+              </div>
+              <p v-if="orderNoteLoading" class="note-assist-hint">正在读取该客户实时打分结果…</p>
+              <p v-else-if="orderNoteFailed" class="note-assist-hint note-assist-err">
+                生成失败：{{ orderNoteFailed }}
+              </p>
+              <p v-else-if="orderSuggestion" class="note-assist-hint">
+                经济性判定：
+                <b :class="'v-' + orderSuggestion.worthiness.verdict">
+                  {{ verdictLabel(orderSuggestion.worthiness.verdict) }}
+                </b>
+                · 个体净收益 {{ fmtSignedYuan(orderSuggestion.worthiness.net) }}
+                · 盈亏平衡点 {{ fmtYuan(orderSuggestion.worthiness.breakeven) }}
+                <br />已写入备注框，可直接编辑或清空后自行填写。
+              </p>
+            </div>
           </div>
         </div>
       </div>
@@ -659,6 +749,38 @@ function showOrderToast(msg) {
 </template>
 
 <style scoped>
+/* ── 建议理由辅助区（建单弹窗内）—— 与客户管理页同名同类，样式各自 scoped ── */
+.note-assist {
+  margin-top: 8px; padding: 10px 12px;
+  background: #f8fafc; border: 1px solid #e5e9f0; border-radius: 8px;
+}
+.note-assist-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+.note-assist-title {
+  font-size: 12px; font-weight: 600; color: #1f2937;
+  display: flex; align-items: center; gap: 6px;
+}
+.note-assist-badge {
+  font-size: 10px; font-weight: 500; color: #1d4ed8;
+  background: #e8f0fe; padding: 1px 7px; border-radius: 10px;
+}
+.note-assist-btn {
+  font-size: 11px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  color: #1d4ed8; background: #fff; border: 1px solid #c7d6ee;
+  transition: .15s; white-space: nowrap;
+}
+.note-assist-btn:hover:not(:disabled) { background: #eef3fb; }
+.note-assist-btn:disabled { color: #9aa7bd; border-color: #e5e9f0; cursor: default; }
+.note-assist-hint { font-size: 11.5px; color: #7c8aa5; line-height: 1.7; margin: 0; }
+.note-assist-err { color: #b45309; }
+/* 四档经济性判定色（非风险等级，故不复用 .risk-* 类名） */
+.v-worth    { color: #0f766e; }
+.v-marginal { color: #a16207; }
+.v-notworth { color: #b45309; }
+.v-noasset  { color: #b91c1c; }
+
 /* Hero Banner —— 浅色银行风：白底 + 左侧蓝色边条 */
 .hero-banner {
   background: #ffffff;

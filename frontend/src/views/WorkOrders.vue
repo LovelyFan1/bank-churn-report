@@ -216,8 +216,20 @@
         <div class="modal-body">
           <div class="form-grid">
             <div class="form-group">
-              <label>客户编号</label>
-              <input v-model="form.customer_id" readonly class="readonly" />
+              <label>
+                客户编号
+                <span v-if="!editingId" class="text-xs text-gray-500">（填编号后自动带出客户信息）</span>
+              </label>
+              <!-- ⚠ 此前这里是 `readonly` 且恒为空，导致「＋ 创建工单」是**死胡同**：
+                   无客户选择控件 → submitOrder 必然报「请填写客户信息」，
+                   实测点确认后 0 条写请求发出。该入口从未可用过。
+                   现改为：新建时可输入编号并自动查询带出信息；编辑时仍只读
+                   （工单的客户不可改，改了就是另一张单）。
+                   带出的信息与客户管理页同源（GET /api/customers/{id}），
+                   理由同步生成，避免第三个建单入口又是"两套行为"。 -->
+              <input v-if="editingId" v-model="form.customer_id" readonly class="readonly" />
+              <input v-else v-model="form.customer_id" placeholder="例如 C000001"
+                     @change="lookupCustomer" @keyup.enter="lookupCustomer" />
             </div>
             <div class="form-group">
               <label>客户姓名</label>
@@ -272,7 +284,39 @@
             </div>
             <div class="form-group" style="grid-column: 1 / -1">
               <label>备注</label>
-              <textarea v-model="form.note" placeholder="添加备注信息..." rows="3"></textarea>
+              <textarea v-model="form.note" placeholder="添加备注信息..." rows="4"></textarea>
+              <!-- 建议理由 —— 与客户管理页/首页同一机制、同一接口。
+                   工单页此前没有这个入口（因为弹窗开不出来），现补齐。 -->
+              <div class="note-assist">
+                <div class="note-assist-head">
+                  <span class="note-assist-title">
+                    🤖 建议理由
+                    <span class="note-assist-badge">系统生成 · 可修改</span>
+                  </span>
+                  <button type="button" class="note-assist-btn"
+                          :disabled="noteLoading || !form.customer_id"
+                          @click="regenNote">
+                    {{ noteLoading ? '生成中…' : '重新生成' }}
+                  </button>
+                </div>
+                <p v-if="lookupError" class="note-assist-hint note-assist-err">{{ lookupError }}</p>
+                <p v-else-if="noteLoading" class="note-assist-hint">正在读取该客户实时打分结果…</p>
+                <p v-else-if="noteFailed" class="note-assist-hint note-assist-err">
+                  生成失败：{{ noteFailed }}
+                </p>
+                <p v-else-if="suggestion" class="note-assist-hint">
+                  经济性判定：
+                  <b :class="'v-' + suggestion.worthiness.verdict">
+                    {{ verdictLabel(suggestion.worthiness.verdict) }}
+                  </b>
+                  · 个体净收益 {{ fmtSignedYuan(suggestion.worthiness.net) }}
+                  · 盈亏平衡点 {{ fmtYuan(suggestion.worthiness.breakeven) }}
+                  <br />已写入备注框，可直接编辑或清空后自行填写。
+                </p>
+                <p v-else class="note-assist-hint">
+                  填写客户编号后自动带出业务信息并生成建议理由。
+                </p>
+              </div>
             </div>
           </div>
         </div>
@@ -353,6 +397,113 @@ const form = reactive({
 
 const toastMsg = ref('')
 let toastTimer = null
+
+// 建议理由生成态 —— 与客户管理页/首页同一机制、同一后端接口。
+// lookupError 单列：它是"客户编号填错"，与"理由接口挂了"是两回事，
+// 混用一条提示会让人以为系统坏了。
+const noteLoading = ref(false)
+const noteFailed = ref('')
+const lookupError = ref('')
+const suggestion = ref(null)
+let noteToken = 0
+
+function fmtYuan(v) {
+  if (v == null || !isFinite(v)) return '—'
+  return '¥' + Math.round(v).toLocaleString()
+}
+function fmtSignedYuan(v) {
+  if (v == null || !isFinite(v)) return '—'
+  return (v >= 0 ? '+' : '−') + '¥' + Math.abs(Math.round(v)).toLocaleString()
+}
+function verdictLabel(v) {
+  return {
+    worth: '值得投入', marginal: '盈亏边界 · 建议人工判断',
+    not_worth: '不建议投入人工', no_asset: '无可挽回资产',
+  }[v] || v
+}
+
+/**
+ * 按客户编号带出信息 —— 供「＋ 创建工单」使用（该入口此前不可用）。
+ *
+ * 先把客户详情拉回来填进表单（等级/概率/余额/因素/价值层/期望价值），
+ * 再取建议理由预填备注。两步都失败时给出**各自的**原因，不混为一条。
+ */
+async function lookupCustomer() {
+  const cid = (form.customer_id || '').trim()
+  lookupError.value = ''
+  noteFailed.value = ''
+  suggestion.value = null
+  if (!cid) {
+    lookupError.value = '请先填写客户编号'
+    return
+  }
+  // 作废在途请求 —— 连续改编号时，先发的可能后返回，会覆盖成别人的信息
+  const token = ++noteToken
+
+  try {
+    const { data: c } = await scope.get(`/customers/${cid}`)
+    if (token !== noteToken) return
+    Object.assign(form, {
+      customer_id: c.customer_id,
+      customer_name: c.surname || '',
+      geography: c.geography || '',
+      risk_level: c.risk_level || 'MEDIUM',
+      probability: c.probability || 0,
+      balance: c.balance || 0,
+      risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
+      strategy: c.action || c.strategy || '',
+      value_tier_snapshot: c.value_tier || null,
+      expected_value_snapshot: c.expected_value ?? null,
+    })
+    // 分级依据快照：取不到就留空，由后端在 create_work_order 里补齐
+    // （后端本就有兜底逻辑，这里不重复实现，避免两处各写一套）
+    try {
+      const { data: ri } = await scope.get('/model/risk-info')
+      if (token === noteToken) {
+        form.thresholds_snapshot = ri.thresholds || null
+        form.model_used = ri.model || null
+      }
+    } catch (_) { /* 快照取不到不影响建单 */ }
+  } catch (e) {
+    if (token !== noteToken) return
+    lookupError.value = `未找到客户 ${cid}：` + (e.response?.data?.detail || e.message)
+    return
+  }
+
+  // 再取建议理由（失败不阻塞建单，只提示）
+  noteLoading.value = true
+  try {
+    const { data } = await scope.get(`/customers/${cid}/suggested-note`)
+    if (token !== noteToken) return
+    suggestion.value = data
+    if (!form.note.trim()) form.note = data.note || ''
+  } catch (e) {
+    if (token !== noteToken) return
+    noteFailed.value = e.response?.data?.detail || e.message
+  } finally {
+    if (token === noteToken) noteLoading.value = false
+  }
+}
+
+/** 「重新生成」—— 用户主动点击，覆盖是预期行为 */
+async function regenNote() {
+  const cid = (form.customer_id || '').trim()
+  if (!cid) return
+  const token = ++noteToken
+  noteLoading.value = true
+  noteFailed.value = ''
+  try {
+    const { data } = await scope.get(`/customers/${cid}/suggested-note`)
+    if (token !== noteToken) return
+    suggestion.value = data
+    form.note = data.note || ''
+  } catch (e) {
+    if (token !== noteToken) return
+    noteFailed.value = e.response?.data?.detail || e.message
+  } finally {
+    if (token === noteToken) noteLoading.value = false
+  }
+}
 
 // ── Computed ────────────────────────────────────────
 const statsCards = computed(() => [
@@ -612,6 +763,12 @@ function resetForm(preset) {
     value_tier_snapshot: preset?.value_tier_snapshot || null,
     expected_value_snapshot: preset?.expected_value_snapshot ?? null,
   })
+  // 清空建议理由生成态 —— 否则新建时先闪出上一单的判定与理由
+  noteToken++
+  noteLoading.value = false
+  noteFailed.value = ''
+  lookupError.value = ''
+  suggestion.value = null
 }
 
 function closeModal() {
@@ -703,6 +860,38 @@ defineExpose({ openCreate })
 </script>
 
 <style scoped>
+/* ── 建议理由辅助区（建单弹窗内）—— 与客户管理页/首页同名同类 ── */
+.note-assist {
+  margin-top: 8px; padding: 10px 12px;
+  background: #f8fafc; border: 1px solid #e5e9f0; border-radius: 8px;
+}
+.note-assist-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+.note-assist-title {
+  font-size: 12px; font-weight: 600; color: #1f2937;
+  display: flex; align-items: center; gap: 6px;
+}
+.note-assist-badge {
+  font-size: 10px; font-weight: 500; color: #1d4ed8;
+  background: #e8f0fe; padding: 1px 7px; border-radius: 10px;
+}
+.note-assist-btn {
+  font-size: 11px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  color: #1d4ed8; background: #fff; border: 1px solid #c7d6ee;
+  transition: .15s; white-space: nowrap;
+}
+.note-assist-btn:hover:not(:disabled) { background: #eef3fb; }
+.note-assist-btn:disabled { color: #9aa7bd; border-color: #e5e9f0; cursor: default; }
+.note-assist-hint { font-size: 11.5px; color: #7c8aa5; line-height: 1.7; margin: 0; }
+.note-assist-err { color: #b45309; }
+/* 四档经济性判定色（非风险等级，故不复用 .risk-* 类名） */
+.v-worth    { color: #0f766e; }
+.v-marginal { color: #a16207; }
+.v-notworth { color: #b45309; }
+.v-noasset  { color: #b91c1c; }
+
 /* ── 卡片覆盖：本页局部用更浅的圆角（全局 .glass-card 已是白卡） ── */
 .glass-card {
   border-radius: 10px;

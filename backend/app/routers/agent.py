@@ -1,0 +1,318 @@
+"""智能体 Router —— 对话式任务型 Agent 的对外接口。
+
+**与其它 router 的区别**
+
+其它 router 都是"查询 → 返回结构化 JSON"。本 router 是**任务型**：
+输入一句自然语言，输出一段回答 + 依据 + （可能的）待确认动作。
+
+**为什么把"缺 key/缺依赖"做成 503 而不是降级**
+
+若 Agent 不可用时静默退回规则匹配，调用方会以为「大模型在回答」，
+实际没有 —— 属于最坏的一类不一致（本项目反复强调的问题）。
+故此处明确返回 503 + 原因，前端据此如实提示。
+"""
+
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.agent import guard_rules, llm
+from app.database import get_db
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/agent", tags=["Agent"])
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=800,
+                          description="用户的自然语言问题")
+    session_id: str = Field(default="default", max_length=64,
+                            description="会话标识（MVP 未持久化，仅回显）")
+
+
+@router.get("/health")
+async def agent_health():
+    """Agent 可用性自检 —— 供前端决定是否显示对话入口。
+
+    返回 available=false 时带上具体原因（缺 key / 缺依赖 / 被关闭），
+    而不是笼统的"不可用"。
+    """
+    ok, reason = llm.is_available()
+    return {
+        "available": ok,
+        "reason": reason,
+        "model": llm.settings.AGENT_LLM_MODEL if ok else None,
+        "base_url": llm.settings.AGENT_LLM_BASE_URL if ok else None,
+        "max_tool_rounds": llm.settings.AGENT_MAX_TOOL_ROUNDS,
+    }
+
+
+@router.get("/capabilities")
+async def agent_capabilities():
+    """Agent 的能力边界 —— 能做什么、不能做什么。
+
+    ⚠ 主动暴露"答不了什么"，比被问到时支吾更有价值：
+      它把系统的**边界**变成了产品能力，也是答辩时最硬的证据。
+
+    返回三部分：
+      tools         可调用的工具（即"能做什么"）
+      blocked       答不了的主题及原因（即"不做什么"）
+      basis_meaning 回答口径字段的语义（前端展示"这句话怎么来的"）
+    """
+    from app.agent import tools as tools_mod
+
+    return {
+        "tools": [
+            {"name": n,
+             "write": s["write"],
+             "description": s["description"]}
+            for n, s in tools_mod.TOOL_SPECS.items()
+        ],
+        "blocked": guard_rules.known_topics(),
+        "basis_meaning": {
+            "llm_verified": "模型作答，且其中每个数字都已通过溯源校验",
+            "llm_partial_dropped": "模型解读含无法溯源的数字，已丢弃该段；数据卡片不受影响",
+            "ungrounded": "⚠ 模型未查询任何系统数据即作答，回答可能不准确",
+            "guard_blocked": "该问题触及本系统答不了的边界，已在调用模型前拦截",
+            "system_pending_action": "系统生成的待确认操作说明（未执行写操作）",
+            "disabled": "智能体未启用",
+        },
+    }
+
+
+@router.post("/ask")
+async def agent_ask(body: AskRequest, db: Session = Depends(get_db)):
+    """问一句，得到一个基于系统真实数据的回答。
+
+    回答可能附带：
+      pending_action  待用户确认的写操作（如建单）—— 不会自动执行
+      citations       本次回答用到的数据来源
+      verify_failed   被丢弃的、无法溯源的数字（非空说明模型编过数字）
+    """
+    ok, reason = llm.is_available()
+    if not ok:
+        # 明确失败，不降级 —— 见文件顶部说明
+        raise HTTPException(
+            status_code=503,
+            detail=f"智能体当前不可用：{reason}",
+        )
+
+    from app.agent import graph as graph_mod
+
+    q = body.question.strip()
+    if not q:
+        raise HTTPException(status_code=422, detail="问题不能为空")
+
+    try:
+        result = graph_mod.run(q, session_id=body.session_id)
+    except Exception as e:
+        logger.exception("agent: 执行失败")
+        raise HTTPException(
+            status_code=500,
+            detail=f"智能体执行失败：{type(e).__name__}: {e}",
+        )
+
+    return {
+        "question": q,
+        "session_id": body.session_id,
+        **result,
+    }
+
+
+@router.post("/confirm")
+async def agent_confirm(payload: dict):
+    """确认执行 Agent 提议的写操作。
+
+    ⚠ 与 /ask 分离是刻意的：Agent 只能**提议**，执行必须由这个
+      独立端点完成，且由用户显式触发。这样"Agent 不会自作主张写库"
+      是**接口结构**上的保证，而不是靠提示词约束模型。
+
+    当前支持 action=create_work_order。
+    """
+    from app.routers.work_orders import create_work_order
+    from app.schemas.work_order import WorkOrderCreate
+
+    action = payload.get("action")
+    if action not in ("create_work_order", "update_work_order", "delete_work_order"):
+        raise HTTPException(status_code=422,
+                            detail=f"不支持的 action：{action}")
+
+    body = payload.get("payload")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="缺少 payload")
+
+    from app.database import SessionLocal
+    from app.routers.work_orders import (
+        create_work_order, delete_work_order, get_work_order, update_work_order)
+    from app.schemas.work_order import WorkOrderCreate, WorkOrderUpdate
+
+    db = SessionLocal()
+    try:
+        if action == "create_work_order":
+            # 复用既有建单逻辑（含 409 互斥、渠道覆盖校验、快照补齐），
+            # 不另写一套 —— 否则 Agent 建的工单与页面建的会有口径差异
+            created = await create_work_order(WorkOrderCreate(**body), db=db)
+            return {"created": True, "action": action, "order": created}
+
+        if action == "update_work_order":
+            oid = int(body.get("order_id"))
+            fields = {k: v for k, v in body.items()
+                      if k in ("status", "assignee", "note") and v is not None}
+            if not fields:
+                raise HTTPException(status_code=422,
+                                    detail="update_work_order 至少需要 status/assignee/note 之一")
+            updated = await update_work_order(oid, WorkOrderUpdate(**fields), db=db)
+            return {"created": False, "action": action, "order": updated}
+
+        # delete_work_order
+        oid = int(body.get("order_id"))
+        # ⚠ 删前先取快照 —— 删掉之后就无法向用户交代"删的是哪一张"
+        before = None
+        try:
+            detail = await get_work_order(oid, db=db)
+            before = {"customer_id": detail.get("customer_id"),
+                      "customer_name": detail.get("customer_name"),
+                      "status": detail.get("status")}
+        except HTTPException:
+            pass
+        await delete_work_order(oid, db=db)
+        return {"created": False, "action": action, "deleted": True,
+                "order_id": oid, "deleted_order": before}
+
+    except HTTPException:
+        raise
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=422, detail=f"参数错误：{e}")
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"操作失败：{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+class BatchConfirmRequest(BaseModel):
+    customer_ids: list[str] = Field(min_length=1, max_length=20,
+                                    description="要建单的客户编号列表")
+    assignee: str = Field(default="", max_length=64,
+                          description="统一负责人，留空则不指派")
+
+
+@router.post("/confirm-batch")
+async def agent_confirm_batch(body: BatchConfirmRequest):
+    """批量确认建单 —— 方案 A（弹确认面板后一次性提交）。
+
+    ⚠ 为什么需要独立端点而不是前端循环调 /confirm：
+      1) **部分失败要能被结构化汇报**。实测（diag112）三人里可能有一人
+         已有进行中工单 → 409。前端若自己循环，就得自己拼错误信息，
+         容易出现"两条成功一条失败但提示含糊"。
+      2) **互斥检查要在服务端统一做**。这里先查一遍
+         /work-orders/active-customers，把已有工单的人**提前标出**，
+         而不是等 409 再回头解释。
+      3) 失败**不中断**后续 —— 一条失败不应让其余全部回滚，
+         否则用户要重来一遍。
+
+    返回：
+      ok            成功建单的客户编号
+      failed        失败列表 [{customer_id, reason}]
+      skipped       因已有进行中工单而跳过的客户编号
+      created       新建工单的摘要（id / customer_id / assignee）
+    """
+    from app.database import SessionLocal
+    from app.routers.work_orders import create_work_order
+    from app.schemas.work_order import WorkOrderCreate
+    from app.services.customer_service import get_customer_detail
+
+    ids = [c.strip() for c in body.customer_ids if c and c.strip()]
+    if not ids:
+        raise HTTPException(status_code=422, detail="customer_ids 不能为空")
+
+    # 去重但保序 —— 用户可能重复勾选
+    seen = set()
+    uniq = [c for c in ids if not (c in seen or seen.add(c))]
+
+    db = SessionLocal()
+    ok_list: list[dict] = []
+    failed: list[dict] = []
+    skipped: list[str] = []
+
+    try:
+        # 预先查一次"已有进行中工单"的客户，提前归类
+        from app.models.work_order import WorkOrder
+        active = {
+            r[0] for r in db.query(WorkOrder.customer_id)
+            .filter(WorkOrder.status.in_(["pending", "in_progress"])).all()
+        }
+
+        for cid in uniq:
+            if cid in active:
+                skipped.append(cid)
+                continue
+
+            detail = get_customer_detail(db, cid)
+            if detail is None:
+                failed.append({"customer_id": cid, "reason": "客户不存在或模型未训练"})
+                continue
+
+            # 组装建单体 —— 与 propose_create_work_order 工具同源字段，
+            # 保证 Agent 建的工单与页面建的完全一致
+            suggested = ""
+            try:
+                from app.services import note_service
+                suggested = note_service.build_reason(
+                    prob=detail.get("probability", 0.0),
+                    balance=detail.get("balance", 0.0),
+                    risk_level=detail.get("risk_level", "MEDIUM"),
+                    value_tier=detail.get("value_tier", "LOW"),
+                    risk_factors=detail.get("risk_factors", []),
+                    expected_value=detail.get("expected_value"),
+                    action=detail.get("action") or detail.get("strategy"),
+                    channel=detail.get("channel"),
+                )["note"]
+            except Exception:
+                pass   # 理由生成失败不阻断建单，note 留空即可
+
+            payload = {
+                "customer_id": detail.get("customer_id"),
+                "customer_name": detail.get("surname"),
+                "geography": detail.get("geography"),
+                "risk_level": detail.get("risk_level"),
+                "probability": detail.get("probability"),
+                "balance": detail.get("balance"),
+                "risk_factors": detail.get("risk_factors") or [],
+                "strategy": detail.get("action") or detail.get("strategy") or "",
+                "assignee": body.assignee or "",
+                "note": suggested,
+                "channel": detail.get("channel"),
+                "value_tier_snapshot": detail.get("value_tier"),
+                "expected_value_snapshot": detail.get("expected_value"),
+            }
+            try:
+                created = await create_work_order(WorkOrderCreate(**payload), db=db)
+                ok_list.append({
+                    "id": created.get("id"),
+                    "customer_id": created.get("customer_id"),
+                    "customer_name": created.get("customer_name"),
+                    "assignee": created.get("assignee"),
+                })
+                # 立刻加入 active，防止同一批里重复建（理论上已去重，双保险）
+                active.add(cid)
+            except HTTPException as e:
+                failed.append({"customer_id": cid, "reason": str(e.detail)})
+            except Exception as e:
+                failed.append({"customer_id": cid,
+                               "reason": f"{type(e).__name__}: {e}"})
+
+        return {
+            "requested": len(uniq),
+            "succeeded": len(ok_list),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "created": ok_list,
+            "failed": failed,
+            "skipped": skipped,
+        }
+    finally:
+        db.close()
