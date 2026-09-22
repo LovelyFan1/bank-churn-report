@@ -36,7 +36,8 @@ import re
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
-from app.agent import answer_builder, guard_rules, llm, tools, verify as verify_mod
+from app.agent import (answer_builder, context as ctx_mod, guard_rules, llm,
+                       tools, verify as verify_mod)
 from app.agent.state import AgentState, initial_state
 from app.config import settings
 
@@ -157,6 +158,34 @@ def node_meta(state: AgentState) -> dict:
     }
 
 
+def _context_block(state: AgentState) -> str:
+    """渲染要注入 LLM 的会话上下文块（无则空串）。
+
+    ⚠ 注入在 **HumanMessage 里**（用户问句前部），**不是** SystemMessage。
+      原因：DeepSeek 的上下文缓存按前缀命中给折扣，而 system prompt 与
+      工具定义是天然静态的部分。把每轮都变的上下文插在最前面会让前缀
+      全变 → 缓存全废，比不缓存更亏。详见 agent/context.py 顶部说明。
+
+    ⚠ 省 token 规则：若用户在问句里**显式写出了编号**，且该编号不在
+      上下文名单里，说明这是全新话题 —— 不必注入旧名单（约 100 token），
+      也避免模型把新客户与旧名单混在一起。
+      反过来说，"显式编号 + 命中名单"（如「这三个人里 C071081 呢」）
+      仍要注入，那正是需要指代消解的场景。
+
+    成本不对称是这条规则的理由：误注入只多花约 100 token（无害），
+    漏注入则直接答不了。故宁可偏向注入。
+    """
+    ctx = state.get("context_in") or {}
+    if not ctx:
+        return ""
+    known = {str(c.get("id") or "").upper()
+             for c in ctx.get("customers") or []}
+    explicit = ctx_mod.explicit_ids(state.get("question") or "")
+    if explicit and not any(e.upper() in known for e in explicit):
+        return ""
+    return ctx_mod.render(ctx)
+
+
 def node_agent(state: AgentState) -> dict:
     """② LLM 决策节点 —— 决定调工具还是直接答。
 
@@ -168,11 +197,19 @@ def node_agent(state: AgentState) -> dict:
       "配对"关系，回灌后极易出现"有 tool_call 无对应结果"的畸形序列。
       故此处每轮**重建一份干净的消息列表**，把已得的工具结果作为
       普通文本附在 HumanMessage 里 —— 简单且不会违反协议。
+
+    ⚠ 会话上下文也走同一条路：**只注入一份指针清单**（编号 + 极简标签），
+      不注入历史原文、不注入工具原始结果。见 agent/context.py。
     """
     model = llm.router_llm().bind_tools(_tool_schemas())
 
     msgs: list = [SystemMessage(content=_DECISION_SYSTEM)]
-    msgs.append(HumanMessage(content=state["question"]))
+    block = _context_block(state)
+    if block:
+        # 上下文在前、问句在后 —— 让模型先看到"有哪些对象"，再读问题
+        msgs.append(HumanMessage(content=f"{block}\n\n{state['question']}"))
+    else:
+        msgs.append(HumanMessage(content=state["question"]))
 
     made = state.get("tool_calls_made", [])
     if made:
@@ -280,6 +317,63 @@ def node_force_write(state: AgentState) -> dict:
     return {"force_write_tool": "propose_delete_work_order"}
 
 
+# 哪些工具的参数是"客户编号"，需要走输出侧白名单
+_CID_TOOLS = {"get_customer_risk", "propose_create_work_order"}
+# 哪些工具的参数是"工单编号"
+_OID_TOOLS = {"propose_update_work_order", "propose_delete_work_order"}
+
+
+def _scope_error(state: AgentState, name: str, args: dict,
+                 results_so_far: list[dict]) -> str | None:
+    """输出侧边界校验 —— 编号必须可溯源，否则拒绝执行。
+
+    ⚠ 这是整个会话上下文设计的**关键防线**，也是"通配"能成立的前提：
+
+      输入侧枚举说法（第一个/他/刚才那个…）永远有漏，因为语言是无限的。
+      但**输出是有限的**（数据库实体）。所以不在输入侧猜用户在指谁，
+      而是让 LLM 自由理解，只校验它最后取用的编号是否在已知名单内。
+
+      这样「他」「那个」「这客户」等任意说法都能被理解（通配），
+      而幻觉出来的编号一律进不了工具层（边界内）。
+
+    ⚠ 为什么用"累积 results"而不是只看 state：
+      模型可能在同一轮里先 list_customers 再 get_customer_risk，
+      此时列表结果还在本轮累积中、尚未写回 state。只看 state 会
+      把正常路径误拦。故二者合并。
+
+    ⚠ 名单为空时的两种情形必须都拦：
+      · 用户没写编号、上下文也没有 → 模型只能凭空编，必拦
+      · 用户写了编号 → 会进 allowed（见 explicit_ids），不会走到这里
+    """
+    ctx = state.get("context_in") or {}
+    question = state.get("question") or ""
+    merged = list(state.get("tool_results") or []) + list(results_so_far or [])
+
+    if name in _CID_TOOLS:
+        cid = args.get("customer_id")
+        if not cid:
+            return None            # 缺参数由工具自身报错，不在此处代判
+        allowed = ctx_mod.allowed_customer_ids(ctx, question, merged)
+        if str(cid).upper() not in allowed:
+            logger.warning("agent: 编号越界拦截 %s cid=%s", name, cid)
+            return ctx_mod.out_of_scope_msg(cid, allowed)
+
+    elif name in _OID_TOOLS:
+        oid = args.get("order_id")
+        if oid is None:
+            return None
+        try:
+            oid = int(oid)
+        except (TypeError, ValueError):
+            return None            # 类型错误交给工具报错，信息更准确
+        allowed_o = ctx_mod.allowed_order_ids(ctx, merged)
+        if oid not in allowed_o:
+            logger.warning("agent: 工单号越界拦截 %s oid=%s", name, oid)
+            return ctx_mod.out_of_scope_order_msg(oid, allowed_o)
+
+    return None
+
+
 def node_tools(state: AgentState) -> dict:
     """③ 执行工具。
 
@@ -291,6 +385,9 @@ def node_tools(state: AgentState) -> dict:
       这是模型行为，不是我们代码的 bug —— 但**执行侧应该挡住**：
       同一轮内 (工具名, 参数) 完全相同的调用只执行一次，后续直接复用结果。
       跨轮不去重：模型可能确实需要重查（例如先查列表再查某一项）。
+
+    ⚠ 越界拦截（会话上下文配套）：带编号的工具在执行前先过 `_scope_error`，
+      编号无法溯源则不执行、把原因回给模型让它重决策（见该函数说明）。
     """
     last = None
     for m in reversed(state.get("messages", [])):
@@ -317,6 +414,17 @@ def node_tools(state: AgentState) -> dict:
         if dedup_key in seen_this_round:
             cached = seen_this_round[dedup_key]
             logger.info("agent: 跳过重复工具调用 %s（本轮已执行）", name)
+            continue
+
+        # ── 输出侧边界：编号必须可溯源 ────────────────────────
+        scope_err = _scope_error(state, name, args, results)
+        if scope_err:
+            r = {"ok": False, "error": scope_err}
+            seen_this_round[dedup_key] = r
+            made.append({"name": name, "args": args, "ok": False,
+                         "result": None, "error": scope_err})
+            results.append({"tool": name, "args": args, "ok": False,
+                            "data": {"error": scope_err}})
             continue
 
         if name in tools.WRITE_TOOL_NAMES:
@@ -573,7 +681,12 @@ def node_verify(state: AgentState) -> dict:
     llm_text = " ".join(
         [state.get("headline") or ""] + list(state.get("insights") or [])
     )
-    ok, orphans = verify_mod.verify(llm_text, tool_results)
+    ok, orphans = verify_mod.verify(
+        llm_text, tool_results,
+        # 上下文里的数字也算合法出处 —— 否则多轮追问引用上一轮数据
+        # 会被误判为幻觉，徽章集体退化。详见 verify.verify 的说明。
+        extra_sources=ctx_mod.numbers(state.get("context_in")),
+    )
 
     headline = state.get("headline") or ""
     insights = state.get("insights") or []
@@ -1166,7 +1279,8 @@ def get_graph():
     return _compiled
 
 
-def run(question: str, session_id: str = "default") -> dict:
+def run(question: str, session_id: str = "default",
+        context: dict | None = None) -> dict:
     """跑一轮对话，返回可直接序列化给前端的 dict。
 
     返回键：
@@ -1177,9 +1291,21 @@ def run(question: str, session_id: str = "default") -> dict:
       pending_action  待确认写操作（有则前端显示确认按钮）
       tool_calls      本次调用的工具留痕
       verify_failed   被丢弃的孤儿数字（非空说明 LLM 编了数字）
+      context         更新后的会话上下文（前端存下，下一轮回传）
+
+    `context` 由前端回传，见 agent/context.py 顶部关于"为什么无状态"的说明。
     """
+    ctx_in = ctx_mod.normalize(context)
+
     st = initial_state(session_id, question)
+    st["context_in"] = ctx_in
     out = get_graph().invoke(st, {"recursion_limit": 20})
+
+    # ── 合并本轮实体，产出下一轮要用的上下文 ──────────────────
+    cur = ctx_mod.extract(out.get("tool_results") or [],
+                          out.get("pending_action"))
+    ctx_out = ctx_mod.merge(ctx_in, cur)
+
     return {
         # 结构化答案 —— 前端主要消费这个
         "answer": out.get("answer") or {},
@@ -1195,4 +1321,7 @@ def run(question: str, session_id: str = "default") -> dict:
         ],
         "verify_failed": out.get("verify_fail") or [],
         "guard_topic": out.get("guard_topic"),
+        # 会话上下文 —— 前端原样存下，下一轮 request 里带回来。
+        # 这样后端**不需要任何进程内状态**，多 worker 天然一致。
+        "context": ctx_out,
     }

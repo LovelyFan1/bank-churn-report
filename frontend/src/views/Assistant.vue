@@ -34,9 +34,11 @@ import api from '../api'
  *      这对演示场景可接受；若要严格隔离需改成"每标签页一份 + 会话 id"。
  *   2. **数据落在浏览器本地**。本系统是演示数据，无真实客户信息，
  *      故可接受。若将来接入真实数据，这里必须改为服务端会话并加权限校验。
- *   3. **只存本轮对话，不构成"记忆"**。服务端仍是无状态（见 graph.run）——
- *      恢复的是**显示历史**，不是让模型记住上下文。
- *      用户问「第二个人呢」这类隐式指代仍然不成立，这是刻意设计。
+ *   3. **显示历史 ≠ 模型记忆**。这里存的是**显示历史**（turns），
+ *      恢复它只是让用户看到之前的对话。
+ *      真正让模型能理解「第二个」「他」这类指代的是 `agentContext`
+ *      —— 一份**只含编号的指针清单**，随每次提问回传后端（见 send 与
+ *      backend/app/agent/context.py）。后端因此保持无状态，多 worker 一致。
  */
 const STORE_KEY = 'agent.session.v1'
 const MAX_TURNS = 60          // 上限，防止 localStorage 无限膨胀（约 5MB 配额）
@@ -64,6 +66,22 @@ const caps = ref(null)
 const listEl = ref(null)
 const restored = ref(false)   // 是否从缓存恢复过（用于提示用户）
 
+/**
+ * 会话上下文（短期记忆）—— 只存编号等指针，不存内容。
+ *
+ * ⚠ 这是**让模型能理解指代**的唯一机制：
+ *   用户问「第二个为什么值得」时，后端收到 context 才知道"第二个"是谁。
+ *   它随每次 /agent/ask 回传，响应里带回更新后的版本。
+ *
+ * ⚠ 为什么由前端持有而不是后端保存：后端是 `uvicorn --workers 4`，
+ *   进程内记忆会让 4 个 worker 各自为政（"有时记得有时不记得"）。
+ *   见 backend/app/agent/context.py 顶部说明。
+ *
+ * 结构：{ customers: [{id, name, prob, balance}], orders: [{order_id, ...}] }
+ * 体积：约 100 token，**不随轮次增长**（上限 20 个实体，溢出淘汰最旧）。
+ */
+const agentContext = ref({ customers: [], orders: [] })
+
 const samples = [
   '帮我调出挽回价值最高的3个客户',
   'C034525 这个人要不要打电话？',
@@ -84,6 +102,16 @@ onMounted(async () => {
       batch: t.batch ? { ...t.batch, open: false, running: false } : null,
     }))
     restored.value = true
+  }
+  // ⚠ 上下文也一并恢复：刷新后追问「第二个」仍应成立。
+  //   否则用户会看到历史对话在，但模型"失忆"了 —— 前后不一致最难解释。
+  //   只接受形状正确的对象；损坏则回落到空上下文（后端还会再校验一次）。
+  if (saved && saved.context && typeof saved.context === 'object'
+      && !Array.isArray(saved.context)) {
+    agentContext.value = {
+      customers: Array.isArray(saved.context.customers) ? saved.context.customers : [],
+      orders: Array.isArray(saved.context.orders) ? saved.context.orders : [],
+    }
   }
 
   try {
@@ -114,7 +142,7 @@ onMounted(async () => {
  */
 let suppressPersist = false
 
-watch(turns, (val) => {
+watch([turns, agentContext], ([val]) => {
   if (suppressPersist) return
   try {
     if (!val.length) {
@@ -142,6 +170,8 @@ watch(turns, (val) => {
     }))
     localStorage.setItem(STORE_KEY, JSON.stringify({
       v: 1, ts: Date.now(), turns: slim.slice(-MAX_TURNS),
+      // 上下文（约 100 token 的指针清单）—— 刷新后追问仍成立
+      context: agentContext.value,
     }))
   } catch (e) {
     // 配额满 / 隐私模式禁用 storage —— 不该影响正常对话
@@ -156,6 +186,9 @@ function clearSession() {
   try { localStorage.removeItem(STORE_KEY) } catch (_) { /* 忽略 */ }
   suppressPersist = true
   turns.value = []
+  // ⚠ 上下文必须一起清 —— 否则"清空会话"后模型仍记得之前的人，
+  //   用户会以为清空没生效（这是最容易被忽略的一处状态残留）
+  agentContext.value = { customers: [], orders: [] }
   restored.value = false
   nextTick(() => { suppressPersist = false })
 }
@@ -186,7 +219,15 @@ async function send(text) {
   await scrollToEnd()
 
   try {
-    const { data } = await api.post('/agent/ask', { question: q, session_id: 'ui' })
+    // ⚠ context 随请求回传 —— 这是让模型能理解「第二个」「他」的唯一途径。
+    //   后端保持无状态，故必须每轮带上（详见 agentContext 的说明）。
+    const { data } = await api.post('/agent/ask', {
+      question: q,
+      session_id: 'ui',
+      context: agentContext.value,
+    })
+    // 更新上下文：后端返回的是**合并后的**新清单，直接替换
+    if (data.context) agentContext.value = data.context
     turns.value.push({
       role: 'agent',
       answer: data.answer || { kind: 'text', text: data.text || '' },

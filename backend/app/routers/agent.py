@@ -13,6 +13,7 @@
 """
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -31,6 +32,22 @@ class AskRequest(BaseModel):
                           description="用户的自然语言问题")
     session_id: str = Field(default="default", max_length=64,
                             description="会话标识（MVP 未持久化，仅回显）")
+    # 会话上下文（短期记忆）——由**前端回传**，见下。
+    #
+    # ⚠ 为什么是前端回传而不是服务端保存：
+    #   生产用 `uvicorn --workers 4`，若放进程内存则 4 个 worker 各自为政，
+    #   追问会随机命中"没有记忆"的那个，表现为"有时记得有时不记得"——
+    #   最难排查的一类故障。回传方式让后端保持**无状态**，多 worker 天然一致。
+    #
+    # ⚠ 它是**不可信输入**（用户能改 localStorage），故 graph 侧会逐字段
+    #   校验（见 context.normalize），且编号还要过输出侧白名单。
+    # ⚠ 类型刻意用 Any 而不是 dict：它是**不可信输入**，若声明为 dict，
+    #   Pydantic 会在进 graph 之前就抛 422，**整轮对话直接挂掉** ——
+    #   而上下文坏了不该让用户问不了问题。
+    #   用 Any 把校验权交给 context.normalize（它对非 dict 一律返回空上下文，
+    #   对每个字段逐项清洗），坏数据只会被静默丢弃。
+    context: Any = Field(default=None,
+                         description="上一轮返回的会话上下文，原样回传")
 
 
 @router.get("/health")
@@ -97,6 +114,11 @@ async def agent_ask(body: AskRequest, db: Session = Depends(get_db)):
       pending_action  待用户确认的写操作（如建单）—— 不会自动执行
       citations       本次回答用到的数据来源
       verify_failed   被丢弃的、无法溯源的数字（非空说明模型编过数字）
+      context         更新后的会话上下文 —— 前端存下，下一轮原样回传
+
+    ⚠ `context` 是**短期记忆的全部载体**：只存编号等指针，不存对话原文、
+      也不存工具原始结果。故追问次数不限、每轮成本恒定（约 100 token），
+      且指针不会"记错"。详见 app/agent/context.py。
     """
     ok, reason = llm.is_available()
     if not ok:
@@ -113,7 +135,8 @@ async def agent_ask(body: AskRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=422, detail="问题不能为空")
 
     try:
-        result = graph_mod.run(q, session_id=body.session_id)
+        result = graph_mod.run(q, session_id=body.session_id,
+                               context=body.context)
     except Exception as e:
         logger.exception("agent: 执行失败")
         raise HTTPException(

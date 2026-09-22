@@ -232,7 +232,8 @@ def _found_in_registry(num: float, allowed: set[float]) -> bool:
     return False
 
 
-def verify(draft: str, tool_results: list[dict]) -> tuple[bool, list[str]]:
+def verify(draft: str, tool_results: list[dict],
+           extra_sources: list[float] | None = None) -> tuple[bool, list[str]]:
     """校验回答中的数字是否都能从工具返回值溯源。
 
     返回 (是否通过, 无法溯源的数字字符串列表)。
@@ -240,6 +241,18 @@ def verify(draft: str, tool_results: list[dict]) -> tuple[bool, list[str]]:
     ⚠ 若 tool_results 为空（例如纯知识性回答），则**跳过校验**并返回通过 ——
       因为没有数据来源可比对，误判为幻觉反而会阻断正常回答。
       但这种情况下 answer_basis 会被标为无来源，由上层决定是否提示用户。
+
+    `extra_sources` 是**会话上下文里出现过的数字**（上一轮查到的余额、
+    概率等）。为什么必须带上（否则会出现一个反效果）：
+
+      多轮追问时，模型可能引用上一轮已经展示给用户的数据，例如
+      「他余额 22.5 万，比上一个大得多」。若出处集合只含**本轮**工具
+      结果，这个 225563 就会被判成孤儿 → 整段解读被丢弃 →
+      徽章从「数字已校验」掉成「部分未溯源」。
+
+      结果是：**记忆一上线，徽章集体退化**，而用户会以为是模型变差了。
+      故出处必须同时覆盖上下文。这不会放宽对真幻觉的拦截 ——
+      上下文里的数字本来就已经是系统自己查出来的、给用户看过的值。
     """
     if not draft or not draft.strip():
         return True, []
@@ -247,6 +260,11 @@ def verify(draft: str, tool_results: list[dict]) -> tuple[bool, list[str]]:
     sources: set[float] = set()
     for r in tool_results or []:
         _collect_numbers(r, sources)
+    for v in extra_sources or []:
+        try:
+            sources.add(float(v))
+        except (TypeError, ValueError):
+            continue
 
     if not sources:
         return True, []

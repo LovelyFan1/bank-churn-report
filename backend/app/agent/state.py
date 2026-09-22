@@ -39,6 +39,16 @@ class AgentState(TypedDict, total=False):
     session_id: str
     question: str
 
+    # ── 会话上下文（短期记忆，指针式）─────────────────────
+    # ⚠ 为什么放在 state 而不是进程内存：生产是 `uvicorn --workers 4`，
+    #   进程内记忆会让 4 个 worker 各自为政，表现为"有时记得有时不记得"。
+    #   故由**前端回传**，后端保持无状态。详见 agent/context.py 顶部说明。
+    #
+    # context_in   上一轮结束后前端回传的实体清单（未经校验的原始 dict）
+    # context_out  本轮结束时合并出的新清单，随响应返回给前端保存
+    context_in: dict
+    context_out: dict
+
     # ── 对话历史（reducer 追加语义）─────────────────────
     messages: Annotated[list, add_messages]
 
@@ -98,6 +108,8 @@ def initial_state(session_id: str, question: str) -> AgentState:
     return AgentState(
         session_id=session_id,
         question=question,
+        context_in={},
+        context_out={},
         messages=[],
         guard_block=None,
         guard_topic=None,
