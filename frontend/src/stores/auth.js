@@ -16,9 +16,13 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import api from '../api'
+import {
+  KEY_TOKEN, KEY_USER,
+  clearAuthStorage as _clearAuth,
+} from '../utils/userStorage'
 
-const TOKEN_KEY = 'auth.token.v1'
-const USER_KEY = 'auth.user.v1'
+const TOKEN_KEY = KEY_TOKEN
+const USER_KEY = KEY_USER
 
 export const useAuthStore = defineStore('auth', () => {
   const token = ref(localStorage.getItem(TOKEN_KEY) || '')
@@ -78,13 +82,39 @@ export const useAuthStore = defineStore('auth', () => {
     return data
   }
 
+  /**
+   * 登出 —— 清掉**身份凭据**，但**保留对话历史**。
+   *
+   * ⚠ 这里踩过两次坑，两版都不对，记下来避免再犯：
+   *
+   *   v1（原始缺陷）：只清 auth 两个键，没清 agent.session.v1。
+   *       后果：切换账号后，新账号看到上一个账号的完整对话 —— 隐私泄露。
+   *
+   *   v2（过度修正）：改成连 agent.session.v1 一起删。
+   *       后果：**同一账号重新登录，自己的历史也没了**（用户指出）。
+   *       而当初特意用 localStorage 的目的就是"下次回来还在" ——
+   *       等于用隐私隔离换掉了这个功能本身。
+   *
+   *   v3（当前）：**隔离靠分键，不靠删除**。
+   *       助手缓存的键里带行员号（agent.session.v1.<username>），
+   *       各人读各自的键，天然互不可见；而登出只清凭据，
+   *       故 A 回来时 A 的历史**依旧在**。
+   *
+   *   判断依据：**凭据属于"当前会话"（必须清），
+   *   对话历史属于"该用户的数据"（应保留）** —— 生命周期不同。
+   */
   async function logout() {
     try { await api.post('/auth/logout') } catch (_) { /* 登出失败也要清本地 */ }
-    _persist('', null)
+    _clearAuth()
+    token.value = ''
+    user.value = null
   }
 
+  /** 清除本地身份（令牌失效 / 会话超时时调用，不发登出请求） */
   function clear() {
-    _persist('', null)
+    _clearAuth()
+    token.value = ''
+    user.value = null
   }
 
   return {

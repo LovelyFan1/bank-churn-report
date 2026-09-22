@@ -21,6 +21,7 @@
  */
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import api from '../api'
+import { AGENT_KEY_PREFIX, KEY_USER, agentKeyFor } from '../utils/userStorage'
 
 /**
  * 会话持久化 —— 用户要求「切换窗口时会话不消失」。
@@ -39,23 +40,87 @@ import api from '../api'
  *      真正让模型能理解「第二个」「他」这类指代的是 `agentContext`
  *      —— 一份**只含编号的指针清单**，随每次提问回传后端（见 send 与
  *      backend/app/agent/context.py）。后端因此保持无状态，多 worker 一致。
+ *   4. **缓存按用户分键**（两轮修正的结果）：
+ *        第一轮问题：所有账号共用一个键 'agent.session.v1' ——
+ *                   切换账号后新账号看到上一个账号的完整对话。
+ *        第二轮问题：我改成"登出时删掉缓存" —— 隔离做到了，但
+ *                   **同一账号重新登录历史也没了**（用户指出）。
+ *        最终方案：键里带上行员号 → 'agent.session.v1.<username>'。
+ *                  各人读各自的键，互不干扰，且**各自的历史都保留**。
+ *      详见 loadSession / persistSession。
  */
-const STORE_KEY = 'agent.session.v1'
 const MAX_TURNS = 60          // 上限，防止 localStorage 无限膨胀（约 5MB 配额）
 
-function loadSession() {
+/**
+ * 当前登录人的行员号（用于拼出该用户的缓存键）。
+ *
+ * ⚠ 直接读 localStorage 而不是 import auth store：本组件在 pinia 之外
+ *   也能被挂载（且 store 的 user 是响应式对象，读它会把"组件依赖"
+ *   和"存储归属"两件事耦合起来）。用户名本身是存储里的静态值，读它足够。
+ *
+ * ⚠ 读不到时返回空串 —— agentKeyFor('') 会退回不带后缀的基础键，
+ *   即一个"匿名槽位"。取不到用户名通常是"未登录"，此时页面本来
+ *   也不该用助手；给个确定的槽位总比写到 `...undefined` 好。
+ */
+function currentUsername() {
   try {
-    const raw = localStorage.getItem(STORE_KEY)
-    if (!raw) return null
-    const obj = JSON.parse(raw)
-    if (!obj || !Array.isArray(obj.turns)) return null
-    return obj
+    const raw = localStorage.getItem(KEY_USER)
+    if (!raw) return ''
+    const u = JSON.parse(raw)
+    return (u && u.username) || ''
+  } catch (_) {
+    return ''
+  }
+}
+
+/** 当前用户的助手缓存键（每次调用都取最新的登录人） */
+function storeKey() {
+  return agentKeyFor(currentUsername())
+}
+
+/**
+ * 读取**当前用户**的会话历史。
+ *
+ * ⚠ 键里已含行员号，故这里**不再需要归属校验** —— 天然读不到别人的。
+ *   第一版实现是在共用键里记 `owner` 字段再比对、不一致就删；
+ *   那种做法有两个缺点：共用键本身会互相覆盖（A 的记录被 B 覆盖掉），
+ *   而且"丢弃"等于删数据。分键后两个问题都不存在。
+ *
+ * ⚠ 兼容旧数据：上一版可能留有共用键 'agent.session.v1' 的残留。
+ *   若当前用户的专属键为空、而共用键里的 owner 正好是自己，
+ *   则迁移过来（一次性），避免升级后用户觉得"历史丢了"。
+ */
+function loadSession() {
+  const key = storeKey()
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw) {
+      const obj = JSON.parse(raw)
+      if (obj && Array.isArray(obj.turns)) return obj
+    }
   } catch (e) {
     // 数据损坏不该让页面挂掉 —— 丢弃并继续
     console.warn('[agent] 会话缓存解析失败，已丢弃：', e.message)
-    try { localStorage.removeItem(STORE_KEY) } catch (_) { /* 忽略 */ }
-    return null
+    try { localStorage.removeItem(key) } catch (_) { /* 忽略 */ }
   }
+
+  // ── 一次性迁移旧版共用键 ──────────────────────────────
+  try {
+    const legacy = localStorage.getItem(AGENT_KEY_PREFIX)
+    if (!legacy) return null
+    const obj = JSON.parse(legacy)
+    const me = currentUsername()
+    if (obj && Array.isArray(obj.turns) && obj.owner && obj.owner === me) {
+      console.info('[agent] 迁移旧版共用缓存到用户专属键')
+      localStorage.setItem(key, JSON.stringify(obj))
+      localStorage.removeItem(AGENT_KEY_PREFIX)
+      return obj
+    }
+    // 旧键属于别人（或结构不对）—— 留给对应的人去迁移，**不动它**
+  } catch (_) {
+    /* 迁移失败不影响正常使用 */
+  }
+  return null
 }
 
 const question = ref('')
@@ -144,9 +209,13 @@ let suppressPersist = false
 
 watch([turns, agentContext], ([val]) => {
   if (suppressPersist) return
+  // ⚠ 键在**写入时**才计算（而非模块级常量）—— 登录人可能在
+  //   本次会话中变化（登出再登录），用常量会把新账号的数据
+  //   写进旧账号的键里。
+  const key = storeKey()
   try {
     if (!val.length) {
-      localStorage.removeItem(STORE_KEY)
+      localStorage.removeItem(key)
       return
     }
     // 只持久化必要字段，避免把大对象写进 5MB 配额
@@ -168,8 +237,12 @@ watch([turns, agentContext], ([val]) => {
         error: t.batch.error, open: false, running: false,
       } : null,
     }))
-    localStorage.setItem(STORE_KEY, JSON.stringify({
-      v: 1, ts: Date.now(), turns: slim.slice(-MAX_TURNS),
+    localStorage.setItem(key, JSON.stringify({
+      v: 2, ts: Date.now(),
+      // 保留 owner 字段：仅供**旧版共用键的一次性迁移**判断归属
+      //（新键已含行员号，无需靠它校验）。见 loadSession 的迁移分支。
+      owner: currentUsername(),
+      turns: slim.slice(-MAX_TURNS),
       // 上下文（约 100 token 的指针清单）—— 刷新后追问仍成立
       context: agentContext.value,
     }))
@@ -179,11 +252,12 @@ watch([turns, agentContext], ([val]) => {
   }
 }, { deep: true })
 
-/** 清空会话 —— 用户需要能主动丢弃本地缓存 */
+/** 清空会话 —— 用户需要能主动丢弃**自己**的本地缓存 */
 function clearSession() {
   // 先删键、再清 turns，并用 suppressPersist 跳过 watcher 的空写，
   // 保证"清空"是彻底且立刻生效的（见 watcher 注释）
-  try { localStorage.removeItem(STORE_KEY) } catch (_) { /* 忽略 */ }
+  // ⚠ 只删**当前用户**的键，不影响其他账号的历史
+  try { localStorage.removeItem(storeKey()) } catch (_) { /* 忽略 */ }
   suppressPersist = true
   turns.value = []
   // ⚠ 上下文必须一起清 —— 否则"清空会话"后模型仍记得之前的人，

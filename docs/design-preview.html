@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>客户名单 · 静态预览</title>
+<style>
+/* ══════════════════════════════════════════════════════════
+   设计令牌 —— 与项目现有 style.css 同源，不引入新色系
+   ══════════════════════════════════════════════════════════ */
+:root {
+  --bg:            #f4f6fa;
+  --card:          #ffffff;
+  --border:        #e5e9f0;
+  --border-strong: #d5dce8;
+  --primary:       #1d4ed8;
+  --primary-dark:  #1743bd;
+  --primary-soft:  #e8f0fe;
+  --primary-hover: #eef3fb;
+
+  --title:   #17335c;
+  --text:    #1f2937;
+  --body:    #5b6b83;
+  --muted:   #7c8aa5;
+  --muted-2: #9aa7bd;
+
+  --th-bg: #f8fafc;
+
+  --crit-bg: #fde8e8; --crit-fg: #c81e1e;
+  --high-bg: #fdf0e2; --high-fg: #b45309;
+  --med-bg:  #fef9c3; --med-fg:  #a16207;
+  --low-bg:  #e0f2f1; --low-fg:  #0f766e;
+
+  --ok-bg: #dcfce7; --ok-fg: #15803d;
+
+  --radius:    10px;
+  --radius-sm: 8px;
+  --shadow-sm: 0 1px 3px rgba(15, 40, 80, .05);
+  --shadow-md: 0 4px 16px rgba(15, 40, 80, .08);
+  --shadow-lg: 0 16px 48px rgba(23, 51, 92, .22);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+               'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 数字列统一等宽对齐 —— 一整列数字纵向扫读时不晃。
+   实测原项目只在个别单元格加 tabular-nums，未全局化。 */
+.num, td.num, .stat-value { font-variant-numeric: tabular-nums; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #f1f5f9; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ══════════════════════════════════════════════════════════
+   布局：固定侧栏 + 可滚动主区
+   ══════════════════════════════════════════════════════════ */
+.app { display: flex; min-height: 100vh; }
+
+.sidebar {
+  position: fixed; left: 0; top: 0; bottom: 0; width: 220px; z-index: 50;
+  display: flex; flex-direction: column;
+  background: var(--card);
+  border-right: 1px solid var(--border);
+}
+.brand {
+  display: flex; align-items: center; gap: 12px;
+  height: 64px; padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.brand-logo {
+  width: 32px; height: 32px; border-radius: 9px;
+  background: var(--primary); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.brand-name {
+  font-size: 13.5px; font-weight: 600; color: var(--title);
+  white-space: nowrap; letter-spacing: .2px;
+}
+
+.nav { flex: 1; padding: 16px 12px; overflow-y: auto; }
+.nav-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 14px; margin-bottom: 2px;
+  border-radius: var(--radius-sm);
+  color: var(--body); font-size: 14px;
+  cursor: default; transition: all .15s ease;
+  border-left: 3px solid transparent;
+}
+.nav-item:hover { background: var(--primary-hover); color: var(--primary); }
+.nav-item.active {
+  background: var(--primary-soft); color: var(--primary);
+  border-left-color: var(--primary); font-weight: 600;
+}
+.nav-item svg { width: 19px; height: 19px; flex-shrink: 0; }
+.nav-item .flex1 { flex: 1; }
+.nav-badge {
+  font-size: 10px; font-weight: 600;
+  color: var(--primary); background: var(--primary-soft);
+  padding: 1px 7px; border-radius: 10px;
+}
+.nav-divider {
+  margin: 16px 14px 6px; border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.nav-divider span {
+  font-size: 11px; color: var(--muted-2);
+  font-weight: 600; letter-spacing: .5px;
+}
+
+.main { flex: 1; margin-left: 220px; min-width: 0; }
+
+/* ── 顶栏 ── */
+.topbar {
+  position: sticky; top: 0; z-index: 40;
+  height: 56px; display: flex; align-items: center;
+  padding: 0 24px;
+  background: rgba(255,255,255,.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.topbar .spacer { flex: 1; }
+.role-chip {
+  font-size: 11.5px; font-weight: 600;
+  color: var(--primary); background: var(--primary-soft);
+  padding: 2px 9px; border-radius: 10px;
+}
+.user-name { font-size: 13px; font-weight: 600; color: var(--title); }
+.btn-logout {
+  height: 28px; padding: 0 12px;
+  border: 1px solid var(--border-strong); border-radius: 7px;
+  background: #fff; color: var(--body); font-size: 12px; cursor: default;
+}
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+
+.content { padding: 20px 24px 40px; }
+
+/* ── 面包屑（新增）── */
+.breadcrumb {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: var(--muted-2);
+  margin-bottom: 12px;
+}
+.breadcrumb a { color: var(--muted); text-decoration: none; }
+.breadcrumb .sep { color: #cbd5e1; }
+.breadcrumb .cur { color: var(--title); font-weight: 600; }
+
+/* ── 页头 ── */
+.page-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; margin-bottom: 18px;
+}
+.page-title {
+  font-size: 22px; font-weight: 700; color: var(--title);
+  margin: 0 0 5px;
+}
+.page-subtitle { font-size: 13px; color: var(--muted); margin: 0; }
+
+/* ══════════════════════════════════════════════════════════
+   统计卡
+   ══════════════════════════════════════════════════════════ */
+.stats {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px; margin-bottom: 18px;
+}
+.stat {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px;
+  box-shadow: var(--shadow-sm);
+  transition: border-color .15s, box-shadow .15s;
+}
+.stat:hover { border-color: #c7d6ee; box-shadow: var(--shadow-md); }
+.stat-label {
+  font-size: 11.5px; color: var(--muted);
+  font-weight: 600; letter-spacing: .3px; margin-bottom: 7px;
+}
+.stat-value { font-size: 29px; font-weight: 700; line-height: 1.1; }
+.stat-foot { font-size: 11.5px; color: var(--muted-2); margin-top: 6px; }
+
+.v-title { color: var(--title); }
+.v-crit  { color: #dc2626; }
+.v-amber { color: #d97706; }
+.v-blue  { color: #2563eb; }
+
+/* ══════════════════════════════════════════════════════════
+   工具栏（粘顶）
+   ══════════════════════════════════════════════════════════ */
+.toolbar {
+  position: sticky; top: 56px; z-index: 30;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px 14px;
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 14px;
+}
+.search {
+  display: flex; align-items: center; gap: 8px;
+  height: 34px; padding: 0 12px; min-width: 240px;
+  background: #fff; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.search svg { width: 15px; height: 15px; color: var(--muted-2); flex-shrink: 0; }
+.search input {
+  border: none; outline: none; background: transparent;
+  font-size: 13px; color: var(--text); width: 100%;
+  font-family: inherit;
+}
+.search input::placeholder { color: var(--muted-2); }
+
+.select {
+  height: 34px; padding: 0 30px 0 12px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: #fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%237c8aa5' stroke-width='2.5'><path d='M6 9l6 6 6-6'/></svg>") no-repeat right 10px center;
+  font-size: 13px; color: var(--text);
+  appearance: none; -webkit-appearance: none;
+  font-family: inherit; cursor: default;
+  outline: none;
+}
+.select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(29,78,216,.08); }
+
+.tb-spacer { flex: 1; }
+
+.btn {
+  height: 34px; padding: 0 14px;
+  border-radius: var(--radius-sm); font-size: 13px;
+  font-weight: 600; font-family: inherit;
+  cursor: default; border: 1px solid var(--border-strong);
+  background: #fff; color: var(--body);
+  display: inline-flex; align-items: center; gap: 6px;
+  transition: all .15s;
+}
+.btn:hover { border-color: #a8bcd9; background: #f8fafc; }
+.btn-primary {
+  background: var(--primary); border-color: var(--primary); color: #fff;
+}
+.btn-primary:hover { background: var(--primary-dark); border-color: var(--primary-dark); }
+.btn svg { width: 14px; height: 14px; }
+
+/* 密度切换（新增）—— 静态展示，当前为「中等」 */
+.density {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  overflow: hidden; height: 34px;
+}
+.density span {
+  padding: 0 11px; height: 100%;
+  display: inline-flex; align-items: center;
+  font-size: 12px; color: var(--muted);
+  border-right: 1px solid var(--border);
+}
+.density span:last-child { border-right: none; }
+.density span.on {
+  background: var(--primary-soft); color: var(--primary); font-weight: 600;
+}
+
+/* ══════════════════════════════════════════════════════════
+   表格
+   ══════════════════════════════════════════════════════════ */
+.table-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+/* 独立滚动容器 —— 表头吸顶在其中生效。
+   实测原项目表头是 position: static，翻页时表头滚走。 */
+.table-scroll { max-height: 460px; overflow: auto; }
+
+table { width: 100%; border-collapse: separate; border-spacing: 0; }
+
+thead th {
+  position: sticky; top: 0; z-index: 10;
+  background: var(--th-bg); text-align: left;
+  padding: 10px 14px;
+  font-size: 11.5px; font-weight: 600; color: var(--body);
+  letter-spacing: .3px; white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+thead th.sortable { cursor: default; }
+thead th .sort {
+  display: inline-flex; align-items: center; gap: 4px;
+}
+thead th .sort svg { width: 11px; height: 11px; color: var(--muted-2); }
+thead th.sorted { color: var(--primary); }
+thead th.sorted .sort svg { color: var(--primary); }
+
+tbody td {
+  padding: 12px 14px; border-bottom: 1px solid #f0f3f8;
+  font-size: 13px; color: var(--text); vertical-align: middle;
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: #f8fbff; }
+
+/* 客户单元格 */
+.cust { display: flex; align-items: center; gap: 10px; }
+.avatar {
+  width: 34px; height: 34px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 13px; font-weight: 700; flex-shrink: 0;
+}
+.cust-name { font-size: 13px; font-weight: 600; color: var(--title); }
+.cust-id {
+  font-size: 11.5px; color: var(--muted-2); margin-top: 1px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 风险徽章 */
+.badge {
+  display: inline-block; padding: 2.5px 10px; border-radius: 20px;
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+}
+.b-crit { background: var(--crit-bg); color: var(--crit-fg); }
+.b-high { background: var(--high-bg); color: var(--high-fg); }
+.b-med  { background: var(--med-bg);  color: var(--med-fg); }
+.b-low  { background: var(--low-bg);  color: var(--low-fg); }
+
+/* 概率条 */
+.prob { display: flex; align-items: center; gap: 8px; }
+.prob-track {
+  width: 56px; height: 5px; border-radius: 3px;
+  background: #eef1f6; overflow: hidden; flex-shrink: 0;
+}
+.prob-fill { height: 100%; border-radius: 3px; }
+.prob-txt { font-size: 12px; font-weight: 600; }
+
+/* 价值层标签 */
+.tag {
+  display: inline-block; font-size: 11px; font-weight: 600;
+  padding: 2.5px 9px; border-radius: 6px;
+}
+.t-high { background: rgba(29,78,216,.10); color: #1d4ed8; }
+.t-low  { background: rgba(124,138,165,.13); color: #5b6b83; }
+.t-zero { background: rgba(124,138,165,.10); color: #8a97ad; }
+
+/* 工单状态 */
+.tag-order { background: var(--primary-soft); color: var(--primary); }
+.tag-active { background: var(--ok-bg); color: var(--ok-fg); }
+.tag-inactive { background: #f1f4f9; color: #7c8aa5; }
+.dash { color: #cbd5e1; }
+
+.actions { text-align: right; white-space: nowrap; }
+.btn-sm {
+  height: 28px; padding: 0 12px; font-size: 12px;
+  border-radius: 7px;
+}
+.btn-disabled {
+  height: 28px; padding: 0 12px; font-size: 12px;
+  border-radius: 7px; border: 1px solid var(--border);
+  background: #f7f9fc; color: var(--muted-2); cursor: default;
+}
+
+/* 复选框 */
+.cb {
+  width: 15px; height: 15px; border-radius: 4px;
+  border: 1.5px solid #c3cede; background: #fff;
+  display: inline-block; vertical-align: middle;
+}
+.cb.on {
+  background: var(--primary); border-color: var(--primary);
+  position: relative;
+}
+.cb.on::after {
+  content: ''; position: absolute; left: 4px; top: 1px;
+  width: 4px; height: 8px;
+  border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.cb.off { opacity: .4; }
+
+/* ── 分页 ── */
+.pager {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 12px 16px;
+  border-top: 1px solid var(--border); background: #fcfdff;
+}
+.pager-info { font-size: 12.5px; color: var(--muted); }
+.pager-info b { color: var(--title); font-variant-numeric: tabular-nums; }
+.pager-btns { display: flex; align-items: center; gap: 4px; }
+.pg {
+  min-width: 30px; height: 30px; padding: 0 9px;
+  border: 1px solid var(--border-strong); border-radius: 7px;
+  background: #fff; color: var(--body); font-size: 12.5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: default; font-variant-numeric: tabular-nums;
+}
+.pg.on { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
+.pg.dis { color: #cbd5e1; background: #fafbfd; }
+
+/* ── 预览标记 ── */
+.preview-chip {
+  position: fixed; right: 18px; bottom: 18px; z-index: 999;
+  display: flex; align-items: center; gap: 7px;
+  padding: 9px 14px; border-radius: 22px;
+  background: rgba(23,51,92,.92); color: #fff;
+  font-size: 12px; box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(6px);
+}
+.preview-chip .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: #4ade80;
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ══════════════ 侧边栏 ══════════════ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">
+        <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"
+                d="M3 6l3 1m0 0l-3 9a5.002 5.002 0 006.001 0M6 7l3 9M6 7l6-2m6 2l3-1m-3 1l-3 9a5.002 5.002 0 006.001 0M18 7l3 9m-3-9l-6-2m0-2v2m0 16V5m0 16H9m3 0h3"/>
+        </svg>
+      </div>
+      <span class="brand-name">客户流失防控平台</span>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4"/></svg>
+        <span class="flex1">工作台</span>
+      </div>
+      <div class="nav-item active">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
+        <span class="flex1">客户名单</span>
+      </div>
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>
+        <span class="flex1">挽留工单</span>
+      </div>
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+        <span class="flex1">干预策略</span>
+      </div>
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-4 4v-4z"/></svg>
+        <span class="flex1">智能助手</span>
+        <span class="nav-badge">Beta</span>
+      </div>
+
+      <div class="nav-divider"><span>系统管理</span></div>
+
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+        <span class="flex1">客群洞察</span>
+      </div>
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+        <span class="flex1">数据洞察</span>
+      </div>
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+        <span class="flex1">模型效果</span>
+      </div>
+      <div class="nav-item">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        <span class="flex1">操作审计</span>
+      </div>
+    </nav>
+  </aside>
+
+  <!-- ══════════════ 主区 ══════════════ -->
+  <div class="main">
+
+    <!-- 顶栏 -->
+    <header class="topbar">
+      <div class="spacer"></div>
+      <div class="topbar-right">
+        <span class="role-chip">客户经理</span>
+        <span class="user-name">李铭</span>
+        <button class="btn-logout">退出</button>
+      </div>
+    </header>
+
+    <div class="content">
+
+      <!-- 面包屑（新增） -->
+      <nav class="breadcrumb">
+        <a href="#">工作台</a>
+        <span class="sep">/</span>
+        <span class="cur">客户名单</span>
+      </nav>
+
+      <!-- 页头 -->
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">客户名单</h1>
+          <p class="page-subtitle">
+            按流失概率与期望价值排序 · 数据源 96,418 条 · 模型 LightGBM（AUC 0.8464）
+          </p>
+        </div>
+      </div>
+
+      <!-- 统计卡 -->
+      <section class="stats">
+        <div class="stat">
+          <div class="stat-label">总客户数</div>
+          <div class="stat-value v-title">96,418</div>
+          <div class="stat-foot">全量在管客户</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">极高 + 高风险客户</div>
+          <div class="stat-value v-crit">28,926</div>
+          <div class="stat-foot">建议优先跟进</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">历史流失样本</div>
+          <div class="stat-value v-amber">19,666</div>
+          <div class="stat-foot">数据集中的历史标签，非模型预测</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">在管工单</div>
+          <div class="stat-value v-blue">5</div>
+          <div class="stat-foot">待处理 + 处理中</div>
+        </div>
+      </section>
+
+      <!-- 工具栏（粘顶） -->
+      <div class="toolbar">
+        <div class="search">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
+          </svg>
+          <input placeholder="搜索客户编号 / 姓名…" />
+        </div>
+
+        <select class="select">
+          <option>全部风险等级</option>
+          <option>极高</option>
+          <option>高危</option>
+          <option>中等</option>
+          <option>低风险</option>
+        </select>
+
+        <select class="select">
+          <option>全部价值层</option>
+          <option>高价值</option>
+          <option>低价值</option>
+          <option>零余额</option>
+        </select>
+
+        <select class="select">
+          <option>全部地区</option>
+          <option>France</option>
+          <option>Germany</option>
+          <option>Spain</option>
+        </select>
+
+        <span class="tb-spacer"></span>
+
+        <!-- 密度切换（新增） -->
+        <div class="density">
+          <span>宽松</span>
+          <span class="on">中等</span>
+          <span>紧凑</span>
+        </div>
+
+        <select class="select">
+          <option>按期望价值 ↓</option>
+          <option>按流失概率 ↓</option>
+          <option>按余额 ↓</option>
+        </select>
+
+        <button class="btn">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1M12 4v12m0 0l-4-4m4 4l4-4"/>
+          </svg>
+          导出
+        </button>
+      </div>
+
+      <!-- 表格 -->
+      <div class="table-card">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:40px"><span class="cb on"></span></th>
+                <th class="sortable" style="width:230px">
+                  <span class="sort">客户
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M8 9l4-4 4 4m0 6l-4 4-4-4"/></svg>
+                  </span>
+                </th>
+                <th style="width:100px">风险等级</th>
+                <th class="sortable sorted" style="width:150px">
+                  <span class="sort">流失概率
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 14l-7 7m0 0l-7-7m7 7V3"/></svg>
+                  </span>
+                </th>
+                <th class="sortable" style="width:120px">
+                  <span class="sort">余额
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M8 9l4-4 4 4m0 6l-4 4-4-4"/></svg>
+                  </span>
+                </th>
+                <th style="width:100px">价值层</th>
+                <th style="width:130px">产品 / 活跃</th>
+                <th style="width:100px">工单状态</th>
+                <th class="actions" style="width:120px">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <!-- 行 1 -->
+              <tr>
+                <td><span class="cb off"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#dc2626">B</div>
+                    <div>
+                      <div class="cust-name">Bentley</div>
+                      <div class="cust-id">C071081 · France</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-crit">极高</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:97.6%;background:#dc2626"></div></div>
+                    <span class="prob-txt" style="color:#dc2626">97.6%</span>
+                  </div>
+                </td>
+                <td class="num">¥225,563</td>
+                <td><span class="tag t-high">高价值</span></td>
+                <td>3 个产品 · <span class="tag tag-inactive" style="padding:2px 7px">非活跃</span></td>
+                <td><span class="tag tag-order">已建单</span></td>
+                <td class="actions"><span class="btn-disabled">已建单</span></td>
+              </tr>
+              <!-- 行 2 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#dc2626">G</div>
+                    <div>
+                      <div class="cust-name">Goddard</div>
+                      <div class="cust-id">C034525 · Germany</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-crit">极高</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:96.2%;background:#dc2626"></div></div>
+                    <span class="prob-txt" style="color:#dc2626">96.2%</span>
+                  </div>
+                </td>
+                <td class="num">¥219,490</td>
+                <td><span class="tag t-high">高价值</span></td>
+                <td>3 个产品 · <span class="tag tag-inactive" style="padding:2px 7px">非活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+              <!-- 行 3 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#ea580c">P</div>
+                    <div>
+                      <div class="cust-name">Pirogov</div>
+                      <div class="cust-id">C062858 · Spain</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-high">高危</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:88.8%;background:#ea580c"></div></div>
+                    <span class="prob-txt" style="color:#ea580c">88.8%</span>
+                  </div>
+                </td>
+                <td class="num">¥225,535</td>
+                <td><span class="tag t-high">高价值</span></td>
+                <td>2 个产品 · <span class="tag tag-active" style="padding:2px 7px">活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+              <!-- 行 4 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#ea580c">T</div>
+                    <div>
+                      <div class="cust-name">Taylor</div>
+                      <div class="cust-id">C035026 · France</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-high">高危</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:74.3%;background:#ea580c"></div></div>
+                    <span class="prob-txt" style="color:#ea580c">74.3%</span>
+                  </div>
+                </td>
+                <td class="num">¥148,220</td>
+                <td><span class="tag t-high">高价值</span></td>
+                <td>1 个产品 · <span class="tag tag-active" style="padding:2px 7px">活跃</span></td>
+                <td><span class="tag tag-order">已建单</span></td>
+                <td class="actions"><span class="btn-disabled">已建单</span></td>
+              </tr>
+              <!-- 行 5 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#ca8a04">C</div>
+                    <div>
+                      <div class="cust-name">Coates</div>
+                      <div class="cust-id">C001893 · Germany</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-med">中等</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:41.7%;background:#ca8a04"></div></div>
+                    <span class="prob-txt" style="color:#ca8a04">41.7%</span>
+                  </div>
+                </td>
+                <td class="num">¥96,540</td>
+                <td><span class="tag t-low">低价值</span></td>
+                <td>2 个产品 · <span class="tag tag-active" style="padding:2px 7px">活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+              <!-- 行 6 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#ca8a04">D</div>
+                    <div>
+                      <div class="cust-name">Dann</div>
+                      <div class="cust-id">C028228 · Spain</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-med">中等</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:35.2%;background:#ca8a04"></div></div>
+                    <span class="prob-txt" style="color:#ca8a04">35.2%</span>
+                  </div>
+                </td>
+                <td class="num">¥88,120</td>
+                <td><span class="tag t-low">低价值</span></td>
+                <td>1 个产品 · <span class="tag tag-inactive" style="padding:2px 7px">非活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+              <!-- 行 7 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#0d9488">G</div>
+                    <div>
+                      <div class="cust-name">Grant</div>
+                      <div class="cust-id">C057787 · France</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-low">低风险</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:12.4%;background:#0d9488"></div></div>
+                    <span class="prob-txt" style="color:#0d9488">12.4%</span>
+                  </div>
+                </td>
+                <td class="num">¥121,880</td>
+                <td><span class="tag t-high">高价值</span></td>
+                <td>2 个产品 · <span class="tag tag-active" style="padding:2px 7px">活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+              <!-- 行 8 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#94a3b8">C</div>
+                    <div>
+                      <div class="cust-name">Chu</div>
+                      <div class="cust-id">C078298 · Germany</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-low">低风险</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:6.1%;background:#0d9488"></div></div>
+                    <span class="prob-txt" style="color:#0d9488">6.1%</span>
+                  </div>
+                </td>
+                <td class="num">¥0</td>
+                <td><span class="tag t-zero">零余额</span></td>
+                <td>1 个产品 · <span class="tag tag-inactive" style="padding:2px 7px">非活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+              <!-- 行 9 -->
+              <tr>
+                <td><span class="cb"></span></td>
+                <td>
+                  <div class="cust">
+                    <div class="avatar" style="background:#94a3b8">W</div>
+                    <div>
+                      <div class="cust-name">Wilson</div>
+                      <div class="cust-id">C005449 · Spain</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="badge b-low">低风险</span></td>
+                <td>
+                  <div class="prob">
+                    <div class="prob-track"><div class="prob-fill" style="width:4.8%;background:#0d9488"></div></div>
+                    <span class="prob-txt" style="color:#0d9488">4.8%</span>
+                  </div>
+                </td>
+                <td class="num">¥0</td>
+                <td><span class="tag t-zero">零余额</span></td>
+                <td>1 个产品 · <span class="tag tag-active" style="padding:2px 7px">活跃</span></td>
+                <td><span class="dash">—</span></td>
+                <td class="actions"><span class="btn btn-primary btn-sm">＋ 创建工单</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 分页 -->
+        <div class="pager">
+          <div class="pager-info">
+            共 <b>96,418</b> 条 · 每页 20 条 · 第 <b>1</b> / <b>4,821</b> 页
+          </div>
+          <div class="pager-btns">
+            <span class="pg dis">‹</span>
+            <span class="pg on">1</span>
+            <span class="pg">2</span>
+            <span class="pg">3</span>
+            <span class="pg">4</span>
+            <span class="pg">5</span>
+            <span class="pg">…</span>
+            <span class="pg">4821</span>
+            <span class="pg">›</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div class="preview-chip">
+  <span class="dot"></span>
+  静态预览 · 点击无响应
+</div>
+</body>
+</html>

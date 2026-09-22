@@ -49,7 +49,7 @@ await page.goto('http://localhost:5173/assistant', { waitUntil: 'networkidle' })
 await page.waitForTimeout(2500)
 
 // 先清掉可能存在的旧缓存，保证从干净状态开始
-await page.evaluate(() => localStorage.removeItem('agent.session.v1'))
+await page.evaluate(() => localStorage.removeItem('agent.session.v1.liming'))
 await page.reload({ waitUntil: 'networkidle' })
 await page.waitForTimeout(2200)
 
@@ -61,7 +61,7 @@ let turns = await page.locator('.turn').count()
 console.log('  turns 数:', turns)
 if (turns < 4) fails.push(`应至少 4 条消息（2问2答），实得 ${turns}`)
 
-const lsRaw = await page.evaluate(() => localStorage.getItem('agent.session.v1'))
+const lsRaw = await page.evaluate(() => localStorage.getItem('agent.session.v1.liming'))
 console.log('  localStorage 已写入:', !!lsRaw, `(${lsRaw ? lsRaw.length : 0} 字节)`)
 if (!lsRaw) fails.push('会话未写入 localStorage')
 
@@ -228,7 +228,7 @@ console.log('六、清空会话')
 await page.locator('.btn-clear').click()
 await page.waitForTimeout(800)
 turns = await page.locator('.turn').count()
-const lsAfter = await page.evaluate(() => localStorage.getItem('agent.session.v1'))
+const lsAfter = await page.evaluate(() => localStorage.getItem('agent.session.v1.liming'))
 console.log('  清空后 turns 数:', turns)
 console.log('  localStorage:', lsAfter === null ? '已清除' : `仍有 ${lsAfter.length} 字节`)
 if (turns !== 0) fails.push(`清空后仍有 ${turns} 条消息`)

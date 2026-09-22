@@ -281,7 +281,7 @@ onBeforeUnmount(() => {
       <div v-if="retention && retention.has_data" class="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div class="metric-card text-center">
           <div class="text-xs text-gray-500 mb-1">已闭环工单</div>
-          <div class="text-xl font-bold text-gray-200">{{ retention.total_completed.toLocaleString() }}</div>
+          <div class="text-xl font-bold text-[#17335c]">{{ retention.total_completed.toLocaleString() }}</div>
         </div>
         <div class="metric-card text-center">
           <div class="text-xs text-gray-500 mb-1">标记为已挽留</div>

@@ -29,6 +29,8 @@ const scatterMethod = ref('tsne')
 const errors = ref([])
 // 聚类任务进行中的进度文案（来自 Celery 的 meta.message）
 const clusterMsg = ref('')
+// 「重新聚类」的二次确认弹窗（覆盖全量标签，见 askRecluster 的说明）
+const clusterConfirm = ref(false)
 
 const COLORS = ['#6366f1', '#ef4444', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899']
 
@@ -515,7 +517,25 @@ function onColorByChange(val) {
   }
 }
 
+/**
+ * 点「重新聚类」—— 先弹确认（覆盖操作），确认后才真正提交。
+ *
+ * ⚠ 为什么需要确认（实测该按钮原先直接提交）：
+ *   `/cluster/kmeans/save` 会 `bulk_update_mappings` **覆盖全部 96,418 个
+ *   客户的分群标签**。而按钮上只写「重新聚类」，页面上也不提示这一点 ——
+ *   用户不会意识到这是一次全量覆盖。
+ *
+ * ⚠ 为什么**空态**那个按钮（"开始聚类分析"）不走确认：
+ *   那时库里还没有标签，是首次生成而非覆盖，没有可失去的东西。
+ *   给无损失的操作加确认只是仪式感 —— 与"批量建单不加确认"同一判断。
+ */
+function askRecluster() {
+  if (loading.value) return
+  clusterConfirm.value = true
+}
+
 async function runClustering() {
+  clusterConfirm.value = false
   loading.value = true
   clusterMsg.value = '正在提交聚类任务…'
   try {
@@ -621,11 +641,30 @@ onBeforeUnmount(() => {
         <label class="text-sm text-gray-400">K值:</label>
         <input v-model.number="k" type="number" min="2" max="10"
                class="w-16 px-3 py-2 rounded-lg bg-white border border-[#d5dce8] text-[#1f2937] text-sm focus:border-[#1d4ed8] focus:outline-none" />
-        <button @click="runClustering" :disabled="loading"
+        <button @click="askRecluster" :disabled="loading"
                 class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors"
                 style="background: #1d4ed8;">
           {{ loading ? '计算中...' : '重新聚类' }}
         </button>
+      </div>
+    </div>
+
+    <!-- 重新聚类二次确认 —— 会覆盖全部客户的分群标签 -->
+    <div v-if="clusterConfirm" class="cc-overlay" @click.self="clusterConfirm = false">
+      <div class="cc-confirm">
+        <h3>重新聚类？</h3>
+        <div class="cc-confirm-body">
+          <p>将以 K = <b>{{ k }}</b> 重新执行 K-Means，并写入数据库。</p>
+          <p class="cc-warn">
+            ⚠ 这会<b>覆盖全部客户的现有分群标签</b>（96,418 人）。
+            客群画像、3D 散点图与"客群洞察"页的分组都随之改变。
+          </p>
+          <p class="cc-dim">任务为异步执行，耗时数十秒；期间请勿反复提交。</p>
+        </div>
+        <div class="cc-confirm-foot">
+          <button class="btn btn-outline" @click="clusterConfirm = false">取消</button>
+          <button class="btn btn-primary" @click="runClustering">确认重新聚类</button>
+        </div>
       </div>
     </div>
 
@@ -663,6 +702,8 @@ onBeforeUnmount(() => {
         当前数据库中暂无聚类标签数据。请点击上方的 <span class="text-indigo-400 font-medium">"重新聚类"</span> 按钮，
         系统将自动对客户进行 K-Means 聚类并生成客群画像。
       </p>
+      <!-- ⚠ 这里是**首次生成**（库里还没有标签），不存在覆盖，
+           故刻意不加二次确认（见 askRecluster 的说明） -->
       <button @click="runClustering" :disabled="loading"
               class="px-6 py-3 rounded-lg text-sm font-medium text-white transition-colors"
               style="background: #1d4ed8;">
@@ -866,5 +907,34 @@ onBeforeUnmount(() => {
   transition: filter 0.15s;
 }
 .btn-retry-cluster:hover { filter: brightness(1.1); }
+
+/* ── 重新聚类二次确认弹窗 ── */
+.cc-overlay {
+  position: fixed; inset: 0; z-index: 999;
+  background: rgba(23, 51, 92, 0.38);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.cc-confirm {
+  width: 100%; max-width: 440px;
+  background: #fff; border-radius: 14px;
+  padding: 22px 24px 18px;
+  box-shadow: 0 16px 48px rgba(23, 51, 92, 0.24);
+}
+.cc-confirm h3 {
+  margin: 0 0 14px; font-size: 16px; font-weight: 700; color: #17335c;
+}
+.cc-confirm-body p {
+  margin: 0 0 9px; font-size: 13px; color: #5b6b83; line-height: 1.7;
+}
+.cc-warn {
+  background: #fffbeb; border: 1px solid #fde68a;
+  border-radius: 8px; padding: 9px 11px;
+  color: #92400e !important; font-size: 12.5px !important;
+}
+.cc-dim { color: #9aa7bd !important; font-size: 12px !important; }
+.cc-confirm-foot {
+  display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;
+}
 </style>
 

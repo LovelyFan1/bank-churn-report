@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { KEY_TOKEN, KEY_USER } from '../utils/userStorage'
 
 const routes = [
   {
@@ -96,8 +97,9 @@ const router = createRouter({
 //
 // ⚠ 直接读 localStorage 而不是 import auth store：router 在 main.js 里
 //   先于 pinia 注册，此时 store 还不可用（会抛 "no active Pinia"）。
-const TOKEN_KEY = 'auth.token.v1'
-const USER_KEY = 'auth.user.v1'
+// ⚠ 键名取自 utils/userStorage.js —— 原先 5 个文件各写一份，改键名必漏。
+const TOKEN_KEY = KEY_TOKEN
+const USER_KEY = KEY_USER
 
 function readAuth() {
   try {

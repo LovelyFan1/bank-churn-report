@@ -1,13 +1,28 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import api, { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
+import { useAuthStore } from '../stores/auth'
 
 // 页面级请求作用域：本页并发 5 个请求（其中 roc-curves 响应体 525 KB），
 // 离开页面时取消在途请求，避免占用连接槽拖慢下一页。
 const scope = useRequestScope()
+
+const auth = useAuthStore()
+
+// 重训需要 model:train 权限（仅管理员）。权限清单由后端 /api/auth/me 下发，
+// 前端不自己写角色映射 —— 两处各写一套必然出现"按钮能点但接口 403"。
+//
+// ⚠ 为什么是"置灰 + 说明"而不是"隐藏"：
+//   重训是"系统能持续学习"的证据，值得被看见；但非管理员点了必然 403。
+//   直接隐藏会让评审不知道有这个能力，置灰+原因则把"你为什么不能点"
+//   讲清楚，信息量更大。
+const canTrain = computed(() => auth.can('model:train'))
+
+// 二次确认弹窗状态（自绘，见模板）
+const trainConfirm = ref(false)
 
 const loading = ref(true)
 const training = ref(false)
@@ -41,7 +56,25 @@ const LABELS = {
 }
 const fmtLabel = (key) => LABELS[key] ? `${key}\n(${LABELS[key]})` : key
 
+/**
+ * 点「重新训练」的第一道关：**不直接开跑**，先弹二次确认。
+ *
+ * ⚠ 为什么必须确认（实测该按钮原先没有任何确认）：
+ *   重训不是"刷新一下数据"，它会**移动全系统的判定基准** ——
+ *   分位数分级线（P95/P70/P35）与决策阈值都会变，进而改变
+ *   "谁该被干预"的名单。且它是分钟级的 Celery 任务，期间模型文件
+ *   正在被写入（页面上那句"训练期间模型文件正在被写入"就是为此打的补丁）。
+ *   与"删除工单"同级乃至更高的影响面，却比删单少一道确认 —— 不一致。
+ */
+function askTrain() {
+  if (!canTrain.value) return          // 置灰时不该走到这里，双保险
+  if (training.value) return
+  trainConfirm.value = true
+}
+
+/** 确认后真正提交训练 */
 async function trainModels() {
+  trainConfirm.value = false
   training.value = true
   trainingMessage.value = '提交训练任务...'
   try {
@@ -59,6 +92,11 @@ async function trainModels() {
     // 3) 加载结果
     await loadData()
     await initCharts()
+  } catch (e) {
+    // ⚠ 必须显式接住错误：权限不足时后端返回 403，若只靠 finally 收尾，
+    //   用户看到按钮恢复原样、没有任何反馈，会以为"点了没反应"。
+    const msg = e.response?.data?.detail || e.message || '训练任务提交失败'
+    loadError.value = `训练任务提交失败：${msg}`
   } finally {
     training.value = false
     trainingMessage.value = ''
@@ -357,11 +395,36 @@ onBeforeUnmount(() => {
       </div>
       <div class="flex items-center gap-3">
         <span v-if="training" class="text-xs text-indigo-300">{{ trainingMessage }}</span>
-        <button @click="trainModels" :disabled="training"
-                class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50"
+        <!-- 无 model:train 权限时置灰并说明原因（而不是隐藏 —— 该能力值得被看见） -->
+        <span v-if="!canTrain && !training" class="text-xs text-gray-500">
+          需「系统管理员」权限
+        </span>
+        <button @click="askTrain" :disabled="training || !canTrain"
+                :title="canTrain ? '重新训练 5 个模型（会移动分级线与决策阈值）'
+                                 : '当前角色无重训权限（需系统管理员）'"
+                class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 style="background: #1d4ed8;">
           {{ training ? '训练中...' : '重新训练' }}
         </button>
+      </div>
+    </div>
+
+    <!-- 重训二次确认 —— 与工单状态变更用同一种自绘弹窗，视觉一致 -->
+    <div v-if="trainConfirm" class="mc-overlay" @click.self="trainConfirm = false">
+      <div class="mc-confirm">
+        <h3>重新训练全部模型？</h3>
+        <div class="mc-confirm-body">
+          <p>本次将重训 5 个模型（LightGBM / XGBoost / 逻辑回归等）。</p>
+          <p class="mc-warn">
+            ⚠ 重训会重算分位数分级线与决策阈值，<b>「该干预谁」的名单会随之改变</b>；
+            已完成工单里冻结的等级快照不受影响。
+          </p>
+          <p class="mc-dim">任务为异步执行，耗时数分钟；期间模型文件正在被写入，请勿反复提交。</p>
+        </div>
+        <div class="mc-confirm-foot">
+          <button class="mc-btn" @click="trainConfirm = false">取消</button>
+          <button class="mc-btn mc-btn-primary" @click="trainModels">确认重训</button>
+        </div>
       </div>
     </div>
 
@@ -382,10 +445,17 @@ onBeforeUnmount(() => {
       </p>
       <div class="flex items-center justify-center gap-3">
         <button @click="reload" class="mc-btn">↻ 刷新</button>
-        <button @click="trainModels" :disabled="training" class="mc-btn mc-btn-primary">
+        <!-- ⚠ 这是第二个重训入口（模型未就绪态），同样要走确认与权限 ——
+             只改顶部按钮会让这条路径绕过二次确认 -->
+        <button @click="askTrain" :disabled="training || !canTrain"
+                :title="canTrain ? '' : '当前角色无重训权限（需系统管理员）'"
+                class="mc-btn mc-btn-primary">
           {{ training ? '训练中...' : '开始训练' }}
         </button>
       </div>
+      <p v-if="!canTrain" class="text-xs text-gray-500 mt-3">
+        当前角色无重训权限，需「系统管理员」
+      </p>
       <p v-if="training" class="text-xs text-indigo-300 mt-3">{{ trainingMessage }}</p>
     </div>
 
@@ -507,4 +577,33 @@ onBeforeUnmount(() => {
 }
 .mc-btn-primary:hover { background: #1e40af; }
 .mc-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ── 重训二次确认弹窗（自绘，与工单页的确认弹窗语义一致）── */
+.mc-overlay {
+  position: fixed; inset: 0; z-index: 999;
+  background: rgba(23, 51, 92, 0.38);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.mc-confirm {
+  width: 100%; max-width: 440px;
+  background: #fff; border-radius: 14px;
+  padding: 22px 24px 18px;
+  box-shadow: 0 16px 48px rgba(23, 51, 92, 0.24);
+}
+.mc-confirm h3 {
+  margin: 0 0 14px; font-size: 16px; font-weight: 700; color: #17335c;
+}
+.mc-confirm-body p {
+  margin: 0 0 9px; font-size: 13px; color: #5b6b83; line-height: 1.7;
+}
+.mc-warn {
+  background: #fffbeb; border: 1px solid #fde68a;
+  border-radius: 8px; padding: 9px 11px;
+  color: #92400e !important; font-size: 12.5px !important;
+}
+.mc-dim { color: #9aa7bd !important; font-size: 12px !important; }
+.mc-confirm-foot {
+  display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;
+}
 </style>

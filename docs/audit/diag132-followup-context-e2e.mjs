@@ -55,7 +55,7 @@ async function ask(q) {
 
 const readCtx = () => page.evaluate(() => {
   try {
-    const o = JSON.parse(localStorage.getItem('agent.session.v1') || '{}')
+    const o = JSON.parse(localStorage.getItem('agent.session.v1.liming') || '{}')
     return o.context || null
   } catch (_) { return null }
 })
@@ -63,7 +63,7 @@ const readCtx = () => page.evaluate(() => {
 await loginAs(page)
 await page.goto('http://localhost:5173/assistant', { waitUntil: 'networkidle' })
 await page.waitForTimeout(2500)
-await page.evaluate(() => localStorage.removeItem('agent.session.v1'))
+await page.evaluate(() => localStorage.removeItem('agent.session.v1.liming'))
 await page.reload({ waitUntil: 'networkidle' })
 await page.waitForTimeout(2200)
 
@@ -121,7 +121,7 @@ console.log('\n七、清空会话 → context 应一并清空')
 await page.locator('button:has-text("清空")').first().click()
 await page.waitForTimeout(1200)
 const c3 = await readCtx()
-const stored = await page.evaluate(() => localStorage.getItem('agent.session.v1'))
+const stored = await page.evaluate(() => localStorage.getItem('agent.session.v1.liming'))
 console.log('  清空后 localStorage:', stored === null ? '已删除' : stored.slice(0, 60))
 ok(stored === null, '清空后 localStorage 键被删除（无残留）')
 

@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { KEY_TOKEN } from '../utils/userStorage'
 
 const api = axios.create({
   baseURL: '/api',
@@ -10,7 +11,10 @@ const api = axios.create({
 // ⚠ 直接读 localStorage 而不是 import auth store：store 里会 import
 //   本模块（api），形成循环依赖 —— 在打包时表现为 "Cannot access before
 //   initialization"，排查成本高。localStorage 是同一份真相，读它是安全的。
-const TOKEN_KEY = 'auth.token.v1'
+//
+// ⚠ 键名取自 utils/userStorage.js 而非就地硬编码 —— 原先 5 个文件各写
+//   一份 'auth.token.v1'，改键名时必然漏改（实测教训见该文件说明）。
+const TOKEN_KEY = KEY_TOKEN
 
 api.interceptors.request.use((config) => {
   try {

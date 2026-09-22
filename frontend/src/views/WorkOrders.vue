@@ -47,8 +47,12 @@
         <span>🔒</span><span>{{ maskNotice }}</span>
       </div>
 
-      <!-- Table -->
-      <div class="glass-card overflow-hidden">
+      <!-- Table
+           ⚠ 外层去掉 overflow-hidden —— 它会让表头 sticky 失效
+             （sticky 被最近滚动祖先限制）。圆角由内层 .table-scroll 保证。
+             展开的详情面板在该滚动容器内，可正常滚动查看。 -->
+      <div class="glass-card">
+        <div class="table-scroll">
         <table class="w-full">
           <thead>
             <tr>
@@ -134,7 +138,7 @@
                 <td class="text-gray-500 text-xs">{{ fmtDate(o.created_at) }}</td>
                 <td v-if="!masked" @click.stop>
                   <button class="btn btn-outline btn-xs" @click="openEdit(o)">✎</button>
-                  <button class="btn btn-outline btn-xs ml-1" @click="deleteOrder(o.id)">✕</button>
+                  <button class="btn btn-outline btn-xs ml-1" @click="deleteOrder(o)">✕</button>
                 </td>
               </tr>
               <!-- Detail Panel -->
@@ -212,6 +216,7 @@
             </template>
           </tbody>
         </table>
+        </div>
       </div>
 
       <!-- Pagination -->
@@ -353,7 +358,10 @@
           <button class="modal-close" @click="confirmDialog = null">✕</button>
         </div>
         <div class="modal-body">
-          <p class="text-sm text-gray-400" style="line-height: 1.7">
+          <!-- white-space: pre-line —— 让文案里的 \n 真正换行。
+               删除工单的确认语分两段（对象 / 后果），挤成一行读起来吃力。
+               既有的状态变更文案不含 \n，行为不变。 -->
+          <p class="text-sm text-gray-400" style="line-height: 1.7; white-space: pre-line">
             {{ confirmDialog.body }}
           </p>
         </div>
@@ -527,7 +535,10 @@ async function regenNote() {
 
 // ── Computed ────────────────────────────────────────
 const statsCards = computed(() => [
-  { key: 'all', label: '全部工单', value: stats.total, color: '#e2e8f0' },
+  // ⚠ 卡片背景是白卡（style.css 的 .glass-card），故"总量"数字不能用
+  //   浅色（原为 #e2e8f0，在白底上几乎不可见）。改用主色 #17335c，
+  //   既保证可读，又与下方彩色分解项形成"总量 vs 分类"的层级。
+  { key: 'all', label: '全部工单', value: stats.total, color: '#17335c' },
   { key: 'pending', label: '⏳ 待处理', value: stats.pending, color: '#fbbf24' },
   { key: 'in_progress', label: '🔄 处理中', value: stats.in_progress, color: '#60a5fa' },
   { key: 'completed', label: '✅ 已完成', value: stats.completed, color: '#34d399' },
@@ -822,16 +833,40 @@ async function submitOrder() {
   }
 }
 
-async function deleteOrder(id) {
-  if (!confirm('确定要删除该工单吗？')) return
+/**
+ * 删除工单 —— 走与状态变更**同一个自绘弹窗**。
+ *
+ * ⚠ 为什么改（实测不一致）：本文件顶部注释明确写了"用自绘弹窗而非
+ *   window.confirm：后者是同步阻塞的浏览器原生框，样式与整站割裂，
+ *   且无法标注危险操作的语义色"，但 deleteOrder 自己却用了原生 confirm ——
+ *   同一个文件里两套做法。且原生框只说"确定要删除该工单吗？"，
+ *   **不显示删的是哪一张**（工单号、客户名都看不到），删除不可逆，
+ *   用户无法确认自己点对了行。
+ */
+function deleteOrder(o) {
+  confirmDialog.value = {
+    title: '删除该工单？',
+    body: `工单 #${o.id} —— 客户 ${o.customer_name || o.display_name || '（已脱敏）'}`
+          + `${o.customer_id ? `（${o.customer_id}）` : ''}，`
+          + `当前状态「${statusLabel(o.status)}」。\n\n`
+          + `删除后不可恢复，且该客户的挽留记录会随之消失。`,
+    danger: true,
+    onConfirm: () => doDeleteOrder(o.id),
+  }
+}
+
+async function doDeleteOrder(id) {
   try {
     await api.delete(`/work-orders/${id}`)
-    showToast('工单已删除')
+    showToast(`工单 #${id} 已删除`)
     expandedId.value = null
     fetchOrders()
     fetchStats()
   } catch (e) {
-    showToast('删除失败')
+    // ⚠ 原实现只写 `showToast('删除失败')`，把后端给的具体原因（如
+    //   404 工单不存在、403 权限不足）整段丢掉了 —— 用户无从判断
+    //   是网络问题还是权限问题。这里把 detail 带出来。
+    showToast('删除失败：' + (e.response?.data?.detail || e.message))
   }
 }
 

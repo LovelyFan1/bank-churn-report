@@ -40,6 +40,38 @@ const navigateTo = (path) => {
   router.push(path)
 }
 
+/**
+ * 面包屑 —— 仅二级页（如 /customers/:id）显示两级。
+ *
+ * ⚠ 为什么一级页不显示：
+ *   一级页侧边栏已经高亮了同一项，再显示一行"工作台 / 客户名单"是**冗余**，
+ *   白白占掉 30px 垂直空间。面包屑的价值在于"能回到父级" ——
+ *   一级页没有父级可回，那行文字就没有信息量。
+ *
+ * ⚠ 文字取自**导航项**而不是 route.meta.title：
+ *   两者不一致（侧边栏写"客户名单"、meta 写"客户管理"），
+ *   用 meta 会让面包屑与用户刚点的那一项文字对不上。
+ */
+const breadcrumb = computed(() => {
+  const all = [...navItems, ...adminNavItems]
+  // 找出当前路由归属的导航项（取**最长匹配**，避免 /customers 抢先匹配 /customers/:id）
+  const owner = all
+    .filter(it => isActive(it.path))
+    .sort((a, b) => b.path.length - a.path.length)[0]
+
+  if (!owner) return []
+
+  const isExact = route.path === owner.path
+  if (isExact) return []          // 一级页不显示（见上）
+
+  // 二级页：父级（可点）+ 当前页
+  const child = route.meta?.title || route.name || '详情'
+  return [
+    { title: owner.title, path: owner.path },
+    { title: String(child) },
+  ]
+})
+
 // ══════════════════════════════════════════════════════════
 // 无操作自动退出（等保三级明确要求项）
 // ══════════════════════════════════════════════════════════
@@ -197,6 +229,14 @@ function stayActive() {
       </header>
 
       <div class="p-6">
+        <!-- 面包屑 —— 仅二级页出现（见 breadcrumb 的说明） -->
+        <nav v-if="breadcrumb.length" class="breadcrumb">
+          <template v-for="(b, i) in breadcrumb" :key="i">
+            <span v-if="i > 0" class="bc-sep">/</span>
+            <a v-if="b.path" class="bc-link" @click="navigateTo(b.path)">{{ b.title }}</a>
+            <span v-else class="bc-cur">{{ b.title }}</span>
+          </template>
+        </nav>
         <slot />
       </div>
     </main>
@@ -213,8 +253,28 @@ function stayActive() {
 </template>
 
 <style scoped>
-/* ── 顶栏 ── */
+/* ── 面包屑（仅二级页）── */
+.breadcrumb {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: #9aa7bd;
+  margin-bottom: 12px;
+}
+.bc-sep { color: #cbd5e1; }
+.bc-link {
+  color: #7c8aa5; cursor: pointer; transition: color .15s;
+}
+.bc-link:hover { color: #1d4ed8; }
+.bc-cur { color: #17335c; font-weight: 600; }
+
+/* ── 顶栏 ──
+   ⚠ 必须 sticky 且 z-index 高于表格表头（表头是 5）：
+     1) 表格表头吸顶到 top:56px，若顶栏不吸顶，滚动后表头会浮在
+        一片空白上（顶栏已经滚走了），看起来像"表头漂在半空"。
+     2) 顶栏 z-index 必须 > 表头，否则页面滚动时表头会从顶栏**前面**穿过。 */
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   height: 56px;
   display: flex; align-items: center; justify-content: flex-end;
   padding: 0 24px;

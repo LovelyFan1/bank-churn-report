@@ -16,7 +16,7 @@
       <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div class="glass-card p-5">
           <div class="text-xs text-gray-400 mb-1">总客户数</div>
-          <div class="text-3xl font-bold text-gray-100">{{ summary.total_customers?.toLocaleString() }}</div>
+          <div class="text-3xl font-bold text-[#17335c]">{{ summary.total_customers?.toLocaleString() }}</div>
           <div class="text-xs text-gray-500 mt-1">模型：{{ modelUsed || '—' }}</div>
         </div>
         <div class="glass-card p-5">
@@ -127,8 +127,13 @@
         <span>{{ maskNotice }}</span>
       </div>
 
-      <!-- Table -->
-      <div class="glass-card overflow-hidden">
+      <!-- Table
+           ⚠ 外层**不能**再带 overflow-hidden —— 它会让内层表头的
+             position: sticky 失效（sticky 被最近滚动祖先限制，而
+             overflow:hidden 的祖先会让它完全不粘）。圆角改由内层
+             .table-scroll 自己保证，视觉不变。详见 style.css 的说明。 -->
+      <div class="glass-card">
+        <div class="table-scroll">
         <table class="w-full">
           <thead>
             <tr>
@@ -218,6 +223,7 @@
             </tr>
           </tbody>
         </table>
+        </div>
       </div>
 
       <!-- Pagination -->

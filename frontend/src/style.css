@@ -97,6 +97,22 @@ body {
   font-size: 13px;
 }
 
+/* ── 数字等宽对齐（tabular-nums）──────────────────────────
+   表格里的余额/概率/金额等数字列，浏览器默认用**比例数字** ——
+   每个字符宽度不同（"1"比"8"窄），于是整列纵向扫读时会"晃"，
+   小数点也对不齐。tabular-nums 让所有数字等宽，这是数据密集型
+   后台的标准做法。
+
+   ⚠ 只作用于表格单元格与显式声明的 .num / .tabular-nums，
+     不全局套用到 body —— 正文里的数字（如"共 96,418 条"）
+     用比例数字排版更自然，强行等宽反而显得松散。 */
+tbody td,
+thead th,
+.num,
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── 风险徽章（全局统一）──────────────────────────────────
    四个视图原先各自 <style scoped> 定义了一套 .risk-* / .badge-*，
    且颜色不一致。现收敛到全局一处，类名由 utils/risk.js 的
@@ -187,4 +203,52 @@ body {
 .fade-enter-from,
 .fade-leave-to {
   opacity: 0;
+}
+
+/* ══════════════════════════════════════════════════════════
+   数据表格：表头吸顶
+   ══════════════════════════════════════════════════════════
+
+   ⚠ 这里有两个必须知道的 CSS 约束（实测踩过，两次都改错了方向）：
+
+   1) `position: sticky` 会被**最近的滚动祖先**限制，而祖先上的
+      `overflow: hidden` 会让它**完全失效**（元素跟着滚走，不报错）。
+      本项目原先的写法是 `<div class="glass-card overflow-hidden">` 包住
+      整张表 —— 那个 overflow-hidden 是为圆角裁剪服务的，却杀死了 sticky。
+      故改造时去掉它，圆角交给 .table-scroll 自己保证。
+
+   2) **不要给表格单独设 max-height**（我第一版就是这么写的，错了）。
+      那样会同时存在"页面滚动"与"表格内滚动"两套滚动条，用户滚轮
+      在表格里滚表格、在外面滚页面 —— 是 B 端明确的反模式。
+      实测证据（视口 900px）：页面可滚(1030>900) **且** 容器可滚(1263>540)。
+
+      正确做法：**让页面滚动，表头 sticky 到视口顶部**。
+      这样只有一条滚动条，且表头始终可见 —— 主流后台（Ant Design Pro、
+      Arco）的列表页都是这个行为。
+
+   ⚠ top 值 = 顶栏高度(56px)。顶栏是 sticky 的，表头必须停在它下沿，
+     否则表头会钻到顶栏底下被盖住。改顶栏高度时要同步这个值。 */
+
+/* ⚠ 关键：这里**不能**用 `overflow-x: auto` 来做横向滚动 ——
+   `overflow-x` 非 visible 时，该元素的 `overflow-y` 会被计算成 auto
+   （CSS 规范：一个方向 visible、另一个非 visible 时，visible 变成 auto），
+   于是它**又变成了滚动祖先，sticky 再次失效**。
+   实测证据：加 overflow-x:auto 后表头 top 从 518 变成 -82（完全不粘）。
+
+   所以这里不设任何 overflow，圆角只靠 border-radius 呈现。
+   本项目表格列宽自适应，正常视口下不会横向溢出。 */
+.table-scroll {
+  border-radius: 10px;
+}
+
+/* 表头吸顶到顶栏下沿 —— 滚动祖先是 document，sticky 相对视口生效 */
+.table-scroll thead th {
+  position: sticky;
+  top: 56px;
+  z-index: 5;
+  /* 吸顶时必须**不透明**，否则下方行会透出来。
+     各页原先已给 th 设了 #f8fafc，这里兜底并加 background-clip
+     防止圆角处出现 1px 缝隙。 */
+  background-color: #f8fafc;
+  background-clip: padding-box;
 }
