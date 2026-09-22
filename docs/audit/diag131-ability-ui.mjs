@@ -2,7 +2,7 @@
  * 前端核验：能力范围面板只列 9 个可做项，不含"答不了"。
  */
 import { chromium } from 'playwright-core'
-import { installReadOnlyGuard, resetAgentSession } from './_guard.mjs'
+import { installReadOnlyGuard, loginAs, resetAgentSession } from './_guard.mjs'
 
 const EXE = process.env.USERPROFILE +
   '\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe'
@@ -16,6 +16,7 @@ page.on('console', m => { if (m.type() === 'error') errors.push(m.text()) })
 page.on('pageerror', e => errors.push('pageerror: ' + e.message))
 
 const guard = await installReadOnlyGuard(page)
+await loginAs(page, 'liming')   // 默认拒绝鉴权：未登录会被重定向到登录页
 await resetAgentSession(page)
 
 const fails = []

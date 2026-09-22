@@ -8,6 +8,9 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.user import User
+from app.services import auth_deps
+from app.services import auth_service as auth
 from app.services import risk_scoring
 from app.services.model_service import get_model_service
 from app.celery_tasks.train import train_all_models_task
@@ -21,8 +24,13 @@ router = APIRouter(prefix="/api/model", tags=["Models"])
 # ═══════════════════════════════════════════════════════════
 
 @router.post("/train")
-async def train_models():
-    """提交训练任务 → 返回 task_id，前端轮询 GET /api/tasks/{task_id}。"""
+async def train_models(user: User = Depends(
+        auth_deps.require_perm(auth.PERM_MODEL_TRAIN))):
+    """提交训练任务 → 返回 task_id，前端轮询 GET /api/tasks/{task_id}。
+
+    ⚠ 权限：`model:train`（仅管理员）。重训会**移动风险分级线与决策阈值**，
+      进而改变"谁该被干预"的名单 —— 影响面远超单张工单，故限权。
+    """
     task = train_all_models_task.delay()
     return {
         "task_id": task.id,

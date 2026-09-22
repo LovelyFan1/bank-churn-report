@@ -15,12 +15,15 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.agent import guard_rules, llm
 from app.database import get_db
+from app.models.user import User
+from app.services import auth_deps
+from app.services import auth_service as auth
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +44,10 @@ class AskRequest(BaseModel):
     #
     # ⚠ 它是**不可信输入**（用户能改 localStorage），故 graph 侧会逐字段
     #   校验（见 context.normalize），且编号还要过输出侧白名单。
-    # ⚠ 类型刻意用 Any 而不是 dict：它是**不可信输入**，若声明为 dict，
-    #   Pydantic 会在进 graph 之前就抛 422，**整轮对话直接挂掉** ——
-    #   而上下文坏了不该让用户问不了问题。
-    #   用 Any 把校验权交给 context.normalize（它对非 dict 一律返回空上下文，
-    #   对每个字段逐项清洗），坏数据只会被静默丢弃。
+    #
+    # ⚠ 类型刻意用 Any 而不是 dict：若声明为 dict，Pydantic 会在进 graph
+    #   之前就抛 422，**整轮对话直接挂掉** —— 而上下文坏了不该让用户
+    #   问不了问题。用 Any 把校验权交给 context.normalize。
     context: Any = Field(default=None,
                          description="上一轮返回的会话上下文，原样回传")
 
@@ -107,7 +109,10 @@ async def agent_capabilities():
 
 
 @router.post("/ask")
-async def agent_ask(body: AskRequest, db: Session = Depends(get_db)):
+async def agent_ask(body: AskRequest, request: Request,
+                    user: User = Depends(
+                        auth_deps.require_perm(auth.PERM_AGENT_USE)),
+                    db: Session = Depends(get_db)):
     """问一句，得到一个基于系统真实数据的回答。
 
     回答可能附带：
@@ -152,17 +157,26 @@ async def agent_ask(body: AskRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/confirm")
-async def agent_confirm(payload: dict):
+async def agent_confirm(payload: dict, request: Request,
+                        user: User = Depends(
+                            auth_deps.require_perm(auth.PERM_ORDER_WRITE))):
     """确认执行 Agent 提议的写操作。
 
     ⚠ 与 /ask 分离是刻意的：Agent 只能**提议**，执行必须由这个
       独立端点完成，且由用户显式触发。这样"Agent 不会自作主张写库"
       是**接口结构**上的保证，而不是靠提示词约束模型。
 
+    ⚠ 引入登录后的关键变化：**操作者由服务端从会话取**（`user`），
+      不再从 payload 里读、也不再依赖 LLM 抽出的 assignee。
+      此前 `session_id` 硬编码为 'ui'，Agent 建的工单**追不到是谁让建的**；
+      现在每次写操作都留审计（4A 的 Audit 环节）。
+
     当前支持 action=create_work_order。
     """
-    from app.routers.work_orders import create_work_order
-    from app.schemas.work_order import WorkOrderCreate
+    from app.database import SessionLocal
+    from app.routers.work_orders import (
+        create_work_order, delete_work_order, get_work_order, update_work_order)
+    from app.schemas.work_order import WorkOrderCreate, WorkOrderUpdate
 
     action = payload.get("action")
     if action not in ("create_work_order", "update_work_order", "delete_work_order"):
@@ -173,17 +187,21 @@ async def agent_confirm(payload: dict):
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="缺少 payload")
 
-    from app.database import SessionLocal
-    from app.routers.work_orders import (
-        create_work_order, delete_work_order, get_work_order, update_work_order)
-    from app.schemas.work_order import WorkOrderCreate, WorkOrderUpdate
-
     db = SessionLocal()
     try:
         if action == "create_work_order":
             # 复用既有建单逻辑（含 409 互斥、渠道覆盖校验、快照补齐），
             # 不另写一套 —— 否则 Agent 建的工单与页面建的会有口径差异
             created = await create_work_order(WorkOrderCreate(**body), db=db)
+            auth_deps.write_audit(
+                db, user=user, action="create_work_order",
+                target=str(created.get("customer_id") or ""),
+                detail={"order_id": created.get("id"),
+                        "assignee": created.get("assignee"),
+                        "via": "agent"},
+                source="agent", ip=auth_deps._client_ip(request),
+                message=f"通过智能助手为客户 {created.get('customer_id')} 创建挽留工单")
+            db.commit()
             return {"created": True, "action": action, "order": created}
 
         if action == "update_work_order":
@@ -194,6 +212,14 @@ async def agent_confirm(payload: dict):
                 raise HTTPException(status_code=422,
                                     detail="update_work_order 至少需要 status/assignee/note 之一")
             updated = await update_work_order(oid, WorkOrderUpdate(**fields), db=db)
+            auth_deps.write_audit(
+                db, user=user, action="update_work_order",
+                target=f"#{oid}",
+                detail={"order_id": oid, "fields": sorted(fields.keys()),
+                        "via": "agent"},
+                source="agent", ip=auth_deps._client_ip(request),
+                message=f"通过智能助手修改工单 #{oid}")
+            db.commit()
             return {"created": False, "action": action, "order": updated}
 
         # delete_work_order
@@ -208,10 +234,28 @@ async def agent_confirm(payload: dict):
         except HTTPException:
             pass
         await delete_work_order(oid, db=db)
+        auth_deps.write_audit(
+            db, user=user, action="delete_work_order", target=f"#{oid}",
+            detail={"order_id": oid, "deleted_order": before, "via": "agent"},
+            source="agent", ip=auth_deps._client_ip(request),
+            message=f"通过智能助手删除工单 #{oid}")
+        db.commit()
         return {"created": False, "action": action, "deleted": True,
                 "order_id": oid, "deleted_order": before}
 
-    except HTTPException:
+    except HTTPException as e:
+        # 失败也要留痕 —— 审计要能回答"谁尝试过什么但没成功"
+        try:
+            auth_deps.write_audit(
+                db, user=user, action=action or "unknown",
+                target=str((payload.get("payload") or {}).get("customer_id")
+                           or (payload.get("payload") or {}).get("order_id") or ""),
+                detail={"via": "agent"}, source="agent", success=False,
+                message=str(e.detail)[:200],
+                ip=auth_deps._client_ip(request))
+            db.commit()
+        except Exception:
+            db.rollback()
         raise
     except (TypeError, ValueError) as e:
         raise HTTPException(status_code=422, detail=f"参数错误：{e}")
@@ -230,7 +274,9 @@ class BatchConfirmRequest(BaseModel):
 
 
 @router.post("/confirm-batch")
-async def agent_confirm_batch(body: BatchConfirmRequest):
+async def agent_confirm_batch(body: BatchConfirmRequest, request: Request,
+                              user: User = Depends(
+                                  auth_deps.require_perm(auth.PERM_ORDER_WRITE))):
     """批量确认建单 —— 方案 A（弹确认面板后一次性提交）。
 
     ⚠ 为什么需要独立端点而不是前端循环调 /confirm：
@@ -344,4 +390,19 @@ async def agent_confirm_batch(body: BatchConfirmRequest):
             "skipped": skipped,
         }
     finally:
+        # ── 批量操作审计（无论成败都留痕）────────────────────
+        # 放在 finally 里：即使中途抛异常，"谁尝试批量建过单"也必须可查。
+        try:
+            auth_deps.write_audit(
+                db, user=user, action="create_work_order_batch",
+                target=f"{len(ok_list)}/{len(uniq)}",
+                detail={"requested": uniq, "succeeded": [o["customer_id"] for o in ok_list],
+                        "failed": failed, "skipped": skipped, "via": "agent"},
+                source="agent", success=not failed and bool(ok_list),
+                message=(f"通过智能助手批量建单：成功 {len(ok_list)}、"
+                         f"失败 {len(failed)}、跳过 {len(skipped)}"),
+                ip=auth_deps._client_ip(request))
+            db.commit()
+        except Exception:
+            db.rollback()
         db.close()

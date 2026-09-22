@@ -21,6 +21,94 @@
  *   console.log(guard.report())   // 看拦截了什么
  */
 
+import { createHmac } from 'node:crypto'
+
+/**
+ * 登录辅助 —— 引入 4A 登录系统后，**所有** E2E 脚本都必须先登录。
+ *
+ * ⚠ 为什么必须加这个（实测）：
+ *   鉴权改成了**默认拒绝**（见 backend/app/middleware/auth.py），
+ *   未登录访问任何 /api/* 都返回 401。前端守卫随即把页面重定向到
+ *   /login —— 于是既有脚本全部卡在 `locator('.composer')` 超时上，
+ *   报错信息完全看不出"其实是没登录"（表现为找不到元素）。
+ *
+ * ⚠ 为什么直接塞 localStorage 而不是走登录表单：
+ *   绝大多数脚本要测的是**业务页面**，登录只是前置条件。
+ *   走表单会让每个脚本多花 2~4 秒，且一旦登录页改版就要改所有脚本。
+ *   需要验证登录流程本身的脚本（diag133）才走真实表单。
+ *
+ * ⚠ 令牌通过真实接口取得（不是伪造），故仍然是端到端有效的。
+ */
+export async function loginAs(page, username = 'liming',
+                              password = 'Bank@2025',
+                              base = 'http://localhost:5173') {
+  // 用页面上下文发请求，确保同源且走真实的鉴权链路
+  const resp = await page.request.post(`${base}/api/auth/login`, {
+    data: { username, password },
+  })
+  if (!resp.ok()) {
+    throw new Error(`登录失败 ${resp.status()}: ${await resp.text()}`)
+  }
+  const data = await resp.json()
+
+  let token = data.token
+  let user = data.user
+
+  // 管理员需要第二步动态口令（TOTP）。
+  // ⚠ 这里用与后端相同的算法**当场算出**当前口令，而不是硬编码 ——
+  //   TOTP 每 30 秒变一次，硬编码必然失效。
+  if (data.need_totp && data.ticket) {
+    const secret = process.env.TEST_TOTP_SECRET
+    if (!secret) {
+      throw new Error(
+        '该账号需要动态口令，但未提供 TEST_TOTP_SECRET 环境变量。\n' +
+        '密钥见后端启动日志 "[preseed] TOTP zhaomin: <secret>"。')
+    }
+    const code = totpNow(secret)
+    const r2 = await page.request.post(`${base}/api/auth/login/totp`, {
+      data: { ticket: data.ticket, code },
+    })
+    if (!r2.ok()) throw new Error(`动态口令失败 ${r2.status()}: ${await r2.text()}`)
+    const d2 = await r2.json()
+    token = d2.token
+    user = d2.user
+  }
+
+  await page.goto(base, { waitUntil: 'domcontentloaded' })
+  await page.evaluate(([t, u]) => {
+    localStorage.setItem('auth.token.v1', t)
+    localStorage.setItem('auth.user.v1', JSON.stringify(u))
+  }, [token, user])
+  return user
+}
+
+/** 与后端 `_hotp` 同算法（RFC 6238, SHA1, 6 位）—— 避免引入依赖。 */
+export function totpNow(secretB32, step = 30) {
+  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  const pad = '='.repeat((8 - (secretB32.length % 8)) % 8)
+  const b32 = secretB32.toUpperCase() + pad
+  let bits = ''
+  for (const ch of b32) {
+    if (ch === '=') break
+    const idx = A.indexOf(ch)
+    if (idx < 0) throw new Error(`非法 base32 字符: ${ch}`)
+    bits += idx.toString(2).padStart(5, '0')
+  }
+  const bytes = []
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.slice(i, i + 8), 2))
+  }
+  const key = Buffer.from(bytes)
+  const counter = Math.floor(Date.now() / 1000 / step)
+  const msg = Buffer.alloc(8)
+  msg.writeBigUInt64BE(BigInt(counter))
+  const h = createHmac('sha1', key).update(msg).digest()
+  const off = h[h.length - 1] & 0x0f
+  const num = ((h[off] & 0x7f) << 24) | (h[off + 1] << 16) |
+              (h[off + 2] << 8) | h[off + 3]
+  return String(num % 1000000).padStart(6, '0')
+}
+
 /**
  * 给测试一个干净的起点：清掉 localStorage 会话缓存后重新加载。
  *
@@ -51,7 +139,23 @@ export async function installReadOnlyGuard(page, opts = {}) {
     //   实测踩坑：不加这条豁免时，护栏把主查询也拦掉并回一个空假响应，
     //   页面于是显示"口径: 未知"，测试全线误报 ——
     //   看起来像产品坏了，实际是护栏把正常请求也拒了。
-    allow = ['/api/agent/ask'],
+    //
+    // ⚠ 认证类接口同样必须放行（引入登录系统后新增）：
+    //   它们是 POST，但**不写业务数据**，只操作会话与用户自身的状态。
+    //   实测踩坑：登录请求被拦 → 前端拿不到令牌 → 页面停在登录页 →
+    //   后续所有断言以 `locator timeout` 失败，报错完全看不出是护栏所致。
+    //   /change-password 会改 users 表，故**不放行**（它不该出现在只读测试里）。
+    allow = [
+      '/api/agent/ask',
+      '/api/auth/login',
+      '/api/auth/login/totp',
+      '/api/auth/logout',
+      // 演示取码：POST 但只读（用临时票据换当前动态口令）——
+      // 它不写任何业务数据。⚠ 实测教训：不加这条时护栏返回**空对象 {}**，
+      // 而前端 `v-if="demo"` 判的是 truthy —— 于是界面渲染出空的演示区，
+      // 6 项断言莫名失败（表现为"口令为空"），完全看不出是护栏所致。
+      '/api/auth/demo/totp',
+    ],
     // 假响应构造器：按 url 返回 {status, body}
     fake = {},
   } = opts
@@ -129,6 +233,11 @@ export async function installReadOnlyGuard(page, opts = {}) {
     })
   })
 
+  // ⚠ 判据必须用**动态的 allow 清单**，不能硬编码 '/api/agent/ask'。
+  //   引入登录后放行清单增加了认证接口；若断言仍只认 ask，
+  //   正常的登录请求会被报成"预期外的写请求"（假告警）。
+  const isAllowed = (w) => allow.some(a => w.includes(a))
+
   return {
     blocked,
     blockedDetail,
@@ -136,9 +245,9 @@ export async function installReadOnlyGuard(page, opts = {}) {
     allowedWrites,
     gets,
     /** 有写请求穿透到后端即为严重事故 */
-    isSafe: () => allowedWrites.every(w => w.includes('/api/agent/ask')),
+    isSafe: () => allowedWrites.every(isAllowed),
     report() {
-      const unexpected = allowedWrites.filter(w => !w.includes('/api/agent/ask'))
+      const unexpected = allowedWrites.filter(w => !isAllowed(w))
       return {
         blockedWrites: blocked.length,
         allowedWrites: allowedWrites.length,

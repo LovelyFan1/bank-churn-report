@@ -2,6 +2,13 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 const routes = [
   {
+    // 登录页 —— 不套 AppLayout（见 App.vue 的判断），故 meta.public 标记它
+    path: '/login',
+    name: 'Login',
+    component: () => import('../views/Login.vue'),
+    meta: { public: true, title: '登录' }
+  },
+  {
     path: '/',
     redirect: '/dashboard'
   },
@@ -63,12 +70,66 @@ const routes = [
     name: 'Assistant',
     component: () => import('../views/Assistant.vue'),
     meta: { title: '智能助手', icon: 'assistant', badge: 'Beta' }
+  },
+  {
+    // 操作审计 —— 4A 的 Audit 环节。仅管理员可见（见下方守卫）。
+    // 放在"系统管理"分组下：它是治理功能，不是日常业务入口。
+    path: '/audit',
+    name: 'AuditLog',
+    component: () => import('../views/AuditLog.vue'),
+    meta: { title: '操作审计', icon: 'audit', permission: 'audit:view' }
   }
 ]
 
 const router = createRouter({
   history: createWebHistory(),
   routes
+})
+
+// ══════════════════════════════════════════════════════════
+// 路由守卫
+// ══════════════════════════════════════════════════════════
+//
+// ⚠ 前端守卫是**体验**措施，不是安全边界 —— 它只防止"未登录看到空页面"，
+//   真正的拦截在后端中间件（默认拒绝）。绕过守卫直接调接口照样 401/403。
+//   把这一点说清楚，避免把守卫误当成安全机制。
+//
+// ⚠ 直接读 localStorage 而不是 import auth store：router 在 main.js 里
+//   先于 pinia 注册，此时 store 还不可用（会抛 "no active Pinia"）。
+const TOKEN_KEY = 'auth.token.v1'
+const USER_KEY = 'auth.user.v1'
+
+function readAuth() {
+  try {
+    const t = localStorage.getItem(TOKEN_KEY)
+    const raw = localStorage.getItem(USER_KEY)
+    return { token: t, user: raw ? JSON.parse(raw) : null }
+  } catch (_) {
+    return { token: null, user: null }
+  }
+}
+
+router.beforeEach((to) => {
+  const { token, user } = readAuth()
+
+  // 公开页（登录页）
+  if (to.meta?.public) {
+    // 已登录还去登录页 → 直接送进系统（避免"登录成功后又看到登录页"）
+    return token ? { path: '/dashboard' } : true
+  }
+
+  if (!token) {
+    // ⚠ 带上 redirect 让用户登录后回到原本想去的页面
+    return { path: '/login', query: to.fullPath !== '/' ? { redirect: to.fullPath } : {} }
+  }
+
+  // 页面级权限：meta.permission 声明的权限点必须命中
+  const need = to.meta?.permission
+  if (need && !(user?.permissions || []).includes(need)) {
+    return { path: '/dashboard', query: { denied: String(need) } }
+  }
+
+  return true
 })
 
 export default router

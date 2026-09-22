@@ -15,7 +15,7 @@
  *   生产库 62 条工单是真实数据。
  */
 import { chromium } from 'playwright-core'
-import { installReadOnlyGuard } from './_guard.mjs'
+import { installReadOnlyGuard, loginAs } from './_guard.mjs'
 
 const EXE = process.env.USERPROFILE +
   '\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe'
@@ -40,6 +40,7 @@ const batchCalls = guard.batchPayloads
 const fails = []
 const grayed = []
 
+await loginAs(page)
 await page.goto('http://localhost:5173/assistant', { waitUntil: 'networkidle' })
 await page.waitForTimeout(2500)
 

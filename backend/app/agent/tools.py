@@ -22,6 +22,16 @@ Agent 不应独断。MVP 先用"返回待确认 + 前端按钮"实现，
   3. 服务层重构不会静默改变 Agent 的行为
 
 代价是多一次本机回环（实测 0.02~0.54s），可接受。
+
+**⚠ 内部鉴权（引入登录系统后新增的必要一环）**
+
+上面这个"HTTP 自调"的设计，在系统加上鉴权之后会**立刻坏掉**：
+工具层的 urllib 请求不带任何令牌，于是全部被 401 拦下 ——
+实测症状是「Agent 查不到任何客户 / 建单说客户不存在」，而接口本身正常。
+
+故此处统一携带**内部令牌**（见 auth_service.internal_token）。
+它只用于服务间调用，配合回环来源校验，不代表任何行员。
+真正的写操作仍由用户令牌经 /api/agent/confirm 触发 —— 工具层只查询。
 """
 
 import json
@@ -37,13 +47,31 @@ _BASE = os.environ.get("AGENT_SELF_BASE", "http://127.0.0.1:8000")
 _TIMEOUT = 30
 
 
+def _headers() -> dict:
+    """内部调用统一请求头 —— 带内部令牌，否则会被鉴权中间件 401。
+
+    ⚠ 延迟到调用时取（而不是模块加载时算），原因有二：
+      1. settings 可能由测试在导入后覆盖
+      2. 避免模块导入即依赖 settings，保持 tools 可独立 import
+    """
+    h = {"Accept": "application/json"}
+    try:
+        from app.services import auth_service
+        h["Authorization"] = "Bearer " + auth_service.internal_token()
+    except Exception:
+        # 取不到令牌时**不静默放行** —— 请求会正常 401，
+        # 从而在验证阶段暴露问题，而不是悄悄变成匿名调用
+        pass
+    return h
+
+
 def _get(path: str, **params) -> Any:
     """调用本系统自己的 GET 接口。失败时抛异常，由上层转成 tool error。"""
     clean = {k: v for k, v in params.items() if v is not None}
     url = _BASE + path
     if clean:
         url += "?" + urllib.parse.urlencode(clean, doseq=True)
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(url, headers=_headers())
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
         return json.loads(r.read().decode())
 

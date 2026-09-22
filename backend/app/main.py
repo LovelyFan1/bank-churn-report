@@ -13,6 +13,10 @@ from app.services import data_source
 from app.services.data_generator import get_data_generator
 from app.routers import eda, clustering, models, cost_benefit, tasks, work_orders, customers, portfolio
 from app.routers import agent as agent_router
+from app.routers import auth as auth_router
+
+# 导入模型模块以确保建表时被注册（Base.metadata 只认识已导入的模型）
+from app.models import user as _user_model  # noqa: F401
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -20,7 +24,20 @@ app = FastAPI(
     debug=settings.DEBUG,
 )
 
-app.add_middleware(
+# ── 中间件注册顺序（实测查证 Starlette 源码后确定）────────
+#
+# Starlette 的 `add_middleware` 是 `user_middleware.insert(0, ...)`，
+# 即**最后注册的在最外层、最先执行**。
+#
+# 故这里：先注册鉴权（内层），再注册 CORS（外层）。
+# 顺序若反过来，鉴权会先于 CORS 执行 —— 未授权的跨域请求被 401 直接
+# 返回，而 CORSMiddleware 根本没机会加上 `Access-Control-Allow-Origin`，
+# 浏览器于是拦掉响应，前端只看到笼统的 "Network Error" 而不是 401。
+# 那种现象极易被误判成"后端挂了"，排查成本很高。
+from app.middleware.auth import AuthMiddleware  # noqa: E402
+app.add_middleware(AuthMiddleware)              # 内层：先鉴权
+
+app.add_middleware(                              # 外层：后执行，负责跨域
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
@@ -38,6 +55,7 @@ app.include_router(work_orders.router)  # /api/work-orders/*
 app.include_router(customers.router)   # /api/customers/*
 app.include_router(portfolio.router)   # /api/portfolio/* — 价值层 × 风险等级矩阵
 app.include_router(agent_router.router)  # /api/agent/* — 对话式任务型 Agent
+app.include_router(auth_router.router)   # /api/auth/* — 内部登录（4A 仿真）
 
 # 允许查询的字段列表
 ALLOWED_FIELDS = [

@@ -20,6 +20,13 @@ saved_models.bak-*/
 .env
 .env.local
 
+# 认证签名密钥（未配置 AUTH_SECRET_KEY 时自动生成）
+# ⚠ 必须忽略：它是签发/校验令牌的密钥，提交进仓库等于公开，
+#   攻击者可据此伪造任意用户（含管理员）的令牌。
+#   路径可能出现在两处：Docker 卷内 data/.auth_secret（本就在卷里，
+#   不进工作区），以及**本地直接跑**时的 backend/.auth_secret。
+.auth_secret
+
 # Python virtual environment
 .venv/
 venv/

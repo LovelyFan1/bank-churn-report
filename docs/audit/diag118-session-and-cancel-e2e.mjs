@@ -11,7 +11,7 @@
  * ⚠ 只读：拦截所有写请求，不真的删单（用户手工建的 #63 必须保留）。
  */
 import { chromium } from 'playwright-core'
-import { installReadOnlyGuard } from './_guard.mjs'
+import { installReadOnlyGuard, loginAs } from './_guard.mjs'
 
 const EXE = process.env.USERPROFILE +
   '\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe'
@@ -44,6 +44,7 @@ async function ask(q) {
   await page.waitForTimeout(700)
 }
 
+await loginAs(page)
 await page.goto('http://localhost:5173/assistant', { waitUntil: 'networkidle' })
 await page.waitForTimeout(2500)
 
@@ -110,14 +111,30 @@ await page2.close()
 // ⚠ 夹具必须用 page.request 发（实测 diag125：page.request **绕过**
 //   page.route，护栏拦不住它），因此**必须自己负责删除**。
 //   这是唯一允许真实写库的地方，且严格限定在 finally 里清理。
+//
+// ⚠ 引入鉴权后必须**显式带令牌**（本次修复）：
+//   page.request 是独立的请求上下文，**不共享** page.evaluate 写入的
+//   localStorage —— 它不会自动带上 Authorization 头。
+//   实测症状：夹具建单返回 401「未登录或缺少令牌」→ 夹具不存在 →
+//   「取消工单未出现确认面板」等 4 项断言失败，看起来像产品坏了，
+//   实际是测试没登录。
 console.log()
 console.log('=' .repeat(88))
 console.log('五、造夹具：新建一张处于 pending 的工单')
 const API = 'http://localhost:8000/api'
+// 与 loginAs 同源的令牌（从页面 localStorage 取，确保是真实登录过的会话）
+const AUTH_HEADERS = await page.evaluate(() => {
+  const t = localStorage.getItem('auth.token.v1')
+  return t ? { Authorization: 'Bearer ' + t } : {}
+})
+if (!AUTH_HEADERS.Authorization) {
+  fails.push('未取得登录令牌，夹具无法创建（请确认已调用 loginAs）')
+}
 let fixtureOrderId = null
 let fixtureCreated = false    // 只有本测试**新建**的才删；复用的不动
 {
   const r = await page.request.post(`${API}/work-orders`, {
+    headers: AUTH_HEADERS,
     data: {
       customer_id: 'C062858', customer_name: 'Pirogov', geography: 'France',
       risk_level: 'CRITICAL', probability: 0.8883, balance: 225534.51,
@@ -160,7 +177,16 @@ console.log('  写请求数:', writes.length, '（点击前应为 0）')
 
 if (writes.length !== 0) fails.push('点击前就发出了写请求')
 if (!hasPending) fails.push('取消工单未出现确认面板（用户看不到按钮）')
-if (!headline.includes('63')) fails.push(`结论未点明工单编号：${headline}`)
+// ⚠ 断言必须用**本次夹具的实际编号**，不能硬编码 '63'。
+//   实测问题：work_orders.id 是 INTEGER PRIMARY KEY（无 AUTOINCREMENT），
+//   插入时取 max(id)+1 —— 删掉旧夹具后 id 会被**复用**。原先硬编码 '63'，
+//   当夹具落到 #62 时断言必然失败，而产品行为其实完全正确
+//   （结论里明明写着「取消（删除）工单 #62」）。这是测试的假告警。
+if (fixtureOrderId && !headline.includes(String(fixtureOrderId))) {
+  fails.push(`结论未点明工单编号（期望 #${fixtureOrderId}）：${headline}`)
+} else if (!fixtureOrderId && !/#\d+/.test(headline)) {
+  fails.push(`结论未点明工单编号：${headline}`)
+}
 
 await last.screenshot({ path: 'C:\\Users\\yyfab\\AppData\\Local\\Temp\\pw-probe\\agent-cancel.png' })
 
@@ -217,7 +243,8 @@ if (lsAfter !== null) fails.push('清空后 localStorage 未被清除')
   console.log('=' .repeat(88))
   console.log('七、清理夹具')
   if (fixtureOrderId && fixtureCreated) {
-    const del = await page.request.delete(`${API}/work-orders/${fixtureOrderId}`)
+    const del = await page.request.delete(`${API}/work-orders/${fixtureOrderId}`,
+      { headers: AUTH_HEADERS })
     console.log(`  删除夹具工单 #${fixtureOrderId} → HTTP ${del.status()}`)
     if (del.status() !== 204) fails.push('夹具清理失败，库中残留测试工单')
   } else if (fixtureOrderId) {

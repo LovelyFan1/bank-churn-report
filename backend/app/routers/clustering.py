@@ -8,6 +8,9 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.user import User
+from app.services import auth_deps
+from app.services import auth_service as auth
 from app.services.clustering_service import get_clustering_service
 from app.celery_tasks.cluster import run_kmeans_task, run_elbow_task
 
@@ -19,12 +22,18 @@ router = APIRouter(prefix="/api/cluster", tags=["Clustering"])
 # ═══════════════════════════════════════════════════════════
 
 @router.post("/kmeans")
-async def submit_kmeans(k: int = Query(default=5, ge=2, le=20), save: bool = Query(default=False)):
+async def submit_kmeans(k: int = Query(default=5, ge=2, le=20),
+                        save: bool = Query(default=False),
+                        user: User = Depends(
+                            auth_deps.require_perm(auth.PERM_MODEL_TRAIN))):
     """提交 K-Means 聚类 → 返回 task_id。
 
     Query params:
         k:    聚类数 (2-20)
         save: 是否将标签写入 DB
+
+    ⚠ 权限：`model:train`（仅管理员）。`save=true` 会**覆盖全部客户的
+      分群标签**，是全局性写操作。
     """
     task = run_kmeans_task.delay(n_clusters=k, save_to_db=save)
     return {
@@ -37,8 +46,10 @@ async def submit_kmeans(k: int = Query(default=5, ge=2, le=20), save: bool = Que
 
 
 @router.post("/kmeans/save")
-async def submit_kmeans_save(k: int = Query(default=5, ge=2, le=20)):
-    """K-Means 聚类 + 保存到数据库 → 返回 task_id。"""
+async def submit_kmeans_save(k: int = Query(default=5, ge=2, le=20),
+                             user: User = Depends(
+                                 auth_deps.require_perm(auth.PERM_MODEL_TRAIN))):
+    """K-Means 聚类 + 保存到数据库 → 返回 task_id（需 model:train 权限）。"""
     task = run_kmeans_task.delay(n_clusters=k, save_to_db=True)
     return {
         "task_id": task.id,

@@ -7,7 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.user import User
 from app.models.work_order import WorkOrder
+from app.services import auth_deps
+from app.services import auth_service as auth
 from app.services import risk_scoring
 from app.schemas.work_order import (
     WorkOrderCreate,
@@ -154,8 +157,21 @@ async def get_active_customers(db: Session = Depends(get_db)):
 # ── 创建工单 ───────────────────────────────────────────
 
 @router.post("", status_code=201)
-async def create_work_order(body: WorkOrderCreate, db: Session = Depends(get_db)):
-    """创建新工单"""
+async def create_work_order(body: WorkOrderCreate,
+                            user: User = Depends(
+                                auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
+                            db: Session = Depends(get_db)):
+    """创建新工单。
+
+    ⚠ 权限：需要 `order:write`。**这是实测发现的缺口修复** ——
+      引入 RBAC 时我只在 Agent 路径（/api/agent/confirm）加了权限检查，
+      却漏了页面直接调用的这个接口。后果：只读角色可以绕过页面建单，
+      「只读」这个角色形同虚设（实测：`POST /api/work-orders` 对
+      chenjie/viewer 返回 201）。
+
+      修法是在**每个写接口**上显式声明权限，而不是指望中间件 ——
+      中间件只保证"必须登录"，不区分"能读"与"能写"。
+    """
     # 互斥检查：同一客户已有进行中的工单则拒绝
     existing = (
         db.query(WorkOrder)
@@ -257,8 +273,11 @@ async def get_work_order(order_id: int, db: Session = Depends(get_db)):
 # ── 更新工单 ───────────────────────────────────────────
 
 @router.put("/{order_id}")
-async def update_work_order(order_id: int, body: WorkOrderUpdate, db: Session = Depends(get_db)):
-    """更新工单状态、负责人、备注等"""
+async def update_work_order(order_id: int, body: WorkOrderUpdate,
+                            user: User = Depends(
+                                auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
+                            db: Session = Depends(get_db)):
+    """更新工单状态、负责人、备注等（需 order:write 权限，见 create 的说明）"""
     order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="工单不存在")
@@ -330,8 +349,14 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate, db: Session = 
 # ── 删除工单 ───────────────────────────────────────────
 
 @router.delete("/{order_id}", status_code=204)
-async def delete_work_order(order_id: int, db: Session = Depends(get_db)):
-    """删除工单"""
+async def delete_work_order(order_id: int,
+                            user: User = Depends(
+                                auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
+                            db: Session = Depends(get_db)):
+    """删除工单（需 order:write 权限，见 create 的说明）。
+
+    ⚠ 删除不可逆，权限检查尤其必要 —— 实测中只读角色曾能删除工单。
+    """
     order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="工单不存在")

@@ -41,6 +41,11 @@ import sys
 from app.database import Base, SessionLocal, engine
 from app.services import data_source
 
+# ⚠ 必须在 create_all 之前导入模型模块：Base.metadata 只登记"已被导入"的
+#   模型类。若把 import 放到 main() 内部（create_all 之后），users 表不会
+#   被建 —— 实测报 `no such table: users`，且播种在每个 worker 里各失败一次。
+from app.models import user as _user_model  # noqa: F401
+
 
 def main() -> int:
     """建表 + 播种（幂等）。成功返回 0，失败返回 1。"""
@@ -60,6 +65,20 @@ def main() -> int:
                 f"[preseed] {info.get('reason')}，现有 {info.get('existing')} 条，跳过",
                 flush=True,
             )
+
+        # ── 演示账号（同理：必须单进程播，否则多 worker 并发插入）──
+        from app.services.user_seed import seed_users
+        uinfo = seed_users(db)
+        if uinfo.get("seeded"):
+            print(f"[preseed] 已播种演示账号 {uinfo['created']} 个", flush=True)
+            # ⚠ 把 TOTP 密钥打出来供演示绑定。这是**演示系统**的刻意选择：
+            #   真银行由 UKey/APP 自行绑定，密钥绝不落日志。
+            for name, secret in (uinfo.get("totp") or {}).items():
+                print(f"[preseed]   TOTP {name}: {secret}", flush=True)
+        else:
+            print(f"[preseed] {uinfo.get('reason')}，现有 {uinfo.get('existing')} 个账号",
+                  flush=True)
+
         return 0
     except Exception as e:
         # 播种失败必须**明确失败** —— 与 data_source 的设计一致：
