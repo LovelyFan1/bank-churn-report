@@ -55,10 +55,43 @@ async function load() {
   }
 }
 
-function fmt(ts) {
-  if (!ts) return '—'
-  // 后端返回 ISO 本地时间；直接截断到秒即可读
-  return String(ts).replace('T', ' ').slice(0, 19)
+/**
+ * 格式化后端返回的时间戳。
+ *
+ * ⚠ 这里曾经有缺陷：旧实现是 `String(ts).replace('T',' ').slice(0,19)`，
+ *   即**原样显示 UTC**，导致审计时间比北京时间**早 8 小时**。
+ *   实测（真实数据）：
+ *       DB 里最新登录 created_at = 2026-09-23 08:18:00  ← 这是 UTC
+ *       页面显示                 = 2026-09-23 08:18:00
+ *       北京实际时间             = 2026-09-23 16:18:00
+ *
+ *   根因：后端 `r.created_at.isoformat()` 输出形如
+ *   `2026-09-23T08:18:00.123456` —— **不带 Z 后缀、不带偏移**。
+ *   而 JS 的 `new Date()` 对"无时区标识"的 ISO 串按**本地时区**解析，
+ *   所以直接 new Date(该串) 仍是对的……前提是没经过字符串截断。
+ *   旧实现压根没进 Date，是纯字符串切割，故永远是 UTC 原值。
+ *
+ *   修法：补 'Z' 显式声明为 UTC，再交给 Date 转本地时区。
+ *
+ * ⚠ 与 WorkOrders.vue 的 fmtDate 是同一套逻辑 —— 两处必须一致，
+ *   否则同一个操作在"工单页"与"审计页"会显示两个相差 8 小时的时间。
+ *   （本项目一贯的做法：口径只留一处。这里因两页数据结构不同而
+ *     各自实现，但算法与注释保持同步。）
+ */
+function fmt(d) {
+  if (!d) return '—'
+  if (typeof d !== 'string') return String(d)
+  // 无时区标识的 ISO 串 → 显式声明为 UTC（后端约定见上）
+  const hasTz = /(Z|[+-]\d{2}:?\d{2})$/.test(d)
+  const iso = hasTz ? d : d + 'Z'
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) {
+    // 解析失败则退化为原样显示（不因格式问题让整列空白）
+    return d.replace('T', ' ').slice(0, 19)
+  }
+  const p = (n) => String(n).padStart(2, '0')
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())} ` +
+         `${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`
 }
 
 const actions = computed(() => Object.keys(ACTION_CN))

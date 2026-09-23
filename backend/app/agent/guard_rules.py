@@ -199,8 +199,15 @@ def known_topics() -> list[dict]:
 
 _WRITE_KEYWORDS = [
     "建单", "建个单", "建工单", "创建工单", "创建工作单", "开个工单",
+    # ⚠ "建立工单" 必须单列（实测缺陷，用户报告）：
+    #   表里有「建工单」但没有「建立工单」—— 中间多了个"立"字，
+    #   正则匹配不到。而"建立工单"恰恰是最自然的书面说法之一。
+    #   实测：用户说「帮我把这三位建立工单」，写意图**完全没被识别**，
+    #   于是不强制调提议工具、前端拿不到确认面板，
+    #   用户只看到一条"未指定负责人"的单条提议。
+    "建立工单", "建立起工单", "建立挽留工单", "建挽留工单",
     "派给", "派单", "分配给", "指派给", "安排给",
-    "帮我建", "给我建", "给.*建.*单",
+    "帮我建", "给我建", "给.*建.*单", "帮.*建.*单", "把.*建.*单",
     "生成工单", "下个工单", "开单",
     # ── 取消/删除/改单（实测缺口 diag116）──────────────────
     # 用户问「帮我取消已建单待处理状态客户」时，Agent **没有任何工具**
@@ -217,11 +224,38 @@ _INQUIRY_KEYWORDS = ["能不能", "可以吗", "该不该", "要不要", "是否
 
 _CID_RE = re.compile(r"\bC\d{4,}\b", re.IGNORECASE)
 
+# 「这三位 / 这几个 / 他们」这类**指代**表达。
+#
+# ⚠ 为什么必须单独识别（实测缺陷，用户报告）：
+#   用户看到列表后说「帮我把这三位建立工单」——
+#   问句里**一个客户编号都没有**（编号在上一条回答的卡片里），
+#   而旧实现只在问句里找 cid，找不到就 `return False, None, None`，
+#   于是**写意图根本没被识别**：不强制调 propose 工具、
+#   前端拿不到确认面板，用户只看到一个"未指定负责人"的单条提议。
+#
+#   实测（修复前）：
+#     "帮我把这三位建立工单"          → intent=False
+#     "把这三个客户建立工单"          → intent=False
+#     "给 C071081、C034525、C062858 建单" → intent=True 但**只抓到 C071081**
+#
+#   指代的**解析**不在这里做（这里拿不到会话上下文）——
+#   本函数只负责回答"这是不是一个写指令"，对象由调用方
+#   结合 context 补齐（见 detect_write_intent_multi）。
+_REFERENTIAL = re.compile(
+    r"(这|那)(几|两|三|四|五|六|七|八|九|十|\d+)?\s*(位|个|名|人|张|条|批)|"
+    r"他们|它们|她们|上述|上面(这|那)?(几|些|些个)?|刚才(那|这)?(几|些)?|"
+    r"这些|那些|全部|所有"
+)
+
 
 def detect_write_intent(question: str) -> tuple[bool, str | None, str | None]:
-    """识别"要求建单"的写意图。
+    """识别"要求建单"的写意图（保持向后兼容的单目标版本）。
 
     返回 (是否写意图, 客户编号, 负责人姓名或 None)。
+
+    ⚠ 新代码请用 `detect_write_intent_multi` —— 它能返回**全部**编号，
+      而本函数只返回第一个（历史行为，供既有调用方与测试使用）。
+      用户说"给这三个建单"时只取第一个是**错的**（实测缺陷）。
 
     ⚠ 询问性问法不算写意图：
       「C034525 要不要建单」是**咨询**，应让模型回答该不该建；
@@ -234,13 +268,33 @@ def detect_write_intent(question: str) -> tuple[bool, str | None, str | None]:
       "负责人写张思远"这样的用户明确要求。故此处在规则层一并抽出，
       作为兜底传给工具（见 graph.node_tools 的合并逻辑）。
     """
+    is_write, cids, assignee = detect_write_intent_multi(question)
+    return is_write, (cids[0] if cids else None), assignee
+
+
+def detect_write_intent_multi(question: str) -> tuple[bool, list[str], str | None]:
+    """识别写意图，返回**问句中出现的全部**客户编号。
+
+    返回 (是否写意图, 客户编号列表(大写,保序去重), 负责人姓名或 None)。
+
+    ⚠ 与单目标版本的关键差异（实测缺陷修复）：
+      用户说「给 C071081、C034525、C062858 建单」时，
+      旧实现用 `_CID_RE.search()` **只取第一个**，
+      于是"这三位"里只有一位进了待确认流程 ——
+      用户看到确认面板上只有一张单，以为系统丢了两个。
+      现改为 `findall` 全部返回。
+
+    ⚠ 指代（"这三位""他们"）只判断**是否为写意图**，不在此解析对象：
+      本函数拿不到会话上下文。调用方若拿到空 cids 但 is_write=True，
+      应结合 context 补齐（见 graph.node_agent 的处理）。
+    """
     if not question:
-        return False, None, None
+        return False, [], None
     q = question.strip()
 
     # 询问性问法 → 不是写指令
     if any(k in q for k in _INQUIRY_KEYWORDS):
-        return False, None, None
+        return False, [], None
 
     hit = False
     for kw in _WRITE_KEYWORDS:
@@ -248,11 +302,24 @@ def detect_write_intent(question: str) -> tuple[bool, str | None, str | None]:
             hit = True
             break
     if not hit:
-        return False, None, None
+        return False, [], None
 
-    m = _CID_RE.search(q)
-    cid = m.group(0).upper() if m else None
-    return True, cid, _extract_assignee(q)
+    # 全部编号（保序去重）—— 不再只取第一个
+    cids: list[str] = []
+    for m in _CID_RE.findall(q):
+        c = m.upper()
+        if c not in cids:
+            cids.append(c)
+
+    # ⚠ 没有显式编号但含指代（"这三位"）时，**仍然算写意图** ——
+    #   对象留给调用方用上下文补齐。旧实现直接返回 False，
+    #   导致整条强制提议链路不触发（这是用户报告的核心缺陷）。
+    #   注意：既无编号又无指代时返回 False（无法构造参数，
+    #   强行调用工具只会得到报错结果，见本模块顶部的设计取舍）。
+    if not cids and not _REFERENTIAL.search(q):
+        return False, [], None
+
+    return True, cids, _extract_assignee(q)
 
 
 # 负责人抽取：匹配「负责人(是|写|叫|填)?X」「派给X」「指派给X」「分配给X」

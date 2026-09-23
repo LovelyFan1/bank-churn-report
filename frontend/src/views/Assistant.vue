@@ -24,6 +24,7 @@ import api from '../api'
 import InfoTip from '../components/InfoTip.vue'
 import { AGENT_KEY_PREFIX, KEY_USER, agentKeyFor } from '../utils/userStorage'
 import { assignees as staffList, canAssign, loadAssignees, defaultAssignee } from '../utils/assignees'
+import { riskLabel } from '../utils/risk'
 
 /**
  * 会话持久化 —— 用户要求「切换窗口时会话不消失」。
@@ -308,16 +309,50 @@ async function send(text) {
     })
     // 更新上下文：后端返回的是**合并后的**新清单，直接替换
     if (data.context) agentContext.value = data.context
+
+    const pending = data.pending_action || null
+    // ── 批量提议自动展开为批量确认面板 ──────────────────────
+    //
+    // ⚠ 后端在"用户一次要求给多位客户建单"时会返回
+    //   action='create_work_order_batch' + items（见 tools.
+    //   propose_create_work_orders_batch）。这个形状与单条 pending
+    //   （payload）不同，若只渲染单条确认区，用户会看到
+    //   "负责人（未指定）"且**没有负责人下拉可选** —— 实测缺陷。
+    //
+    //   这里把它转成已有的批量面板（复用同一套 UI 与负责人下拉、
+    //   同一套 /agent/confirm-batch 提交），保证：
+    //     · 负责人可下拉选择（预填当前登录人）
+    //     · 一次能看到全部待建客户
+    const batchFromPending = (
+      pending && pending.action === 'create_work_order_batch'
+        ? {
+            open: true,
+            kind: 'create',
+            targets: (pending.items || []).map((it) => it.customer_id),
+            blocked: (pending.items || [])
+              .filter((it) => it.has_active_order)
+              .map((it) => it.customer_id),
+            items: pending.items || [],
+            assignee: defaultAssignee(),
+            running: false,
+            result: null,
+            error: '',
+          }
+        : null
+    )
+
     turns.value.push({
       role: 'agent',
       answer: data.answer || { kind: 'text', text: data.text || '' },
       basis: data.basis,
       toolCalls: data.tool_calls || [],
       verifyFailed: data.verify_failed || [],
-      pending: data.pending_action || null,
+      // 批量提议不放进单条 pending（否则会出现两个确认入口，
+      // 用户不知道点哪个）；它由 batch 面板承载
+      pending: batchFromPending ? null : pending,
       showEvidence: false,
       // 批量确认面板状态（方案 A：弹面板 → 确认 → 一次性提交）
-      batch: null,          // { open, targets, assignee, running, result }
+      batch: batchFromPending,   // { open, targets, items, assignee, running, result }
       confirming: false,
       confirmed: false,
       cancelled: false,
@@ -715,7 +750,21 @@ function warnClass(level) {
                 <p class="batch-danger">⚠ 删除不可恢复，工单将从系统中移除。</p>
               </template>
               <template v-else>
-                <ul class="batch-list">
+                <!-- 有 items（来自 Agent 批量提议）时显示客户卡片，
+                     让用户看清"到底要给谁建单"；否则退回纯编号列表 -->
+                <ul v-if="t.batch.items?.length" class="batch-list batch-items">
+                  <li v-for="it in t.batch.items" :key="it.customer_id"
+                      :class="{ 'is-blocked': it.has_active_order }">
+                    <span class="bi-cid">{{ it.customer_id }}</span>
+                    <span class="bi-name">{{ it.customer_name }}</span>
+                    <span v-if="it.risk_level" class="bi-tag">{{ riskLabel(it.risk_level) }}</span>
+                    <span v-if="it.balance != null" class="bi-money">
+                      ¥{{ Math.round(it.balance).toLocaleString() }}
+                    </span>
+                    <span v-if="it.has_active_order" class="bi-blocked">已有进行中工单</span>
+                  </li>
+                </ul>
+                <ul v-else class="batch-list">
                   <li v-for="cid in t.batch.targets" :key="cid">{{ cid }}</li>
                 </ul>
                 <p v-if="t.batch.blocked.length" class="batch-skip">
@@ -730,7 +779,16 @@ function warnClass(level) {
                       {{ a.display_name }}（{{ a.role_label }}）
                     </option>
                   </select>
-                  <input v-else v-model="t.batch.assignee" readonly />
+                  <!-- ⚠ 名单拉取失败时的兜底。若这里显示为空且不可选，
+                       用户会认为"系统不给选负责人"，实际是接口没回来。
+                       故明确提示原因，而不是给一个静默的只读框。 -->
+                  <input v-else v-model="t.batch.assignee" readonly
+                         :title="canAssign
+                           ? '行员名单加载中或获取失败，将按当前登录人建单'
+                           : '当前角色无派单权限'" />
+                  <p v-if="!staffList.length" class="assignee-hint">
+                    {{ canAssign ? '⏳ 行员名单加载中…' : '当前角色不能指派负责人' }}
+                  </p>
                 </div>
               </template>
 
@@ -977,12 +1035,31 @@ function warnClass(level) {
 .batch-list { margin: 0 0 8px; padding-left: 18px; max-height: 150px; overflow-y: auto; }
 .batch-list li { font-size: 12px; color: #5b6b85; line-height: 1.8;
                  font-family: ui-monospace, monospace; }
+
+/* 批量提议的客户卡片列表 —— 让"要给谁建单"看得见（不是只有编号） */
+.batch-items { list-style: none; padding-left: 0; max-height: 210px; }
+.batch-items li {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 5px 8px; border-radius: 6px; margin-bottom: 3px;
+  background: #f8fafc; font-family: inherit;
+}
+.batch-items li.is-blocked { background: #fdf6e3; }
+.bi-cid { font-family: ui-monospace, monospace; font-size: 11px; color: #8b9ab5; }
+.bi-name { font-size: 12.5px; font-weight: 600; color: #17335c; }
+.bi-tag { font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
+          background: #eef3fb; color: #1d4ed8; }
+.bi-money { font-size: 11.5px; color: #0f766e; font-variant-numeric: tabular-nums; }
+.bi-blocked { font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
+              background: #fdecec; color: #b45309; margin-left: auto; }
+
 .batch-skip { font-size: 11.5px; color: #b45309; background: #fdf6e3;
               border-radius: 6px; padding: 5px 9px; margin: 0 0 9px; }
 .batch-assignee { margin-bottom: 10px; }
 .batch-assignee label { display: block; font-size: 11px; color: #8b9ab5; margin-bottom: 4px; }
 .batch-assignee input { width: 100%; max-width: 240px; font-size: 12.5px; padding: 6px 10px;
                         border: 1px solid #e5e9f0; border-radius: 6px; color: #1f2937; }
+/* 名单加载中/无权限的说明 —— 避免用户以为"系统不给选负责人" */
+.assignee-hint { font-size: 10.5px; color: #8b9ab5; margin: 4px 0 0; }
 .batch-btns { display: flex; gap: 8px; align-items: center; }
 .batch-result .br-line { font-size: 12.5px; font-weight: 600; margin: 8px 0 4px; }
 .br-line.ok { color: #0f766e; }

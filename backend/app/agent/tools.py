@@ -350,6 +350,10 @@ def propose_create_work_order(customer_id: str,
     note 省略时由系统按该客户实时数据自动生成建议理由
     （含风险画像、命中因素、值不值得救、建议动作）。
 
+    ⚠ 一次只能提一位。要给**多位**客户建单（用户说"给这三位建单"），
+      请改用 propose_create_work_orders_batch —— 否则会像实测缺陷那样
+      只提议一位，用户以为系统丢了两张单。
+
     ⚠ 这是**写操作**，必须经用户确认。不要在回答里声称"已经建好了"。
     """
     # 先查客户，确认存在并取回建单所需字段 —— 避免开出无法执行的空单
@@ -381,6 +385,88 @@ def propose_create_work_order(customer_id: str,
         "summary": f"为客户 {payload['customer_id']}（{payload['customer_name']}）创建挽留工单"
                    + (f"，负责人 {assignee}" if assignee else ""),
         "payload": payload,
+        "requires_confirmation": True,
+    }
+
+
+def propose_create_work_orders_batch(customer_ids: list[str],
+                                      assignee: str = "") -> dict:
+    """**提议**給**多位**客户创建挽留工单（不会立即执行）。
+
+    customer_ids: 客户编号列表，如 ["C071081","C034525","C062858"]。
+                  最多 20 位（与后端批量建单接口的上限一致）。
+
+    用这个回答「帮我把这三位建单」「给这几个客户建单」「把这批人派给小李」
+    —— 即用户**一次要求给多位客户建单**的情形。
+
+    ⚠ 为什么必须有这个工具（实测缺陷，用户报告）：
+      用户看到列表后说「帮我把这三位建立工单」，旧实现只能提议**一位**，
+      确认面板上只跳出一张单，用户以为系统丢了另外两张。
+      根因是 propose_create_work_order 的签名只接受单个 customer_id，
+      模型即使想提三位也无处安放。
+
+    ⚠ 返回的 payload 是**列表**（items），与单数版本结构不同。
+      前端据此渲染"批量确认面板"（含负责人下拉），
+      确认后调 POST /api/work-orders/batch 一次提交。
+
+    ⚠ 这是**写操作**，必须经用户确认。不要在回答里声称"已经建好了"。
+    """
+    ids = [str(c).strip().upper() for c in (customer_ids or []) if str(c).strip()]
+    # 保序去重
+    seen: set[str] = set()
+    ids = [c for c in ids if not (c in seen or seen.add(c))]
+    if not ids:
+        return {"__error__": "customer_ids 不能为空"}
+    ids = ids[:20]
+
+    items: list[dict] = []
+    failed: list[dict] = []
+    for cid in ids:
+        try:
+            d = _get(f"/api/customers/{urllib.parse.quote(cid)}")
+        except Exception as e:
+            failed.append({"customer_id": cid, "reason": f"查询失败：{e}"})
+            continue
+        if not d or not d.get("customer_id"):
+            failed.append({"customer_id": cid, "reason": "客户不存在"})
+            continue
+        item = {
+            "customer_id": d.get("customer_id"),
+            "customer_name": d.get("surname"),
+            "geography": d.get("geography"),
+            "risk_level": d.get("risk_level"),
+            "probability": d.get("probability"),
+            "balance": d.get("balance"),
+            "risk_factors": d.get("risk_factors") or [],
+            "strategy": d.get("action") or d.get("strategy") or "",
+            "assignee": assignee or "",
+            "note": "",
+            "channel": d.get("channel"),
+            "value_tier_snapshot": d.get("value_tier"),
+            "expected_value_snapshot": d.get("expected_value"),
+            # 已有进行中工单的标记出来 —— 前端要显示"这张会被跳过"，
+            # 而不是等提交后收到 409 才解释
+            "has_active_order": bool(d.get("has_active_order")),
+        }
+        try:
+            sn = _get(f"/api/customers/{urllib.parse.quote(cid)}/suggested-note")
+            item["note"] = sn.get("note", "")
+        except Exception:
+            pass   # 理由生成失败不阻断提议
+        items.append(item)
+
+    if not items:
+        return {"__error__": "没有任何可建单的客户："
+                             + "；".join(f"{f['customer_id']}({f['reason']})"
+                                        for f in failed[:3])}
+
+    return {
+        "__pending_action__": True,
+        "action": "create_work_order_batch",
+        "summary": f"为 {len(items)} 位客户批量创建挽留工单"
+                   + (f"，负责人 {assignee}" if assignee else ""),
+        "items": items,
+        "failed": failed,
         "requires_confirmation": True,
     }
 
@@ -506,8 +592,14 @@ TOOL_SPECS = {
     "propose_create_work_order": {
         "fn": propose_create_work_order,
         "write": True,
-        "label": "提议给某个客户创建挽留工单（不会立即执行）",
+        "label": "提议给**某一位**客户创建挽留工单（不会立即执行）",
         "description": propose_create_work_order.__doc__.strip().split("\n")[0],
+    },
+    "propose_create_work_orders_batch": {
+        "fn": propose_create_work_orders_batch,
+        "write": True,
+        "label": "提议给**多位**客户批量创建挽留工单（不会立即执行）",
+        "description": propose_create_work_orders_batch.__doc__.strip().split("\n")[0],
     },
     "propose_update_work_order": {
         "fn": propose_update_work_order,

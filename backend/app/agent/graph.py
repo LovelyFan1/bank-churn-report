@@ -240,22 +240,61 @@ def node_agent(state: AgentState) -> dict:
     #   修法与 Guard 同理：**不要求模型自觉，而是用工具层强制**。
     #   bind_tools 的 tool_choice 可以指定必须调用某个工具，
     #   这样"建单必须经过 propose 流程"就是协议保证，不是提示词祈祷。
-    write_intent, cid, assignee = guard_rules.detect_write_intent(state["question"])
+    write_intent, cids, assignee = guard_rules.detect_write_intent_multi(
+        state["question"])
+
+    # ⚠ 指代解析（"这三位"）：问句里没有编号时，从**会话上下文**取对象。
+    #
+    #   实测缺陷（用户报告）：用户看到列表后说「帮我把这三位建立工单」，
+    #   问句里一个编号都没有（编号在上一条回答的卡片里）。
+    #   旧实现因此彻底不识别写意图 —— 不强制提议工具、前端拿不到确认面板，
+    #   用户只看到一条"未指定负责人"的单条提议。
+    #
+    #   修法：上下文里已有那批客户（context.py 在每轮回答后写入），
+    #   直接取来作为目标。**只取上下文的 customers**，不看 orders ——
+    #   建单的对象只能是客户。
+    #
+    #   ⚠ 必须限定在上下文集内（而不是全库搜索），否则"这三位"可能
+    #     被解析成任意客户 —— 那是越权，也会让用户莫名其妙。
+    if write_intent and not cids:
+        ctx_customers = (state.get("context_in") or {}).get("customers") or []
+        for c in ctx_customers:
+            cid = c.get("id")
+            if cid:
+                cids.append(str(cid).upper())
+        if cids:
+            logger.info("agent: 写意图含指代，从上下文解析出 %d 位客户：%s",
+                        len(cids), cids)
+
     write_tools_done = {r["name"] for r in made}
-    if (write_intent and cid
-            and "propose_create_work_order" not in write_tools_done):
-        logger.info("agent: 识别到写意图，强制调用 propose_create_work_order cid=%s", cid)
+    # ── 强制提议：按目标数量选工具 ──────────────────────────
+    #
+    # ⚠ 一位用 propose_create_work_order，多位用 batch 版本。
+    #   旧实现只有单数工具 + 只抓第一个 cid，导致用户说"这三位"时
+    #   只提议一位（实测缺陷）。现在按 len(cids) 分流。
+    _PROPOSE_SINGLE = "propose_create_work_order"
+    _PROPOSE_BATCH = "propose_create_work_orders_batch"
+    propose_name = _PROPOSE_BATCH if len(cids) > 1 else _PROPOSE_SINGLE
+
+    if (write_intent and cids and propose_name not in write_tools_done):
+        logger.info("agent: 识别到写意图，强制调用 %s cids=%s",
+                    propose_name, cids)
         # 规则层已抽出负责人时，用提示词明确告知 —— 强制 tool_choice 时
         # 模型没有机会做复杂推理，必须把参数直接喂给它
+        hint = ""
         if assignee:
-            msgs.append(HumanMessage(content=(
-                f"注意：用户要求的负责人是「{assignee}」。"
-                f"调用 propose_create_work_order 时 assignee 参数必须填「{assignee}」。"
-            )))
+            hint = (f"注意：用户要求的负责人是「{assignee}」。"
+                    f"调用 {propose_name} 时 assignee 参数必须填「{assignee}」。")
+        # 多位时把编号**逐个列出**，避免模型自行猜测或漏填
+        if len(cids) > 1:
+            hint += (f"\n用户指定的客户编号是：{', '.join(cids)}。"
+                     f"必须全部放进 customer_ids 参数，一个都不能少。")
+        if hint:
+            msgs.append(HumanMessage(content=hint))
         model = llm.router_llm().bind_tools(
             _tool_schemas(),
             tool_choice={"type": "function",
-                         "function": {"name": "propose_create_work_order"}},
+                         "function": {"name": propose_name}},
         )
     elif state.get("force_write_tool"):
         # ── 强制调用某个写工具（见 route_after_tools 的说明）────────
@@ -318,7 +357,8 @@ def node_force_write(state: AgentState) -> dict:
 
 
 # 哪些工具的参数是"客户编号"，需要走输出侧白名单
-_CID_TOOLS = {"get_customer_risk", "propose_create_work_order"}
+_CID_TOOLS = {"get_customer_risk", "propose_create_work_order",
+              "propose_create_work_orders_batch"}
 # 哪些工具的参数是"工单编号"
 _OID_TOOLS = {"propose_update_work_order", "propose_delete_work_order"}
 
@@ -350,13 +390,23 @@ def _scope_error(state: AgentState, name: str, args: dict,
     merged = list(state.get("tool_results") or []) + list(results_so_far or [])
 
     if name in _CID_TOOLS:
-        cid = args.get("customer_id")
-        if not cid:
+        # ⚠ 两种参数名都要处理：单数工具用 customer_id，
+        #   批量工具用 customer_ids（列表）。
+        #   只判单数会让批量工具**完全绕过白名单校验** ——
+        #   模型（或被注入的提示）可以借此给任意客户建单，是越权漏洞。
+        raw = args.get("customer_ids")
+        if raw is None:
+            raw = args.get("customer_id")
+        if raw is None or raw == "" or raw == []:
             return None            # 缺参数由工具自身报错，不在此处代判
+
+        cand = raw if isinstance(raw, list) else [raw]
         allowed = ctx_mod.allowed_customer_ids(ctx, question, merged)
-        if str(cid).upper() not in allowed:
-            logger.warning("agent: 编号越界拦截 %s cid=%s", name, cid)
-            return ctx_mod.out_of_scope_msg(cid, allowed)
+        bad = [str(c).upper() for c in cand
+               if c and str(c).upper() not in allowed]
+        if bad:
+            logger.warning("agent: 编号越界拦截 %s cid(s)=%s", name, bad)
+            return ctx_mod.out_of_scope_msg(bad[0], allowed)
 
     elif name in _OID_TOOLS:
         oid = args.get("order_id")
@@ -473,11 +523,23 @@ def node_synthesis(state: AgentState) -> dict:
     #   却仍没有 pending_action，就**绕过 LLM** 直接调用提议工具。
     #   这样"建单必须经过确认流程"成为系统的硬保证。
     if pending is None:
-        w_intent, cid, assignee = guard_rules.detect_write_intent(state["question"])
-        if w_intent and cid:
-            logger.warning("agent: LLM 未产出待确认动作，启用确定性兜底 cid=%s", cid)
-            r = tools.call_tool("propose_create_work_order",
-                                {"customer_id": cid, "assignee": assignee or ""})
+        w_intent, cids, assignee = guard_rules.detect_write_intent_multi(
+            state["question"])
+        # 指代同样从上下文解析（与 node_agent 里的逻辑一致）
+        if w_intent and not cids:
+            for c in (state.get("context_in") or {}).get("customers") or []:
+                if c.get("id"):
+                    cids.append(str(c["id"]).upper())
+        if w_intent and cids:
+            logger.warning("agent: LLM 未产出待确认动作，启用确定性兜底 cids=%s", cids)
+            if len(cids) > 1:
+                r = tools.call_tool("propose_create_work_orders_batch",
+                                    {"customer_ids": cids,
+                                     "assignee": assignee or ""})
+            else:
+                r = tools.call_tool("propose_create_work_order",
+                                    {"customer_id": cids[0],
+                                     "assignee": assignee or ""})
             if r.get("ok"):
                 pending = r["result"]
             else:
@@ -1022,8 +1084,10 @@ def _tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "propose_create_work_order",
-                "description": "**提议**给某客户创建挽留工单（不会立即执行，"
-                               "只生成待用户确认的动作）。",
+                "description": "**提议**给**某一位**客户创建挽留工单"
+                               "（不会立即执行，只生成待用户确认的动作）。"
+                               "一次只能提一位；要给多位请用 "
+                               "propose_create_work_orders_batch。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1034,6 +1098,31 @@ def _tool_schemas() -> list[dict]:
                                  "description": "备注，省略时系统自动生成建议理由"},
                     },
                     "required": ["customer_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_create_work_orders_batch",
+                "description": "**提议**给**多位**客户批量创建挽留工单"
+                               "（不会立即执行，只生成待用户确认的动作）。"
+                               "用户说「把这三位建单」「给这几个客户建单」"
+                               "或一次点名多位客户时用它 —— "
+                               "逐个调用单数版本只会弹出一张确认单。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "customer_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "客户编号列表，如 "
+                                           '["C071081","C034525"]，最多 20 位',
+                        },
+                        "assignee": {"type": "string",
+                                     "description": "统一负责人姓名，可省略"},
+                    },
+                    "required": ["customer_ids"],
                 },
             },
         },
