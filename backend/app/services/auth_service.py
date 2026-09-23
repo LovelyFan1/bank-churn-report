@@ -329,6 +329,25 @@ PERM_ORDER_WRITE = "order:write"   # 建单 / 改任意单 / 删单（派单方�
 #   数据级限制（只能碰自己的单）无法用权限点表达，故在 router 里判。
 PERM_ORDER_ASSIGNED = "order:assigned"
 PERM_AGENT_USE = "agent:use"       # 使用智能助手
+# 查看**全行视角**的分析视图：工作台大盘、客户名单、干预策略、数据洞察、
+# 模型效果。
+#
+# ⚠ 为什么需要这个权限点，而不是靠 data:view 或 customer:identify 推：
+#
+#   客户专员（staff）与只读分析（viewer）在这两件事上**正好相反**：
+#
+#     viewer：看得到全行分布，看不到客户是谁（无 customer:identify）
+#     staff ：看得到客户是谁（要打电话），但**不需要**全行名单与策略分析
+#
+#   两者都与 data:view 相符，故 data:view 无法区分他们。
+#   customer:identify 更不行 —— staff 必须有它，否则工单里看不到姓名，
+#   连电话都打不了，整个角色就废了。
+#
+#   所以「能看全行」是一件**独立的授权**，需要自己的权限点。
+#
+# ⚠ 为什么 viewer 也给 insight:view：他的岗位就是"看分布与趋势来核对
+#   风险敞口"（见 privacy.py 的设计说明），拿掉它 viewer 就无事可做。
+PERM_INSIGHT_VIEW = "insight:view"
 PERM_USER_ADMIN = "user:admin"     # 用户管理
 PERM_AUDIT_VIEW = "audit:view"     # 查看审计日志
 # 重算力/全局性操作：模型重训、聚类标签落库。
@@ -339,23 +358,27 @@ PERM_AUDIT_VIEW = "audit:view"     # 查看审计日志
 PERM_MODEL_TRAIN = "model:train"
 
 PERMISSIONS = {
-    "admin": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_WRITE,
-              PERM_ORDER_ASSIGNED, PERM_AGENT_USE, PERM_USER_ADMIN,
-              PERM_AUDIT_VIEW, PERM_MODEL_TRAIN],
-    "manager": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_WRITE,
-                PERM_ORDER_ASSIGNED, PERM_AGENT_USE],
+    "admin": [PERM_VIEW, PERM_INSIGHT_VIEW, PERM_CUSTOMER_IDENTIFY,
+              PERM_ORDER_WRITE, PERM_ORDER_ASSIGNED, PERM_AGENT_USE,
+              PERM_USER_ADMIN, PERM_AUDIT_VIEW, PERM_MODEL_TRAIN],
+    "manager": [PERM_VIEW, PERM_INSIGHT_VIEW, PERM_CUSTOMER_IDENTIFY,
+                PERM_ORDER_WRITE, PERM_ORDER_ASSIGNED, PERM_AGENT_USE],
     # staff —— 基层执行岗（柜员 / 外呼专员 / 客户经理助理）。
     #
-    # ⚠ 关键设计：给 `customer:identify`（看得到客户姓名与余额）但**不给**
-    #   `order:write`（不能建单、删单、改别人的单）。
+    # ⚠ 关键设计：给 `customer:identify`（看得到客户姓名与余额）但
+    #   **不给** `insight:view`（看不到全行名单、大盘、策略分析）。
     #
     #   为什么必须给 identify：他要给客户打电话，看不到姓名和余额就没法工作。
-    #   为什么不能给 write：派单权在经理手里，给了就破坏职责分离。
-    #   他能做的只有一件 —— 推进**指派给自己**的工单，故给 order:assigned，
-    #   并在 work_orders 路由里用 `_assert_can_touch()` 做数据级限制。
+    #   为什么不给 insight:view：他是**执行岗**，工作流是
+    #     "登录 → 我的工单 → 打电话 → 回填结果"，
+    #     给他 96,418 人的全行名单与策略矩阵既用不上，也不符合最小权限。
+    #     真银行里柜员/坐席的终端打开就是"我的待办"，没有全行客户检索。
+    #
+    #   他也没有 order:write（派单权在经理），只能推进指派给自己的工单，
+    #   故给 order:assigned，并在 work_orders 路由做数据级限制。
     "staff": [PERM_VIEW, PERM_CUSTOMER_IDENTIFY, PERM_ORDER_ASSIGNED],
     # viewer 只有聚合视图权限 —— 看得到"分布与趋势"，看不到"具体是谁"
-    "viewer": [PERM_VIEW],
+    "viewer": [PERM_VIEW, PERM_INSIGHT_VIEW],
 }
 
 ROLE_LABELS = {

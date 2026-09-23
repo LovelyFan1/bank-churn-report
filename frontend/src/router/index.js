@@ -23,7 +23,10 @@ const routes = [
     path: '/customers',
     name: 'CustomerManagement',
     component: () => import('../views/CustomerManagement.vue'),
-    meta: { title: '客户管理', icon: 'customers' }
+    // ⚠ permission: 'insight:view' —— 客户专员（staff）没有全行洞察授权，
+    //   直接输网址进来会被守卫弹回。他在这个页面看到的所有按钮
+    //   （建单 / 批量派单 / 导出）都会 403，不如明确拒绝。
+    meta: { title: '客户管理', icon: 'customers', permission: 'insight:view' }
   },
   {
     // 客户详情 —— 从列表点行进入，看 SHAP 归因 / 推荐动作 / 历史工单。
@@ -31,31 +34,31 @@ const routes = [
     path: '/customers/:id',
     name: 'CustomerDetail',
     component: () => import('../views/CustomerDetail.vue'),
-    meta: { title: '客户详情', hidden: true }
+    meta: { title: '客户详情', hidden: true, permission: 'insight:view' }
   },
   {
     path: '/eda',
     name: 'EdaAnalysis',
     component: () => import('../views/EdaAnalysis.vue'),
-    meta: { title: 'EDA分析', icon: 'eda' }
+    meta: { title: 'EDA分析', icon: 'eda', permission: 'insight:view' }
   },
   {
     path: '/clustering',
     name: 'CustomerClustering',
     component: () => import('../views/CustomerClustering.vue'),
-    meta: { title: '客户分群', icon: 'clustering' }
+    meta: { title: '客户分群', icon: 'clustering', permission: 'insight:view' }
   },
   {
     path: '/models',
     name: 'ModelComparison',
     component: () => import('../views/ModelComparison.vue'),
-    meta: { title: '模型对比', icon: 'models' }
+    meta: { title: '模型对比', icon: 'models', permission: 'insight:view' }
   },
   {
     path: '/intervention',
     name: 'InterventionStrategy',
     component: () => import('../views/InterventionStrategy.vue'),
-    meta: { title: '干预策略', icon: 'intervention' }
+    meta: { title: '干预策略', icon: 'intervention', permission: 'insight:view' }
   },
   {
     path: '/work-orders',
@@ -131,7 +134,17 @@ router.beforeEach((to) => {
   // 页面级权限：meta.permission 声明的权限点必须命中
   const need = to.meta?.permission
   if (need && !(user?.permissions || []).includes(need)) {
-    return { path: '/dashboard', query: { denied: String(need) } }
+    // ⚠ 不能无条件弹回 /dashboard —— 工作台本身也要求 insight:view，
+    //   客户专员（staff）没有该权限，会被**反复弹回**（弹回的目标又一次
+    //   触发本守卫），表现为页面卡住或白屏。
+    //   故回退目标必须是"该角色一定有权访问的落地页"：
+    //   有 insight:view → 工作台；否则 → 挽留工单（staff 的主场，
+    //   后端按数据级授权只返回他的单）。
+    const perms = user?.permissions || []
+    const home = perms.includes('insight:view') ? '/dashboard' : '/work-orders'
+    // 已经在目标页了就不再重定向，彻底断开潜在的循环
+    if (to.path === home) return true
+    return { path: home, query: { denied: String(need) } }
   }
 
   return true

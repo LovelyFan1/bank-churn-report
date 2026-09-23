@@ -5,6 +5,12 @@ import api, { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import InfoTip from '../components/InfoTip.vue'
 import { riskLabel, riskBadgeClass, probColor, fmtPercent, channelLabel } from '../utils/risk'
+import { useAuthStore } from '../stores/auth'
+
+// 权限判断 —— 用于隐藏指向受限页面的入口（详见模板「查看全部」处的说明）。
+// ⚠ 判据来自后端下发的 permissions，前端不自己写角色映射。
+const auth = useAuthStore()
+const can = (perm) => (auth.permissions || []).includes(perm)
 
 // 页面级请求作用域：本页一次并发 7~9 个请求（全站最多），
 // 离开页面时自动取消在途请求，避免占用连接槽拖慢下一页。
@@ -538,12 +544,18 @@ function showOrderToast(msg) {
               优先干预 Top 10 <span class="badge">按期望价值排序</span>
               <span class="info-tip" title="期望价值 = 流失概率 × 余额。高风险客户概率趋同，此时余额决定干预优先级。">ⓘ</span>
             </span>
-            <router-link to="/customers" class="view-all-link">查看全部 →</router-link>
+            <!-- ⚠ 「查看全部」指向客户名单页，而该页要求 insight:view。
+                 客户专员（staff）也能看到本页（脱敏版），若留着这个链接，
+                 他点进去会被守卫弹回 —— 表现为"点了一下又回来了"。
+                 故按权限显隐：没权限就不显示。 -->
+            <router-link v-if="can('insight:view')" to="/customers"
+                         class="view-all-link">查看全部 →</router-link>
           </div>
           <!-- 错误态：明确告知原因，不留空表 -->
           <div v-if="topError" class="dash-error">
             <span>⚠ {{ topError }}</span>
-            <router-link to="/models" class="dash-error-link">去训练模型</router-link>
+            <router-link v-if="can('insight:view')" to="/models"
+                         class="dash-error-link">去训练模型</router-link>
           </div>
           <div v-else-if="!topCustomers.length" class="dash-empty">
             暂无符合条件的客户

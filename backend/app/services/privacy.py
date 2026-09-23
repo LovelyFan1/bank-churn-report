@@ -67,6 +67,57 @@ def can_identify(user: User | None) -> bool:
                          auth.PERM_CUSTOMER_IDENTIFY)
 
 
+# ── 工作台（全行大盘）专用判据 ────────────────────────────
+#
+# ⚠ 为什么工作台不能直接用 can_identify：
+#
+#   这两类角色的能力**正好相反**，只用 identify 会把 staff 放进来：
+#
+#     viewer  看得到全行分布，看不到客户是谁   identify=False → 会脱敏 ✅
+#     staff   看得到客户是谁（要打电话），    identify=True  → **不脱敏** ❌
+#             但不需要全行名单与大盘
+#
+#   staff 若在工作台看到"全行 Top10 客户姓名 + 余额"，等于绕过了
+#   "他只看得到派给自己的单"这条数据级限制 —— 名单页与策略页都对他关了，
+#   大盘却把同样的信息又递了出来，限制就白做了。
+#
+#   故工作台要求**两者同时具备**：既知道客户是谁（identify），
+#   又有全行洞察授权（insight:view）。
+#
+#   结果：admin / manager 正常；viewer 脱敏（岗位需要）；staff 也脱敏
+#   （他不是来看大盘的）。
+
+def can_view_whole_book(user: User | None) -> bool:
+    """能否在工作台看到**全行**的具名客户明细。"""
+    if user is None:
+        return False
+    role = getattr(user, "role", "") or ""
+    return (auth.has_perm(role, auth.PERM_CUSTOMER_IDENTIFY)
+            and auth.has_perm(role, auth.PERM_INSIGHT_VIEW))
+
+
+# 工作台脱敏时给前端的说明 —— 必须写清"为什么看不到"。
+# ⚠ 与 MASK_NOTICE 分开：staff 被脱敏的原因不是"权限不够"（他有
+#   identify 权限），而是"这个视图不是他的岗位职责"。用同一句话会
+#   让他困惑"我明明能看客户姓名，为什么这里不行"。
+MASK_NOTICE_SCOPED = (
+    "当前角色（客户专员）仅处理指派给自己的工单；"
+    "全行客户名单与策略分析需「客户经理」及以上权限。"
+)
+
+
+def mask_notice_for(user: User | None) -> str:
+    """按角色挑合适的脱敏说明文案。
+
+    staff 与 viewer 都会看到脱敏的工作台，但**原因不同**，
+    文案必须区分，否则会给出误导性的解释。
+    """
+    role = getattr(user, "role", "") or ""
+    if role == "staff":
+        return MASK_NOTICE_SCOPED
+    return MASK_NOTICE
+
+
 def mask_customer(d: dict, seq: int | None = None) -> dict:
     """把一个客户记录脱敏成"匿名条目"。
 

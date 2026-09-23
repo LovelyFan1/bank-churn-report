@@ -11,14 +11,27 @@ const idleWarn = ref(false)         // 即将因无操作退出
 
 // ── 一级导航：业务工作流（看大盘 → 找客户 → 办工单 → 定策略 → 智能助手）──
 //
-// ⚠ 智能助手带 permission: 'agent:use' —— 客户专员（staff）没有该权限，
-//   导航里必须过滤掉。否则他点进去会被后端 403，界面表现为"页面能开、
-//   一发消息就报错"，比直接不显示更让人困惑。
+// ⚠ 除「挽留工单」外，各项都带 permission —— 客户专员（staff）只看到
+//   工作台与挽留工单，其余全部过滤掉。理由有两层：
+//
+//   1) **体验**：staff 没有 order:write / agent:use，进了客户名单或策略页
+//      会看到一堆按不动的按钮（"＋ 创建工单""批量派单""⬇ 导出"全是 403），
+//      比直接不显示更让人以为系统坏了。
+//   2) **最小权限**：他是执行岗，工作流是"登录 → 我的工单 → 打电话 →
+//      回填结果"。全行客户名单与策略矩阵对他既用不上，也不该给。
+//
+// ⚠ 工作台**不带 permission**（staff 也要看）：后端对 staff 返回的是
+//   **脱敏**版本 —— 客户名替换为"客户 #N"、去掉流失概率/余额/风险因素，
+//   但概览与风险分布这些聚合数字照常给（那是他了解总体情况需要的）。
+//   详见 backend/app/services/privacy.py 的 can_view_whole_book。
+//
+// ⚠ 「挽留工单」也不带 permission —— 它正是 staff 的主场，
+//   后端已按数据级授权只返回指派给他的单。
 const navItems = [
   { path: '/dashboard', title: '工作台', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4' },
-  { path: '/customers', title: '客户名单', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
+  { path: '/customers', title: '客户名单', permission: 'insight:view', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
   { path: '/work-orders', title: '挽留工单', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
-  { path: '/intervention', title: '干预策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+  { path: '/intervention', title: '干预策略', permission: 'insight:view', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
   { path: '/assistant', title: '智能助手', badge: 'Beta', permission: 'agent:use', icon: 'M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-4 4v-4z' },
 ]
 
@@ -27,16 +40,19 @@ const visibleNav = computed(() =>
   navItems.filter(it => !it.permission || auth.can(it.permission)))
 
 // ── 二级导航：系统管理（技术与分析工具，非日常业务入口）──
-// 审计项带 permission —— 非管理员会被过滤掉（见 visibleAdmin）
+// ⚠ 前三个带 insight:view —— 客户专员（staff）不该看到分析类页面；
+//   审计项带 audit:view，仅管理员。
 const adminNavItems = [
-  { path: '/clustering', title: '客群洞察', icon: 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z' },
-  { path: '/eda', title: '数据洞察', icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
-  { path: '/models', title: '模型效果', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
+  { path: '/clustering', title: '客群洞察', permission: 'insight:view', icon: 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z' },
+  { path: '/eda', title: '数据洞察', permission: 'insight:view', icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
+  { path: '/models', title: '模型效果', permission: 'insight:view', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
   { path: '/audit', title: '操作审计', permission: 'audit:view', icon: 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z' },
 ]
 
 // ⚠ 按权限过滤导航项 —— 只读用户不该看到「操作审计」然后点进去被弹回。
 //   判据来自后端下发的 permissions，前端不自己写角色映射。
+//   客户专员（staff）在「系统管理」分组下没有任何可看的项，
+//   故该分组会整体隐藏（见模板里的 v-if="visibleAdmin.length"）。
 const visibleAdmin = computed(() =>
   adminNavItems.filter(it => !it.permission || auth.can(it.permission)))
 
@@ -180,11 +196,16 @@ function stayActive() {
           </transition>
         </div>
 
-        <!-- 分隔线 + 二级：系统管理 -->
-        <div v-if="!collapsed" class="nav-divider">
-          <span class="nav-divider-text">系统管理</span>
-        </div>
-        <div v-else class="nav-divider-collapsed"></div>
+        <!-- 分隔线 + 二级：系统管理
+             ⚠ 整组都要 v-if="visibleAdmin.length"：客户专员（staff）在这组
+               下没有任何可看的项，若只隐藏条目而留下「系统管理」标题，
+               侧边栏会出现一个**下面什么都没有的分组标题** —— 看起来像加载失败。 -->
+        <template v-if="visibleAdmin.length">
+          <div v-if="!collapsed" class="nav-divider">
+            <span class="nav-divider-text">系统管理</span>
+          </div>
+          <div v-else class="nav-divider-collapsed"></div>
+        </template>
 
         <div
           v-for="item in visibleAdmin"

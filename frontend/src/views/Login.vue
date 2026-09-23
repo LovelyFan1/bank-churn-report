@@ -145,9 +145,25 @@ async function submitTotp() {
 }
 
 function afterLogin() {
-  // 登录后回到用户原本想去的页面（被守卫拦下时会带 redirect 参数）
-  const to = route.query.redirect || '/dashboard'
-  router.replace(String(to))
+  // 登录后回到用户原本想去的页面（被守卫拦下时会带 redirect 参数）。
+  //
+  // ⚠ 但要先校验目标页**该角色是否真能访问**：staff 若带着
+  //   redirect=/customers 登录（比如从收藏夹点进来被拦），
+  //   直接 replace 过去会被路由守卫再弹一次 —— 用户看到"登录后又跳走"。
+  //   故这里用与守卫同一套判据先筛一遍，不能去就回落到角色落地页。
+  // ⚠ auth.permissions 是 Pinia 的 computed ref，在 script 里必须取 .value
+  //   （模板里会自动解包，容易在迁移到 script 时漏掉 —— 漏了会得到
+  //    一个 ref 对象，`.includes` 恒为 undefined，判断静默失效）。
+  const perms = auth.permissions?.value || auth.user?.permissions || []
+  const home = perms.includes('insight:view') ? '/dashboard' : '/work-orders'
+  const want = String(route.query.redirect || '')
+
+  // 受限页面前缀：这些页都要求 insight:view
+  const GATED = ['/customers', '/intervention', '/eda', '/clustering', '/models']
+  const blocked = GATED.some((p) => want === p || want.startsWith(p + '/'))
+  const to = (!want || blocked) ? home : want
+
+  router.replace(to)
 }
 
 function back() {

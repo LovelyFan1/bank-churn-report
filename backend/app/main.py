@@ -172,9 +172,12 @@ async def get_field_distribution(field: str):
 async def get_dashboard_summary(user: User = Depends(auth_deps.current_user)):
     """Dashboard 首屏聚合数据：概览 + Top10 + 成本收益 + 风险口径。
 
-    ⚠ 脱敏：Top10 客户名单含姓名与编号，对无 `customer:identify` 权限的
-      角色（只读分析）替换为匿名条目。概览、风险分布、成本收益这些
-      **聚合数字不受影响** —— 那正是该角色需要看的。
+    ⚠ 脱敏判据是 `privacy.can_view_whole_book`（identify **且** insight:view），
+      **不是** `can_identify`。原因：客户专员（staff）有 identify 权限
+      （要打电话），但没有全行洞察授权 —— 若用 can_identify，
+      staff 会在工作台看到全行 Top10 客户姓名与余额，绕过
+      "他只能看派给自己的单"这条数据级限制（名单页对他已关闭）。
+      详见 privacy.can_view_whole_book 的说明。
     """
     from app.services import privacy
     from app.services import risk_scoring
@@ -226,8 +229,8 @@ async def get_dashboard_summary(user: User = Depends(auth_deps.current_user)):
         # 4) 风险分级口径
         risk_info = risk_scoring.get_risk_info()
 
-        # 5) 脱敏 Top10（无身份权限时替换为匿名条目）
-        masked = not privacy.can_identify(user)
+        # 5) 脱敏 Top10（无全行视图权限时替换为匿名条目）
+        masked = not privacy.can_view_whole_book(user)
         if masked:
             top_customers = privacy.mask_customers(top_customers)
 
@@ -239,7 +242,7 @@ async def get_dashboard_summary(user: User = Depends(auth_deps.current_user)):
             "risk_info": risk_info,
             "model_error": model_error,
             "masked": masked,
-            "mask_notice": privacy.MASK_NOTICE if masked else "",
+            "mask_notice": privacy.mask_notice_for(user) if masked else "",
         }
     finally:
         db.close()
