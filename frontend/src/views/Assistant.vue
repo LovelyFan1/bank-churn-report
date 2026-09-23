@@ -537,7 +537,9 @@ function tagClass(tag) {
   if (['值得投入'].includes(tag)) return 'tag-worth'
   if (['盈亏边界'].includes(tag)) return 'tag-marginal'
   if (['不建议投入', '无资产可留'].includes(tag)) return 'tag-bad'
-  if (['中等', '低风险', '低价值', '零余额'].includes(tag)) return 'tag-neutral'
+  // ⚠ '中低价值' 与旧写法 '低价值' 都列上：历史对话缓存里可能存的是旧标签，
+  //   漏掉会让老会话的标签配色突然变样。
+  if (['中等', '低风险', '中低价值', '低价值', '零余额'].includes(tag)) return 'tag-neutral'
   return 'tag-neutral'
 }
 function warnClass(level) {

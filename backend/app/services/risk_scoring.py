@@ -822,7 +822,7 @@ CHANNEL_LABELS = {
 RISK_LABELS = {
     "CRITICAL": "极高", "HIGH": "高危", "MEDIUM": "中等", "LOW": "低风险",
 }
-VALUE_TIER_LABELS = {"HIGH": "高价值", "LOW": "低价值", "ZERO": "零余额"}
+VALUE_TIER_LABELS = {"HIGH": "高价值", "LOW": "中低价值", "ZERO": "零余额"}
 
 # 渠道 → 对应的价值层。渠道被人工覆盖后，需要据此反查动作表。
 _CHANNEL_TIER = {v: k for k, v in CHANNEL_BY_TIER.items()}

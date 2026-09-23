@@ -110,13 +110,28 @@ def list_customers(risk_level: str | None = None,
                    min_balance: float | None = None,
                    max_balance: float | None = None,
                    sort_by: str = "expected_value",
-                   limit: int = 10) -> dict:
+                   limit: int = 10,
+                   offset: int = 0) -> dict:
     """按条件查客户名单。
 
     risk_level: CRITICAL / HIGH / MEDIUM / LOW
     value_tier: HIGH / LOW / ZERO
     sort_by:    expected_value（默认，按"值得投入多少"排）或 probability
     limit:      返回条数，1~50
+    offset:     跳过前几条（用于「另外几个」「再要一批」）
+
+    ⚠ **用户说「另外三个」「再调几个」「还有吗」时必须传 offset** ——
+      传成上一次的 limit（例如上次取了 3 条，这次 offset=3）。
+      不传的话会**返回一模一样的名单**，用户会以为系统坏了。
+      实测缺陷（用户报告）：说「另外三个」时返回的还是原来那三位。
+
+      offset + limit 都受后端约束：后端 page_size 上限 100，
+      故 offset 超过 100 时本函数会如实说明"无法再往后翻"，
+      而不是静默返回空列表。
+
+    ⚠ 「价值一般 / 中等价值 / 普通客户」→ value_tier 传 **LOW**
+      （本系统价值层只有三档：HIGH ≥10万 / LOW 0~10万 / ZERO 零余额）。
+      不要因为"一般"听起来像中间档就臆造一个不存在的枚举值。
 
     ⚠ 只返回前 limit 条，并**如实告知总数**。不要假装这是全部 ——
       `/api/customers` 的 page_size 上限是 100，而决策线内有 6,582 人，
@@ -132,6 +147,7 @@ def list_customers(risk_level: str | None = None,
       把"不值得救"的人标出来。若交给 LLM 转述，它可能漏掉或说错。
     """
     limit = max(1, min(int(limit or 10), 50))
+    offset = max(0, int(offset or 0))
     # 后端只支持 sort_by ∈ {probability, expected_value, balance, age, credit_score}。
     # 传非法值会**静默回退**到 probability（实测），因此这里必须自己校验，
     # 否则 Agent 以为按期望价值排了、实际是按概率排的。
@@ -140,9 +156,43 @@ def list_customers(risk_level: str | None = None,
         sort_by = "expected_value"
 
     need_local = min_balance is not None or max_balance is not None
-    # 含本地过滤时多取一些，否则过滤后可能不足 limit 条
-    fetch = 100 if need_local else limit
-    d = _get("/api/customers", page=1, page_size=fetch,
+
+    # ── offset → 后端分页参数 ─────────────────────────────
+    #
+    # 后端不直接收 offset，只收 page / page_size（内部换算）。
+    # ⚠ 两个硬约束必须在这里处理，否则会**静默返回错数据**：
+    #   1) page_size ≤ 100
+    #   2) 本地过滤（min/max_balance）在**取回之后**做，
+    #      故分页窗口要按"过滤前"算 —— 否则翻页会漏掉/重复客户。
+    #      做法：本地过滤时固定取一页足够大的窗口（100 条），
+    #      用 offset 决定从第几个窗口开始。
+    page_size_cap = 100
+    if need_local:
+        # 过滤场景：按 100 条一页往后翻，保证窗口不重叠
+        fetch = page_size_cap
+        page = offset // page_size_cap + 1
+        skip_in_page = offset % page_size_cap
+    else:
+        fetch = limit
+        page = offset // max(limit, 1) + 1
+        skip_in_page = offset % max(limit, 1)
+
+    if offset >= page_size_cap and not need_local:
+        # 后端 page_size 上限 100 → 无法用单页表达超过 100 的偏移。
+        # 不静默返回空列表，而是如实说明，让模型改用更精确的筛选条件。
+        return {
+            "items": [],
+            "returned": 0,
+            "offset": offset,
+            "limit": limit,
+            "note": (f"无法从第 {offset + 1} 位开始返回："
+                     f"本接口单次最多取前 {page_size_cap} 条。"
+                     f"请改用更精确的筛选条件（如限定 risk_level / value_tier），"
+                     f"或分段多次查询。"),
+            "is_complete": False,
+        }
+
+    d = _get("/api/customers", page=page, page_size=fetch,
              risk_level=risk_level, value_tier=value_tier,
              sort_by=sort_by, sort_order="desc")
 
@@ -152,6 +202,9 @@ def list_customers(risk_level: str | None = None,
             items = [c for c in items if (c.get("balance") or 0) >= min_balance]
         if max_balance is not None:
             items = [c for c in items if (c.get("balance") or 0) <= max_balance]
+        # 本地过滤后再按页内偏移切
+        items = items[skip_in_page:]
+
     items = items[:limit]
 
     keep = ["customer_id", "surname", "balance", "probability",
@@ -197,15 +250,26 @@ def list_customers(risk_level: str | None = None,
         "items": out_items,
         "returned": len(out_items),
         "matched_total": total,          # 符合筛选条件的总数
-        "is_complete": len(out_items) >= (total or 0),
+        # ⚠ 本次跳过了前 offset 条 —— 回传出去，让模型知道
+        #   "这不是第一页"，也便于它算下一次该用多少 offset。
+        "offset": offset,
+        "limit": limit,
+        # next_offset：模型要"再要一批"时直接用这个值，不必自己算
+        # （避免它把 offset 和 limit 搞混，返回重复名单）
+        "next_offset": offset + len(out_items),
+        # is_complete 表达"这一轮的名单是否已覆盖全部符合条件的人"。
+        # ⚠ 必须把 offset 算进去：从第 50 位取 10 条时，即使返回了 10 条，
+        #   也远未取完 —— 旧实现只比 len 与 total，会误报"已完整"。
+        "is_complete": (offset + len(out_items)) >= (total or 0),
         "sorted_by": sort_by,
         "post_filtered": need_local,     # True = 含本地过滤，非服务端
         # 供界面直接使用的确定性派生量（不经过 LLM）
         "buildable_customer_ids": buildable,
         "blocked_by_active_order": blocked,
         "note": (
-            f"仅返回前 {len(out_items)} 条，符合条件共 {total} 条。"
-            if total and len(out_items) < total else ""
+            f"这是第 {offset + 1}~{offset + len(out_items)} 位，"
+            f"符合条件共 {total} 条。如需继续，传 offset={offset + len(out_items)}。"
+            if total and (offset + len(out_items)) < total else ""
         ),
     }
 

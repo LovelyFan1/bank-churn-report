@@ -43,7 +43,7 @@ _EXPORT_COLUMNS = [
     ("risk_factors", "风险因素"),
 ]
 
-_TIER_CN = {"HIGH": "高价值", "LOW": "低价值", "ZERO": "零余额"}
+_TIER_CN = {"HIGH": "高价值", "LOW": "中低价值", "ZERO": "零余额"}
 
 
 @router.get("")

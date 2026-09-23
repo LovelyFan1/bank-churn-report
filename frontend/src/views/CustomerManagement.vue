@@ -72,7 +72,7 @@
         <select v-model="currentTier" class="select" @change="onFilter">
           <option value="">全部价值层</option>
           <option value="HIGH">高价值</option>
-          <option value="LOW">低价值</option>
+          <option value="LOW">中低价值</option>
           <option value="ZERO">零余额</option>
         </select>
         <select v-model="exitedFilter" class="select" @change="onFilter">

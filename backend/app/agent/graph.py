@@ -88,8 +88,10 @@ _WRITER_SYSTEM = """你是银行客户流失预警系统的分析助手。
    反例（差）：「Bentley 期望挽回 220080.25 居首」
    正例（好）：「Bentley 期望挽回居首，但已有在途工单」
 5. **枚举值必须译成中文**：CRITICAL→极高、HIGH→高危、MEDIUM→中等、
-   LOW→低风险；价值层 HIGH→高价值、LOW→低价值、ZERO→零余额。
+   LOW→低风险；价值层 HIGH→高价值、LOW→中低价值、ZERO→零余额。
    不要在中文句子里夹带 CRITICAL/HIGH 这类英文。
+   ⚠ 价值层的 LOW 是「中低价值」不是「低价值」—— 该档实测平均余额 8.2 万，
+     叫「低价值」会让用户误以为是几千块的小客户。
 6. 语气专业简洁。
 
 用中文回答。
@@ -1013,14 +1015,22 @@ def _tool_schemas() -> list[dict]:
             "function": {
                 "name": "list_customers",
                 "description": "按条件查客户名单。返回前 limit 条，并如实给"
-                               "符合条件总数。",
+                               "符合条件总数。"
+                               "⚠ 用户说「另外几个」「再调一批」「还有吗」时，"
+                               "必须把 offset 设为上一次已返回的条数，"
+                               "否则会返回完全相同的名单。"
+                               "⚠ 「价值一般 / 中等价值」对应 value_tier=LOW。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "risk_level": {"type": "string",
                                        "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]},
                         "value_tier": {"type": "string",
-                                       "enum": ["HIGH", "LOW", "ZERO"]},
+                                       "enum": ["HIGH", "LOW", "ZERO"],
+                                       "description": "价值层：HIGH=高价值(≥10万)、"
+                                                      "LOW=中低价值(0~10万)、"
+                                                      "ZERO=零余额。"
+                                                      "「价值一般/中等价值」用 LOW"},
                         "min_balance": {"type": "number",
                                         "description": "余额下限（本地过滤）"},
                         "max_balance": {"type": "number",
@@ -1029,6 +1039,10 @@ def _tool_schemas() -> list[dict]:
                                     "enum": ["expected_value", "probability", "balance"]},
                         "limit": {"type": "integer",
                                   "description": "返回条数，1~50，默认 10"},
+                        "offset": {"type": "integer",
+                                   "description": "跳过前几条。用户说「另外 N 个」时，"
+                                                  "传上一次返回的条数（或上次结果里的 "
+                                                  "next_offset）。不传会返回重复名单。"},
                     },
                 },
             },
@@ -1232,7 +1246,25 @@ _NEEDS_DATA_KW = [
     # 口径与汇总
     "阈值", "决策线", "成本比", "成功率", "召回", "精准",
     "多少", "几个", "哪些", "名单", "统计", "总数", "占比",
+    # ── 取名单的常见说法（实测缺陷，用户报告）─────────────
+    # 用户说「再帮我调出3个客户」时，旧表里只有「几个」，
+    # 而用户写的是阿拉伯数字「3个」→ 一个关键词都不命中 →
+    # 不强制查数据 → 模型凭记忆答「未查询到符合条件的客户」，
+    # 而且拿到了「未经数据核对」的徽章（系统自己知道没查，却没拦住）。
+    "调出", "调取", "列出", "列一下", "找出", "找几个", "来几个",
+    "给我", "来一批", "换一批", "另外几个", "另外几个", "还有",
+    "客户名单", "客户列表", "推荐客户", "候选",
 ]
+
+# 数字 + 量词（"3个客户""5位""10名""三个"）—— 纯关键词表覆盖不了，
+# 因为数字是无限的，且中文数字与阿拉伯数字都要认。
+# ⚠ 中文数字必须一起覆盖：实测「另外三个」在只认阿拉伯数字时返回 False
+#   （「3个」命中但「三个」不命中），而中文数字在口语里更常见。
+_CN_NUM = "一二三四五六七八九十两半几"
+_NUM_UNIT_RE = re.compile(
+    rf"(?:\d+|[{_CN_NUM}]+)\s*(?:个|位|名|条|批)\s*(?:客户|人|名单)?"
+    r"|另[外一二三四五六七八九十\d]*\s*(?:几|些)?\s*(?:个|位|名|批)?"
+)
 
 
 def _needs_data(question: str) -> bool:
@@ -1245,6 +1277,9 @@ def _needs_data(question: str) -> bool:
         return False
     q = question.strip()
     if re.search(r"\bC\d{4,}\b", q, re.IGNORECASE):
+        return True
+    # 数字+量词（"3个客户"）—— 关键词表列不全无限的数字组合
+    if _NUM_UNIT_RE.search(q):
         return True
     return any(kw in q for kw in _NEEDS_DATA_KW)
 

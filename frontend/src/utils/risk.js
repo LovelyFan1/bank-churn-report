@@ -83,7 +83,14 @@ export function fmtWan(v) {
 // 由后端 risk_scoring.value_tier() 按余额划分，前端不得自行判定 ——
 // 与阈值同理，边界（VALUE_TIER_HIGH）属后端业务假设。
 
-const TIER_LABELS = { HIGH: '高价值', LOW: '低价值', ZERO: '零余额' }
+// ⚠ LOW 的中文标签由「低价值」改为「中低价值」（实测修正）：
+//   该档是 0 < balance < 10 万，实测平均余额 **8.2 万**（含 9.9 万这种
+//   紧贴高价值线的客户），叫「低价值」会让人误以为是几千块的小客户 ——
+//   用户看到「低价值 + 极高危」的名单时直接质疑"这是不是语义有问题"。
+//   与 ZERO（零余额）形成合理梯度：高价值 / 中低价值 / 零余额。
+//   ⚠ 与后端 risk_scoring.VALUE_TIER_LABELS、answer_builder._TIER_CN、
+//     customers._TIER_CN 三处必须保持一致（口径只能有一处说法）。
+const TIER_LABELS = { HIGH: '高价值', LOW: '中低价值', ZERO: '零余额' }
 const TIER_COLORS = { HIGH: '#6d28d9', LOW: '#1d4ed8', ZERO: '#64748b' }
 
 /** 触达渠道 —— 与后端 risk_scoring.CHANNEL_BY_TIER 对应 */

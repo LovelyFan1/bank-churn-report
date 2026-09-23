@@ -70,7 +70,7 @@ def _wan(v: Any) -> str:
 
 
 _RISK_CN = {"CRITICAL": "极高", "HIGH": "高危", "MEDIUM": "中等", "LOW": "低风险"}
-_TIER_CN = {"HIGH": "高价值", "LOW": "低价值", "ZERO": "零余额"}
+_TIER_CN = {"HIGH": "高价值", "LOW": "中低价值", "ZERO": "零余额"}
 _VERDICT_CN = {
     "worth": "值得投入",
     "marginal": "盈亏边界",
