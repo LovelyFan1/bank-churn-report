@@ -510,6 +510,39 @@ def node_tools(state: AgentState) -> dict:
     }
 
 
+def _last_decision_text(state: AgentState) -> str:
+    """取决策节点**最后一条且没有调用工具**的回答正文。
+
+    用于「模型没查到数据、但它的话本身就是答案」的场景（寒暄、身份、
+    常识），见 node_synthesis 里的说明。
+
+    ⚠ 两个必须守住的边界，否则会取错内容：
+
+      1. **只认最后一条**：若走过 force_tools（先答后被强制补查），
+         消息里会有两条 AIMessage。必须取**最新**那条 —— 取旧的会把
+         已经被强制修正过的回答又拿回来用。
+      2. **跳过带 tool_calls 的**：带工具调用的 AIMessage 的 content
+         通常是空的或半句话（"让我查一下…"），把它当答案会展示出
+         "让我查一下"这种残缺文本。
+
+    ⚠ 注意这里是**倒序找第一条符合条件的**，而不是"看最后一条是否为
+      AIMessage"。因为消息列表里最后一条可能已经是 synthesize 阶段追加的
+      内容，直接取末条会取错类型。
+    """
+    for m in reversed(state.get("messages", [])):
+        if not isinstance(m, AIMessage):
+            continue
+        if getattr(m, "tool_calls", None):
+            # 带工具调用的不算答案；且它更新，故更早的无工具调用回答
+            # 已经被它取代 —— 直接返回空，不继续往前找
+            return ""
+        text = (m.content or "").strip()
+        if text:
+            return _cn_enums(text)
+        # content 为空且无工具调用：继续往前找（防御性，正常不出现）
+    return ""
+
+
 def node_synthesis(state: AgentState) -> dict:
     """④ 生成回答 —— LLM 只负责措辞，数字已由工具确定。"""
     pending = state.get("pending_action")
@@ -549,6 +582,49 @@ def node_synthesis(state: AgentState) -> dict:
 
     if pending:
         return {"draft": _pending_text(pending), "pending_action": pending}
+
+    # ── 零工具调用：决策节点的回答本身就是完整答案 ──────────────
+    #
+    # ⚠ 实测缺陷（用户报告「你好 → 暂无客户数据可分析」）：
+    #   问「你好」时决策节点**已经答对了** ——
+    #     「你好！我是银行客户流失预警系统的分析助手。我可以帮你做这些事：
+    #       查客户风险 / 筛客户名单 / 查模型口径…」
+    #   但本节点从头到尾**没读过它**，而是另叫写手（_WRITER_SYSTEM），
+    #   喂给它一份 `tool_results = []` 的空 payload，让它重新编一句话。
+    #   写手按自己的铁律（"只写你在数据里真实看到的"）看到空数据，
+    #   于是写出「暂无客户数据可分析」—— **正确答案被丢掉，换成了一句
+    #   像故障的兜底文案**。
+    #
+    #   这不是"缺关键词"：往 meta.py 加寒暄词表毫无作用，因为答案根本没走到
+    #   那一步就被覆盖了。实测对照（docs/audit/exp-prompt-vs-enum.py）：
+    #   纯提示词下模型对寒暄（含「吃了没」「嗯嗯」「哦」这类词表覆盖不到的
+    #   说法）16/16 全对 —— 模型会答，是**下游把答案扔了**。
+    #
+    # ⚠ 为什么用 _needs_data 当闸门，这不算"退回枚举思维"：
+    #   _needs_data 此前被用来**猜用户想干什么**（路由决策），那种用法必须
+    #   穷尽所有说法，漏一个就出错，所以脆弱。
+    #   这里它的角色完全不同 —— 只回答"**没有数据依据的回答能不能给用户看**"。
+    #   这是**安全兜底**，方向上必须保守：
+    #     · 命中（可能是数据问题）→ 不给模型的话，退回中性占位文案
+    #       —— 保留 diag116 的防护：模型没查就说"没有待处理工单"这类
+    #          无依据断言，不能展示
+    #     · 未命中 → 说明这句话本就不该有数据依据（寒暄/身份/常识），
+    #       展示模型的话
+    #   即：误判只导致"少说一句"，不会导致"展示编造内容"。
+    #
+    # ⚠ 只影响 `tool_results` 为空的路径，不碰任何数据查询逻辑。
+    if not state.get("tool_results"):
+        decision_text = _last_decision_text(state)
+        if decision_text and not _needs_data(state.get("question", "")):
+            logger.info("agent: 零工具调用且非数据类问题，采用决策节点原答（不再叫写手重编）")
+            # ⚠ 放 direct_answer 而**不是** headline：
+            #   这是段落文本，前端 headline 是单行加粗标题样式，塞进去会畸形。
+            #   且 answer_builder 零工具分支会让 headline 与 text 同值 →
+            #   同一段话显示两遍（现存缺陷，本次一并修）。
+            return {"draft": decision_text,
+                    "direct_answer": decision_text,
+                    "headline": "",
+                    "insights": []}
 
     payload = json.dumps(state.get("tool_results", []),
                          ensure_ascii=False, default=str)
@@ -789,6 +865,32 @@ def node_verify(state: AgentState) -> dict:
     if not retrieved:
         logger.warning("agent: 零工具调用即作答，标记 no_data q=%s",
                        state.get("question", "")[:40])
+        direct = (state.get("direct_answer") or "").strip()
+        if direct:
+            # ── 模型没查数据，但它的话本身就是完整答案 ──────────────
+            # 场景：寒暄 / 问身份 / 问能力 / 常识。见 node_synthesis 的说明。
+            #
+            # ⚠ 仍然标 `no_data`，不升格为 `llm_verified`：
+            #   它确实没有系统数据支撑，徽章必须如实。这是本项目的既定原则
+            #   （"零工具调用 → 一律不给已校验"，见上方注释）。
+            #   同时也**不加** warning —— 对"你好"这种正常回复挂一条
+            #   "未经数据核对"的警示是噪音，会让用户以为出了问题。
+            #   徽章本身已经承载了这个信息。
+            ans = {
+                "kind": "text",
+                "headline": "",
+                "warning": None,
+                "entities": [], "facts": [], "actions": [], "insights": [],
+                "text": direct,
+            }
+            return {
+                "verify_passed": True,
+                "verify_fail": [],
+                "final": direct,
+                "answer": ans,
+                "answer_basis": "no_data",
+                "citations": [],
+            }
         ans = answer_builder.build(tool_results, state["question"],
                                    llm_headline=headline, llm_insights=insights)
         # 答案本身来自模型（可能是常识性回答），但**没有系统数据支撑**，

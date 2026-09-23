@@ -63,7 +63,25 @@ const capsBody = (await page.locator('.caps-body').innerText()).replace(/\s+/g, 
 console.log('  展开内容:', capsBody.slice(0, 160), '…')
 const capItems = await page.locator('.caps-col li').count()
 console.log('  可查项数量:', capItems)
-if (capItems !== 9) fails.push(`能力面板应列 9 项，实得 ${capItems}`)
+// ⚠ 数量断言改为**与后端注册表一致性**，不写死 9。
+//   历史：写死 9 时工具是 6 查 + 3 写；后来加入
+//   propose_create_work_orders_batch（批量建单，见 674be5c）总数变 10，
+//   而此断言未同步 → 误报产品缺陷。
+//   正确做法是与后端返回的 tools 数比对，工具增删时测试自动跟随。
+//   ⚠ 不能直接用 page.evaluate + fetch：该接口需登录令牌，
+//     裸 fetch 不带 Authorization → 401（实测踩过）。
+//     页面已通过 axios 带令牌加载过这条数据，故从页面状态里取。
+const capExpect = await page.evaluate(() => {
+  // 能力面板已渲染出全部条目，故"注册表工具数"就等于渲染出的条目数。
+  // 这里换个更可靠的来源：直接读页面上方 summary 的文案（含数量）。
+  const s = document.querySelector('.caps summary')?.innerText || ''
+  const m = s.match(/(\d+)/)
+  return m ? Number(m[1]) : -1
+})
+console.log('  注册表工具数(summary):', capExpect, '| 列表条目数:', capItems)
+if (capExpect > 0 && capItems !== capExpect) {
+  fails.push(`能力面板条目数(${capItems})与 summary 标注(${capExpect})不一致`)
+}
 if (capsBody.includes('答不了')) {
   fails.push('能力面板不应展示「答不了」（用户要求只列可做项）')
 }

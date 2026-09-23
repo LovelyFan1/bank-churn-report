@@ -84,6 +84,15 @@ class AgentState(TypedDict, total=False):
     draft: str
     headline: str
     insights: list[str]
+    # 决策节点的**原答正文** —— 仅在"模型没查数据、但它的话本身就是答案"
+    # 时填入（寒暄、身份、常识类）。见 graph.node_synthesis 的说明。
+    #
+    # ⚠ 为什么单独一个字段而不是复用 headline：
+    #   headline 在前端是 15.5px 加粗的**单行标题**，而这类回答是段落文本
+    #   （常含换行与列表）。塞进 headline 会渲染成畸形大标题，且 answer_builder
+    #   零工具分支会让 headline 与 text 取同一个值 → 同一段话显示两遍。
+    #   故正文与标题必须分开传递。
+    direct_answer: str
 
     # ── ⑤ verify：数字保全校验 ─────────────────────────
     verify_fail: list[str]       # 无法溯源的数字
@@ -124,6 +133,7 @@ def initial_state(session_id: str, question: str) -> AgentState:
         draft="",
         headline="",
         insights=[],
+        direct_answer="",
         verify_fail=[],
         verify_passed=False,
         final="",

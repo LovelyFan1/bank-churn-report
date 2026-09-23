@@ -140,7 +140,17 @@ const btnText = btnCount ? (await actionBtns.first().innerText()).trim() : ''
 // 工单数据是活的（实测用户给 C034525 建单后这里就变成 1 人）
 const buildable = 3 - grayed.length
 console.log('  按钮:', btnText || '(无)', ` （可建单应为 ${buildable} 人）`)
-if (btnCount !== 1) fails.push(`应有 1 个动作按钮，实得 ${btnCount}`)
+// ⚠ 断言必须是**一致性**：有可建单对象就该出现 1 个建单按钮，
+//   没有则不出现（此时界面显示"无可建单对象"说明，见下方 else 分支）。
+//   旧写法写死 `btnCount !== 1` —— 当时三人中尚有可建单对象。
+//   实测（2026-09-23 复查）：C071081(#56) / C034525(#62) / C062858(#63)
+//   三者均已有进行中工单，可建单数=0，按钮正确地为 0 个，
+//   而写死的断言却报错 —— 是测试跟不上活数据，不是产品缺陷。
+//   与上方卡片置灰断言（119-125 行）同一个道理，此处对齐。
+const expectBtn = buildable > 0 ? 1 : 0
+if (btnCount !== expectBtn) {
+  fails.push(`动作按钮数应为 ${expectBtn}（可建单 ${buildable} 人），实得 ${btnCount}`)
+}
 
 if (buildable > 0) {
   // 单人时后端文案是「为 C062858 建单」（用编号更明确），

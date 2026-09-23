@@ -656,13 +656,18 @@ TOOL_SPECS = {
     "propose_create_work_order": {
         "fn": propose_create_work_order,
         "write": True,
-        "label": "提议给**某一位**客户创建挽留工单（不会立即执行）",
+        # ⚠ label 会被前端**原样渲染**（Assistant.vue 的能力面板用插值，
+        #   不解析 Markdown）。此处曾写成「提议给**某一位**客户…」，
+        #   星号直接裸露在界面上 —— 实测缺陷，已去掉标记符号改用中文强调。
+        #   这类文案里的 Markdown 一律不要写。
+        "label": "提议给某一位客户创建挽留工单（不会立即执行）",
         "description": propose_create_work_order.__doc__.strip().split("\n")[0],
     },
     "propose_create_work_orders_batch": {
         "fn": propose_create_work_orders_batch,
         "write": True,
-        "label": "提议给**多位**客户批量创建挽留工单（不会立即执行）",
+        # 同 propose_create_work_order：label 由前端原样渲染，不得含 Markdown
+        "label": "提议给多位客户批量创建挽留工单（不会立即执行）",
         "description": propose_create_work_orders_batch.__doc__.strip().split("\n")[0],
     },
     "propose_update_work_order": {
