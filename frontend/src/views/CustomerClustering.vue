@@ -201,9 +201,7 @@ function renderScatter(scatterData, profilesData, colorBy) {
   // 主成分方差解释率由后端实时给出（仅 PCA 路径有值）
   const ev = scatterData.explained_variance || []
   const pct = (i) => (ev[i] != null ? (ev[i] * 100).toFixed(1) + '%' : '—')
-  const axisName = (i) => isTsne
-    ? `t-SNE ${i + 1}`
-    : `PC${i + 1} (${pct(i)})`
+  const axisName = (i) => isTsne ? '' : `PC${i + 1} (${pct(i)})`
 
   // 坐标轴稳健区间 —— 由后端按 [0.5%, 99.5%] 分位算好返回，用于裁掉离群值
   // 造成的超长轴（只对 PCA 路径有实际意义；t-SNE 无长尾，后端给的是实际范围）。
@@ -295,14 +293,6 @@ function renderScatter(scatterData, profilesData, colorBy) {
       axisLabel: { color: '#6b7280', fontSize: 10 },
       axisLine: { lineStyle: { color: '#d5dce8' } },
     },
-    // ⚠ t-SNE 的轴无物理含义，图上加一行提示，避免被当成"PC1 越大越好"
-    graphic: isTsne ? [{
-      type: 'text', right: 12, bottom: 6,
-      style: {
-        text: 't-SNE 降维：轴无物理含义，簇间距离不可直接比较',
-        fill: '#9aa7bd', fontSize: 10,
-      },
-    }] : [],
     series,
   }, true)
 }
