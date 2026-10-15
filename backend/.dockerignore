@@ -8,3 +8,8 @@ __pycache__/
 .vscode/
 venv/
 env/
+
+saved_models.bak*/
+.audit/
+.venv*/
+get-pip.py

@@ -20,7 +20,7 @@
 这是**刻意简化**，不是遗漏 —— 答辩时若被问到要如实说这是简化。
 """
 
-from sqlalchemy import Column, DateTime, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.sql import func
 
 from app.database import Base
@@ -50,6 +50,7 @@ class User(Base):
     #   格式：pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>
     password_hash = Column(String(255), nullable=False)
     must_change_password = Column(Integer, default=0)  # 1 = 首次登录须改密
+    auth_version = Column(Integer, nullable=False, default=0, server_default="0")
 
     # ── 双因素（认证的第二因子）───────────────────────
     # 真银行用 UKey/数字证书（等保要求"至少一种使用密码技术"）。
@@ -70,6 +71,24 @@ class User(Base):
     last_login_at = Column(DateTime)
     last_login_ip = Column(String(64))
     created_at = Column(DateTime, server_default=func.now())
+
+
+class AuthSession(Base):
+    """JWT jti对应的共享会话；只存标识、认证版本和时间，不存令牌。"""
+    __tablename__ = "auth_sessions"
+    jti = Column(String(64), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    auth_version = Column(Integer, nullable=False)
+    issued_at = Column(Float, nullable=False)
+    expires_at = Column(Float, nullable=False, index=True)
+    last_activity_at = Column(Float, nullable=False)
+
+
+class RevokedToken(Base):
+    """多 worker 共享的登出撤销记录；只存 jti 与过期时间，不存令牌。"""
+    __tablename__ = "revoked_tokens"
+    jti = Column(String(64), primary_key=True)
+    expires_at = Column(Float, nullable=False, index=True)
 
 
 class AuditLog(Base):
@@ -98,6 +117,7 @@ class AuditLog(Base):
     username = Column(String(64), index=True)       # 操作者行员号（冗余存）
     display_name = Column(String(64))               # 操作者姓名
     role = Column(String(16))                       # 操作时的角色（事后提权也说得清）
+    auth_method = Column(String(16), nullable=True)
     action = Column(String(64), index=True)         # login / logout / create_work_order …
     target = Column(String(128))                    # 操作对象，如 C071081 / #63
     detail = Column(Text)                           # JSON 附加信息（不落敏感字段）

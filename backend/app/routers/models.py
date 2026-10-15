@@ -4,7 +4,9 @@
 轻量查询 (对比/ROC/特征重要性) → 直接读取磁盘/DB
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException, Header
+from pydantic import BaseModel, Field
+from app.schemas.prediction import PredictionFeatures
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -15,8 +17,11 @@ from app.services import risk_scoring
 from app.services.model_service import get_model_service
 from app.celery_tasks.train import train_all_models_task
 from app.celery_tasks.predict import batch_score_task
+from app.services import task_submission, model_manifest
+from app.models.task_submission import TaskSubmission
 
-router = APIRouter(prefix="/api/model", tags=["Models"])
+router = APIRouter(prefix="/api/model", tags=["Models"],
+                   dependencies=[Depends(auth_deps.require_perm(auth.PERM_INSIGHT_VIEW))])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -25,18 +30,17 @@ router = APIRouter(prefix="/api/model", tags=["Models"])
 
 @router.post("/train")
 async def train_models(user: User = Depends(
-        auth_deps.require_perm(auth.PERM_MODEL_TRAIN))):
+        auth_deps.require_perm(auth.PERM_MODEL_TRAIN)),
+        db: Session = Depends(get_db), idempotency_key: str | None = Header(default=None)):
     """提交训练任务 → 返回 task_id，前端轮询 GET /api/tasks/{task_id}。
 
     ⚠ 权限：`model:train`（仅管理员）。重训会**移动风险分级线与决策阈值**，
       进而改变"谁该被干预"的名单 —— 影响面远超单张工单，故限权。
     """
-    task = train_all_models_task.delay()
-    return {
-        "task_id": task.id,
-        "status": "pending",
-        "message": f"训练任务已提交，请轮询 GET /api/tasks/{task.id} 查看进度",
-    }
+    from app.services.data_loader import _read_cache_version
+    return task_submission.submit(db, user, idempotency_key, 'train',
+        {'data_snapshot': _read_cache_version()}, train_all_models_task,
+        model_manifest.revision(risk_scoring.MODEL_DIR))
 
 
 @router.get("/shap-global")
@@ -47,14 +51,37 @@ async def get_shap_global(db: Session = Depends(get_db)):
 
 
 @router.get("/batch-score")
-async def batch_score(top_n: int = Query(default=100, ge=1, le=1000)):
-    """提交批量预测 → 返回 task_id。"""
-    task = batch_score_task.delay(top_n=top_n)
-    return {
-        "task_id": task.id,
-        "status": "pending",
-        "message": f"批量预测已提交 (Top {top_n})，请轮询 GET /api/tasks/{task.id} 查看进度",
-    }
+async def deprecated_batch_score(
+                      user: User = Depends(auth_deps.require_perm(auth.PERM_MODEL_TRAIN))):
+    raise HTTPException(405, 'GET不提交任务；请使用POST并提供Idempotency-Key', headers={'Allow': 'POST'})
+
+
+class BatchScoreRequest(BaseModel):
+    top_n: int = Field(default=100, ge=1, le=1000, strict=True)
+
+
+@router.post('/batch-score')
+async def batch_score(body: BatchScoreRequest,
+                      user: User = Depends(auth_deps.require_perm(auth.PERM_MODEL_TRAIN)),
+                      db: Session = Depends(get_db), idempotency_key: str | None = Header(default=None)):
+    if not idempotency_key or not 8 <= len(idempotency_key) <= 128:
+        raise HTTPException(422, '提交任务需要8至128字符的Idempotency-Key')
+    existing = db.query(TaskSubmission).filter_by(username=user.username, idempotency_key=idempotency_key).first()
+    payload = {'top_n': body.top_n}
+    version = existing.model_version if existing else None
+    if not existing:
+        try:
+            manifest = model_manifest.resolve(risk_scoring.MODEL_DIR)
+            engine = risk_scoring._ensure_engine(db)
+            if engine is None or engine['model_version'] != manifest.revision:
+                raise ValueError('风险引擎与发布清单不匹配')
+            version = manifest.revision
+            payload['model_snapshot'] = {'meta': manifest.meta, 'model_version': version,
+                'thresholds': dict(engine['thresholds']), 'customer_version': engine['customer_version'],
+                'status': manifest.status}
+        except Exception:
+            raise HTTPException(503, '模型或数据快照未就绪，未提交评分任务')
+    return task_submission.submit(db, user, idempotency_key, 'batch_score', payload, batch_score_task, version)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -109,14 +136,26 @@ async def get_confusion_matrices(db: Session = Depends(get_db)):
 
 
 @router.post("/predict")
-async def predict_single(customer_data: dict, db: Session = Depends(get_db)):
+async def predict_single(customer_data: PredictionFeatures, db: Session = Depends(get_db)):
     """单客户预测 — 同步（加载模型 + 推理 = 毫秒级）。"""
     service = get_model_service(db)
-    return service.predict_single(customer_data)
+    try:
+        result = service.predict_single(customer_data.model_dump())
+    except Exception:
+        raise HTTPException(503, "模型或风险引擎不可用，请稍后重试")
+    if result.get("error"):
+        raise HTTPException(503, result["error"])
+    return result
 
 
 @router.post("/shap-single")
-async def get_shap_single(customer_data: dict, db: Session = Depends(get_db)):
+async def get_shap_single(customer_data: PredictionFeatures, db: Session = Depends(get_db)):
     """单客户 SHAP 解释 — 同步。"""
     service = get_model_service(db)
-    return service.get_shap_single(customer_data)
+    try:
+        result = service.get_shap_single(customer_data.model_dump())
+    except Exception:
+        raise HTTPException(503, "模型解释不可用，请稍后重试")
+    if result.get("error"):
+        raise HTTPException(503, "模型解释不可用，请检查模型支持及发布状态")
+    return result

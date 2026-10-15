@@ -14,7 +14,8 @@ from app.services import auth_service as auth
 from app.services.clustering_service import get_clustering_service
 from app.celery_tasks.cluster import run_kmeans_task, run_elbow_task
 
-router = APIRouter(prefix="/api/cluster", tags=["Clustering"])
+router = APIRouter(prefix="/api/cluster", tags=["Clustering"],
+                   dependencies=[Depends(auth_deps.require_perm(auth.PERM_INSIGHT_VIEW))])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -60,7 +61,7 @@ async def submit_kmeans_save(k: int = Query(default=5, ge=2, le=20),
 
 
 @router.post("/elbow")
-async def submit_elbow():
+async def submit_elbow(user: User = Depends(auth_deps.require_perm(auth.PERM_MODEL_TRAIN))):
     """提交肘部法则计算 → 返回 task_id。"""
     task = run_elbow_task.delay()
     return {

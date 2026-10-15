@@ -15,10 +15,16 @@ saved_models.bak-*/
 
 # Database
 *.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
 
 # Environment
 .env
 .env.local
+.env.*
+!.env.example
 
 # 认证签名密钥（未配置 AUTH_SECRET_KEY 时自动生成）
 # ⚠ 必须忽略：它是签发/校验令牌的密钥，提交进仓库等于公开，
@@ -45,3 +51,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local audit material and presentation working directories (keep on disk)
+/.audit/
+/projects/
+/docs/audit/
+/docs/商业计划书对账报告.md

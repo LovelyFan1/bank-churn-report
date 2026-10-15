@@ -7,12 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # ── 创建工单 ───────────────────────────────────────────
 
 class WorkOrderCreate(BaseModel):
-    customer_id: str
-    customer_name: str
+    customer_id: str = Field(pattern=r"^C\d{4,}$")
+    customer_name: str = ""
     geography: str = ""
     risk_level: str = "MEDIUM"
-    probability: float = 0.0
-    balance: float = 0.0
+    probability: float = Field(default=0.0, ge=0, le=1, allow_inf_nan=False)
+    balance: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     risk_factors: list[str] = []
     strategy: str = ""
     assignee: str = ""
@@ -90,19 +90,24 @@ class WorkOrderBatchCreate(BaseModel):
 
 class WorkOrderUpdate(BaseModel):
     status: str | None = None       # pending / in_progress / completed / lost
+    observation_start: datetime | None = None
+    observation_end: datetime | None = None
+    result_evidence: str | None = Field(default=None, max_length=2000)
+    actual_cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    actual_benefit: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     result: str | None = None       # retained / lost
     assignee: str | None = None
     strategy: str | None = None
     note: str | None = None
     risk_level: str | None = None
-    probability: float | None = None
+    probability: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        allowed = {"pending", "in_progress", "completed", "lost"}
+        allowed = {"pending", "in_progress", "completed", "lost", "cancelled"}
         if v not in allowed:
             raise ValueError(f"status must be one of {allowed}")
         return v
@@ -121,6 +126,18 @@ class WorkOrderUpdate(BaseModel):
 # ── 工单响应 ───────────────────────────────────────────
 
 class WorkOrderResponse(BaseModel):
+    result_source: str | None = None
+    verification_state: str | None = None
+    result_recorded_by: str | None = None
+    verified_by: str | None = None
+    verified_at: datetime | None = None
+    observation_start: datetime | None = None
+    observation_end: datetime | None = None
+    result_evidence: str | None = None
+    actual_cost: float | None = None
+    actual_benefit: float | None = None
+    assignee_username: str | None = None
+    assignee_name_snapshot: str | None = None
     model_config = ConfigDict(from_attributes=True)
 
     id: int

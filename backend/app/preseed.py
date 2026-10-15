@@ -46,6 +46,7 @@ from app.services import data_source
 #   被建 —— 实测报 `no such table: users`，且播种在每个 worker 里各失败一次。
 from app.models import user as _user_model  # noqa: F401
 from app.models import work_order as _wo_model  # noqa: F401
+from app.agent import order_safety as _pending_model  # noqa: F401
 from app.migrate import run_migrations
 
 
@@ -80,10 +81,7 @@ def main() -> int:
         if uinfo.get("seeded"):
             print(f"[preseed] 已补齐演示账号 {uinfo['created']} 个"
                   f"（现有共 {uinfo.get('total')} 个）", flush=True)
-            # ⚠ 把 TOTP 密钥打出来供演示绑定。这是**演示系统**的刻意选择：
-            #   真银行由 UKey/APP 自行绑定，密钥绝不落日志。
-            for name, secret in (uinfo.get("totp") or {}).items():
-                print(f"[preseed]   TOTP {name}: {secret}", flush=True)
+            # 二因素密钥不得写入启动日志；演示辅助由专用配置显式控制。
         else:
             print(f"[preseed] 演示账号已是最新，共 {uinfo.get('existing')} 个", flush=True)
 

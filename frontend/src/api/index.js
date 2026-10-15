@@ -67,6 +67,11 @@ export function isCanceled(error) {
 }
 
 const IDEMPOTENT = new Set(['get', 'head', 'options'])
+function isRetryableTask(config) {
+  const key = config.headers?.get?.('Idempotency-Key') || config.headers?.['Idempotency-Key']
+  return config.method?.toLowerCase() === 'post' && key &&
+    /^\/?model\/(train|batch-score)$/.test(config.url || '')
+}
 
 api.interceptors.response.use(
   (response) => response,
@@ -76,9 +81,12 @@ api.interceptors.response.use(
 
     // ── 401：令牌失效 → 通知上层跳登录页 ──────────────────
     if (error.response?.status === 401) {
-      let hadToken = false
-      try { hadToken = !!localStorage.getItem(TOKEN_KEY) } catch (_) {}
-      if (hadToken && onUnauthorized) {
+      let currentToken = ''
+      try { currentToken = localStorage.getItem(TOKEN_KEY) || '' } catch (_) {}
+      const sentAuthorization = config.headers?.get?.('Authorization') ||
+        config.headers?.Authorization || config.headers?.authorization
+      // 切换账号后旧请求的401不能清除新账号凭据。
+      if (currentToken && sentAuthorization === 'Bearer ' + currentToken && onUnauthorized) {
         // ⚠ 不在拦截器里直接改路由：这里拿不到 router 实例
         //（import router 又会循环依赖）。交给 main.js 注册的回调。
         onUnauthorized(error.response?.data?.detail || '登录已过期')
@@ -87,7 +95,7 @@ api.interceptors.response.use(
     }
 
     if (!isNetworkError(error)) return Promise.reject(error)
-    if (!IDEMPOTENT.has((config.method || 'get').toLowerCase())) return Promise.reject(error)
+    if (!IDEMPOTENT.has((config.method || 'get').toLowerCase()) && !isRetryableTask(config)) return Promise.reject(error)
 
     config.__retryCount = config.__retryCount || 0
     if (config.__retryCount >= RETRY_MAX) return Promise.reject(error)

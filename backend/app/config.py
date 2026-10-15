@@ -1,11 +1,12 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from pathlib import Path
 
 
 class Settings(BaseSettings):
     APP_NAME: str = "Bank Customer Churn Analysis System"
     VERSION: str = "1.0.0"
-    DEBUG: bool = True
+    DEBUG: bool = False
 
     # Database
     DATABASE_URL: str = "sqlite:///./churn_analysis.db"
@@ -81,8 +82,7 @@ class Settings(BaseSettings):
     #              = (流失数×recall×AVG) / (触达×AVG/COST_RATIO)
     #              = COST_RATIO × precision
     #      —— 这个式子**不含任何"成功率"因子**，等价于假设
-    #      「只要打电话，客户 100% 会留下」。这不成立：外呼挽留的行业
-    #      公开区间大致是 20%~40%，取 100% 会把 ROI 系统性高估数倍。
+    #      「只要打电话，客户 100% 会留下」。本系统没有真实回访来支持这一假设，取 100% 会高估测算收益。
     #
     #    引入 s 后的正确式子：
     #        净收益(t) = TP×(s×COST_RATIO − 1) − FP     （单位 = 一次干预成本）
@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     #    ⚠ 取 0.30 的依据：本系统**没有任何真实挽留结果数据**
     #      （seed_work_orders.py 造的 60 条工单是硬编码常量表，
     #        其 retained 比例是写死的，不能当作实测）。
-    #      因此取行业中位偏保守值 0.30，而非从数据拟合。
+    #      因此 0.30 仅是演示情景参数，缺少来源和实测验证。
     #      这是一个**必须被质疑的假设**，故在接口与页面上显式暴露，
     #      而不是藏在公式里。
     #
@@ -169,13 +169,13 @@ class Settings(BaseSettings):
     AUTH_SECRET_KEY: str = ""
 
     # 令牌有效期（分钟）。取 120：银行内部系统的会话通常比互联网短，
-    # 但太短会让柜面/客户经理频繁重登。前端另有**无操作自动退出**
+    # 但太短会让柜面/客户经理频繁重登。数据库另有**无操作自动失效**
     # （见 AUTH_IDLE_MINUTES），两者是不同机制：前者是绝对上限，
     # 后者是闲置超时 —— 等保要求的"登录连接超时自动退出"指后者。
-    AUTH_TOKEN_TTL_MINUTES: int = 120
+    AUTH_TOKEN_TTL_MINUTES: int = Field(default=120, ge=1)
 
     # 无操作自动退出（分钟）—— 等保三级明确要求项。
-    AUTH_IDLE_MINUTES: int = 30
+    AUTH_IDLE_MINUTES: int = Field(default=30, ge=1)
 
     # 连续失败达到该次数开始锁定（1 分钟起，递增，上限 1 小时）
     AUTH_MAX_FAILED: int = 5

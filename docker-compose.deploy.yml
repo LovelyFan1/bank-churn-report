@@ -1,0 +1,38 @@
+# Local release profile. Keep docker-compose.yml for source-mounted development.
+# Build and update with both files; database and existing models stay persistent.
+services:
+  backend:
+    image: bank-churn-report-backend:deployment-20261005
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DEBUG: "false"
+      AUTH_ENABLED: "true"
+      AUTH_DEMO_SHOW_TOTP: "false"
+    volumes: !override
+      - backend_data:/app/data
+      - ./backend/saved_models:/app/saved_models
+      - ./../模拟仿真客户数据:/data-source:ro
+
+  celery-worker:
+    image: bank-churn-report-celery-worker:deployment-20261005
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DEBUG: "false"
+    volumes: !override
+      - backend_data:/app/data
+      - ./backend/saved_models:/app/saved_models
+      - ./../模拟仿真客户数据:/data-source:ro
+
+  frontend:
+    image: bank-churn-report-frontend:deployment-20261005
+    build:
+      dockerfile: Dockerfile.production
+    ports: !override
+      - "127.0.0.1:5173:8080"
+    environment: !reset {}
+    volumes: !reset []
+    command: !reset null

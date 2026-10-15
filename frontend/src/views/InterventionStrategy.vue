@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import * as echarts from 'echarts'
+import { echarts } from '../utils/charts'
 import { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import InfoTip from '../components/InfoTip.vue'
@@ -19,6 +19,8 @@ const retention = ref(null)   // 挽留效果复盘（来自工单真实 result�
 // 不接住就会渲染成空框（矩阵页曾因此"只有表头没有内容"）
 const matrixError = ref('')
 const summaryError = ref('')
+const retentionError = ref('')
+const retentionLoading = ref(true)
 const thresholdError = ref('')
 const thresholdChart = shallowRef(null)
 const chartInstances = []
@@ -86,7 +88,10 @@ const matrixTotals = computed(() => ({
 function drillDown(tier, level) {
   router.push({
     path: '/customers',
-    query: { value_tier: tier, risk_level: level, sort_by: 'expected_value' },
+    query: { value_tier: tier, risk_level: level, sort_by: 'expected_value', exited: '0', has_order: 'false',
+             source: 'test_matrix', source_model_version: matrix.value?.model_version || '',
+             source_count: String((matrix.value?.cells || []).find(c => c.tier === tier && c.level === level)?.count ?? ''),
+    },
   })
 }
 
@@ -106,7 +111,7 @@ async function loadAll() {
       scope.get('/cost-benefit/summary').catch((e) => ({ data: { error: e.message } })),
       scope.get('/cost-benefit/thresholds').catch((e) => ({ data: { error: e.message } })),
       scope.get('/model/risk-info').catch(() => ({ data: null })),
-      scope.get('/cost-benefit/retention-summary').catch(() => ({ data: null })),
+      scope.get('/cost-benefit/retention-summary').catch(e => ({ data: null, error: e.response?.data?.detail || e.message })),
       scope.get('/portfolio/matrix').catch((e) => ({ data: { error: e.message } })),
     ])
     // 页面已卸载则不再写状态
@@ -121,6 +126,8 @@ async function loadAll() {
     //   结果是「320px 空卡片 + 悬空的『最优阈值:』文案」。
     thresholdError.value = thresholdRes.data?.error || ''
     riskInfo.value = riskInfoRes.data
+    retentionLoading.value = false
+    retentionError.value = retentionRes.error || ''
     retention.value = retentionRes.data
     matrixError.value = matrixRes.data?.error || ''
     matrix.value = matrixRes.data?.error ? null : matrixRes.data
@@ -140,12 +147,12 @@ async function loadAll() {
       ] : []
       chart.setOption({
         tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-        legend: { top: 0, textStyle: { color: '#7c8aa5', fontSize: 11 }, itemGap: 14 },
+        legend: { top: 0, textStyle: { color: '#5b6b83', fontSize: 11 }, itemGap: 14 },
         grid: { left: 50, right: 50, top: 36, bottom: 20 },
-        xAxis: { type: 'category', data: data.map(d => d.threshold), axisLabel: { color: '#7c8aa5' }, axisLine: { lineStyle: { color: '#d5dce8' } } },
+        xAxis: { type: 'category', data: data.map(d => d.threshold), axisLabel: { color: '#5b6b83' }, axisLine: { lineStyle: { color: '#d5dce8' } } },
         yAxis: [
-          { type: 'value', name: '数量', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } },
-          { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#7c8aa5' }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } }
+          { type: 'value', name: '数量', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' }, nameTextStyle: { color: '#5b6b83', fontSize: 11 } },
+          { type: 'value', name: '净利润', splitLine: { show: false }, axisLabel: { color: '#5b6b83' }, nameTextStyle: { color: '#5b6b83', fontSize: 11 } }
         ],
         series: [
           // ⚠ 系列名由「TP(挽留成功)」改为「TP(判对)」——
@@ -220,7 +227,7 @@ onBeforeUnmount(() => {
         <div class="text-xl font-bold text-red-400">{{ businessSummary.annual_churn_count.toLocaleString() }}</div>
       </div>
       <div class="metric-card text-center">
-        <div class="text-xs text-gray-500 mb-1">按此折算年损失</div>
+        <div class="text-xs text-gray-500 mb-1">样本损失测算（非利润）</div>
         <div class="text-xl font-bold text-orange-400">¥{{ (businessSummary.annual_loss / 10000).toFixed(0) }}万</div>
       </div>
       <div class="metric-card text-center">
@@ -291,6 +298,9 @@ onBeforeUnmount(() => {
         </InfoTip>
       </h3>
 
+      <p v-if="retentionLoading" role="status">正在加载观察记录…</p>
+      <p v-if="retentionError" role="alert" class="text-red-700">复盘加载失败：{{ retentionError }}</p>
+      <p v-if="retention" class="text-sm text-slate-700">人工观察记录；已复核 {{ retention.verified_count || 0 }} 条，排除演示 {{ retention.excluded_demo || 0 }} 条，来源未明 {{ retention.historical_unknown || 0 }} 条。ROI 为假设折算，未证实干预增量。</p>
       <div v-if="retention && retention.has_data" class="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div class="metric-card text-center">
           <div class="text-xs text-gray-500 mb-1">已闭环工单</div>
@@ -308,7 +318,7 @@ onBeforeUnmount(() => {
           <!-- ⚠ 改名 + 口径提示：分母只含实际建单完成的工单，
                与上方推算 ROI 的分母（决策线覆盖全量）相差数百倍，不可比。 -->
           <div class="text-xs text-gray-500 mb-1" title="分母仅含实际已建单完成的工单，与上方推算 ROI 口径不同">
-            已执行 ROI
+            情景折算 ROI
           </div>
           <div class="text-xl font-bold text-indigo-400">{{ retention.roi_executed }}x</div>
           <div v-if="retention.roi_if_same_basis_as_plan != null"
@@ -342,9 +352,9 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div v-else class="empty-state">
+      <div v-else-if="!retentionLoading && !retentionError" class="empty-state">
         <div class="text-2xl mb-2">📭</div>
-        <p class="text-sm text-gray-400">暂无工单数据</p>
+        <p class="text-sm text-gray-400">暂无可统计的人工结案观察记录</p>
         <p class="text-xs text-gray-600 mt-1">
           需先在「客户管理」或「工单管理」创建工单，并将状态推进到
           <span class="text-gray-400">已完成</span> / <span class="text-gray-400">已流失</span> 后，此处才会有统计。
@@ -382,12 +392,12 @@ onBeforeUnmount(() => {
             <span class="tip-row">
               人数 / 历史流失率 / 平均余额 / 可挽回金额均为测试集实测
               （描述性统计，不外推未来收益）。
-              可挽回金额 = 该格流失客户余额合计 × 全局召回率 {{ fmtPercent(matrix.recall_used) }}。
+              覆盖历史资产 = 该格内真实流失且被决策线触达的客户余额合计。
+              金额用于解释历史覆盖，不代表挽回利润；格内命中率与全局召回率分别统计。
             </span>
             <span class="tip-row">
-              <span class="tip-warn">「紧急」整行历史流失率为 100%，属实</span> ——
-              该档在训练集/测试集/全量上稳定为 100%，模型在此已接近规则
-              （多产品且非活跃的组合几乎必然流失），不是统计口径错误。
+              历史流失率 = 格内历史流失人数 ÷ 格内样本数；实际比例见各格，随模型和样本变化。
+              点击格子查看当前未流失且无在途工单的可行动名单，人数与测试统计范围不同。
             </span>
             <span class="tip-row">
               「建议动作」取自后端统一策略规则（与客户列表、建单弹窗同源），
@@ -438,7 +448,7 @@ onBeforeUnmount(() => {
                     class="py-3 px-3 align-top cell-link"
                     @click="drillDown(row.tier, c.level)"
                     :title="`查看「${row.label} × ${c.levelTitle}」的 ${c.count} 位客户`">
-                  <div class="text-base font-semibold text-white leading-tight">
+                  <div class="text-base font-semibold text-[#17335c] leading-tight">
                     {{ c.count.toLocaleString() }}<span class="text-xs text-gray-500 font-normal ml-0.5">人</span>
                   </div>
 
@@ -497,13 +507,13 @@ onBeforeUnmount(() => {
           <div class="text-2xl font-bold text-green-400">
             {{ (businessSummary.expected_retained ?? businessSummary.retained_customers ?? 0).toLocaleString() }}
           </div>
-          <div class="text-xs text-gray-500 mt-1">期望年可挽留</div>
+          <div class="text-xs text-gray-500 mt-1">情景测算挽留人数</div>
         </div>
         <div class="text-center p-4 rounded-xl bg-white/3">
           <div class="text-2xl font-bold text-yellow-400">
             ¥{{ ((businessSummary.expected_reduced_loss ?? businessSummary.reduced_loss ?? 0) / 10000).toFixed(0) }}万
           </div>
-          <div class="text-xs text-gray-500 mt-1">期望年减少损失</div>
+          <div class="text-xs text-gray-500 mt-1">情景测算减少损失</div>
         </div>
         <div class="text-center p-4 rounded-xl bg-white/3">
           <div class="text-2xl font-bold text-purple-400">{{ businessSummary.roi }}x</div>
@@ -528,7 +538,7 @@ onBeforeUnmount(() => {
 
 .mini-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .mini-table th {
-  text-align: left; padding: 6px 10px; color: #7c8aa5; font-weight: 600;
+  text-align: left; padding: 6px 10px; color: #5b6b83; font-weight: 600;
   border-bottom: 1px solid #e5e9f0;
 }
 .mini-table td {

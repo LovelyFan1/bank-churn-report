@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -156,9 +157,14 @@ _MODEL_VERSION_FILE = MODEL_DIR / ".model_version"
 
 def _read_model_version() -> str:
     try:
-        return _MODEL_VERSION_FILE.read_text(encoding="utf-8").strip()
+        marker = _MODEL_VERSION_FILE.read_text(encoding="utf-8").strip()
     except OSError:
-        return ""
+        marker = ""
+    try:
+        stamp = str((MODEL_DIR / "meta.json").stat().st_mtime_ns)
+    except OSError:
+        stamp = "0"
+    return marker + ":" + stamp
 
 
 def bump_model_version() -> None:
@@ -179,7 +185,7 @@ def bump_model_version() -> None:
     # 2) 落盘递增版本号，让其他进程也能感知
     try:
         _MODEL_VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        cur = _read_model_version()
+        cur = _read_model_version().split(":", 1)[0]
         try:
             nxt = int(cur) + 1 if cur else 1
         except ValueError:
@@ -212,89 +218,55 @@ def _cache_expired() -> bool:
     """模型对象缓存是否已过期（或从未加载、或模型已被重训）。"""
     if _best_model_cache["model"] is None:
         return True
+    try:
+        from app.services.model_manifest import resolve
+        resolve(MODEL_DIR, _best_model_cache['meta'])
+    except Exception:
+        return True
     if time.time() - _best_model_cache["ts"] >= MODEL_CACHE_TTL:
         return True
     # 跨进程失效：训练任务会递增磁盘版本号（见 bump_model_version 的说明）
     return _best_model_cache.get("version") != _read_model_version()
 
 
-def _load_best_model():
-    """加载 AUC 最高的模型，进程级缓存（带 TTL）。返回 (model, name)。
+def select_model(meta):
+    from app.services.model_manifest import select_model as select
+    return select(meta)
 
-    ⚠ 读取失败要**记录并降级**，不能向上抛：
-      本函数被客户列表/风险预测/成本收益/矩阵共同依赖。若 meta.json 正被
-      训练任务写入（旧实现是非原子写，见 train.py 的说明），json.load 或
-      joblib.load 会抛异常。旧实现没有 try —— 异常会一路冒到接口层变成 500，
-      或者被更上层吞掉变成空数据。这里统一转成 (None, None)，由调用方按
-      "模型未就绪"处理，并留下 warning 便于定位。
-    """
+
+def model_artifact(meta, name, root=None):
+    from app.services.model_manifest import artifact
+    return artifact(meta, name, MODEL_DIR if root is None else root)
+
+
+def dataset_fingerprint(df):
+    import hashlib
+    import pandas as pd
+    columns = [c for c in df.columns if c not in ("id", "cluster_id", "risk_score", "risk_level")]
+    stable = df[sorted(columns)].sort_values("customer_id").reset_index(drop=True)
+    return hashlib.sha256(pd.util.hash_pandas_object(stable, index=False).values.tobytes()).hexdigest()
+
+
+def _load_best_model():
+    """使用同一发布清单加载，失败清除旧模型与旧元数据。"""
     if not _cache_expired():
         return _best_model_cache["model"], _best_model_cache["name"]
-
+    from app.services import model_manifest
     import joblib
-
-    meta_path = MODEL_DIR / "meta.json"
-    if not meta_path.exists():
-        return None, None
-
-    # 读取失败大概率是撞上训练写入窗口，短退避重试几次
-    ATTEMPTS = 3
-    meta = None
-    last_err: Exception | None = None
-    for attempt in range(ATTEMPTS):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            break
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            last_err = e
-            if attempt < ATTEMPTS - 1:
-                time.sleep(0.15 * (attempt + 1))
-
-    if meta is None:
-        logger.warning(
-            "risk_scoring: 读取 %s 失败（已重试 %d 次）: %s: %s",
-            meta_path, ATTEMPTS, type(last_err).__name__, last_err,
-        )
-        return None, None
-
-    # ⚠ 结构异常也要降级，不能把 KeyError 抛到接口层。
-    #   实测：meta.json 能被 json.load 解析、但缺 "results" 键（或该键为空、
-    #   或某模型缺 "auc"）时，旧实现会抛
-    #       KeyError: 'results' / ValueError: max() arg is an empty sequence
-    #   并一路冒到 /api/customers 等**所有**依赖本函数的接口，全部 500。
-    #   写入端的原子写只能保证"不出现半截 JSON"，保证不了结构完整
-    #   （手工编辑、旧版本文件、外部工具写入都可能造成结构异常）。
-    #   cost_benefit_service._read_meta 对同类情况是正确降级的，这里与之对齐。
     try:
-        results = meta["results"]
-        if not isinstance(results, dict) or not results:
-            raise ValueError("meta.json 的 results 为空或类型异常")
-        best_name = max(results.keys(), key=lambda x: results[x]["auc"])
-    except (KeyError, TypeError, ValueError, AttributeError) as e:
-        logger.warning(
-            "risk_scoring: %s 结构异常，无法选出最佳模型（降级为模型未就绪）: %s: %s",
-            meta_path, type(e).__name__, e,
-        )
+        manifest = model_manifest.resolve(MODEL_DIR)
+        model = joblib.load(manifest.path)
+        if manifest.revision != model_manifest.revision(MODEL_DIR):
+            raise ValueError("模型发布正在切换，请重试")
+    except Exception as error:
+        _best_model_cache.clear()
+        _best_model_cache.update(name=None, model=None, ts=0.0, version=None,
+            meta=None, error=str(error), status="unavailable")
+        logger.warning("模型加载失败：%s", error)
         return None, None
-
-    model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
-    if not model_path.exists():
-        return None, None
-
-    try:
-        model = joblib.load(model_path)
-    except Exception as e:
-        # joblib 读到半截文件会抛（pickle 反序列化失败），同样降级处理
-        logger.warning("risk_scoring: 加载模型 %s 失败: %s: %s", model_path, type(e).__name__, e)
-        return None, None
-
-    _best_model_cache["model"] = model
-    _best_model_cache["name"] = best_name
-    _best_model_cache["ts"] = time.time()
-    # 记录加载时的版本号；下次调用若发现磁盘版本变了就会自动重载
-    _best_model_cache["version"] = _read_model_version()
-    return model, best_name
+    _best_model_cache.update(model=model, name=manifest.best_model, ts=time.time(),
+        version=manifest.revision, meta=manifest.meta, error=None, status=manifest.status)
+    return model, manifest.best_model
 
 
 # ── 成本收益最优阈值（参考）─────────────────────────────
@@ -328,7 +300,7 @@ def net_profit(tp: int, fp: int, fn: int,
       展开 ROI 会得到 `ROI = COST_RATIO × precision` —— 一个不含任何成功率
       因子的式子。这会把 ROI 系统性高估（按 s=0.3 算，高估约 3.3 倍）。
 
-      默认取 settings.RETENTION_SUCCESS_RATE（0.30，行业保守值）。
+      默认取 settings.RETENTION_SUCCESS_RATE（0.30，演示假设，无实测依据）。
       显式传 1.0 可复现旧行为，仅供对照，不应作为对外口径。
 
     ⚠ 历史沿革（保留以备追溯）：更早的实现是 `tp*1 - fn*cost_ratio - fp*1`，
@@ -394,7 +366,7 @@ def _engine_is_fresh() -> bool:
         return False
     if time.time() - _engine_cache["ts"] >= CACHE_TTL:
         return False
-    if _engine_cache.get("model_version") != _read_model_version():
+    if _cache_expired() or _engine_cache.get("model_version") != _read_model_version():
         return False
     from app.services.data_loader import _read_cache_version
     if _engine_cache.get("customer_version") != _read_cache_version():
@@ -402,8 +374,35 @@ def _engine_is_fresh() -> bool:
     return True
 
 
+_engine_lock = threading.RLock()
+
+
 def _ensure_engine(db: Session):
+    with _engine_lock:
+        return _ensure_engine_locked(db)
+
+
+def _ensure_engine_locked(db: Session):
+    global _engine_cache, _scored_cache
+    try:
+        engine = _build_engine(db)
+        if engine is not None:
+            engine["status"] = "ready"
+            engine["error"] = None
+            return engine
+        error = _best_model_cache.get("error") or "模型文件、数据指纹或评分状态不兼容"
+    except Exception as exception:
+        logger.warning("风险引擎构建失败：%s", exception)
+        error = "风险引擎无法构建，请检查发布文件与数据schema"
+    _engine_cache = _empty_engine_cache()
+    _engine_cache.update(status="unavailable", error=error)
+    _scored_cache = {"data": None, "name": None, "ts": 0.0, "engine_ts": None}
+    return None
+
+
+def _build_engine(db: Session):
     """加载模型 + 全量打分 + 计算分位数阈值 + 成本收益参考。返回缓存 dict 或 None。"""
+    global _engine_cache
     if _engine_is_fresh():
         return _engine_cache
 
@@ -414,8 +413,15 @@ def _ensure_engine(db: Session):
     # 走共享缓存 —— 与 EDA / 成本收益读同一份表，避免三处各读一遍
     # （10 万行实测每次约 2.8 秒）。⚠ 该函数返回共享对象，此处只读不改。
     df = get_cached_customer_df(db)
+    meta = _best_model_cache["meta"]
+    training_matches = not meta.get('dataset_fingerprint') or meta['dataset_fingerprint'] == dataset_fingerprint(df)
+    validation = meta['results'][name].get('threshold_validation')
+    if not training_matches and not validation:
+        logger.error('旧模型缺少独立阈值记录，无法用于滚动数据；需完整发布清单')
+        return None
     X, y, _ = prepare_features(df)
-    raw = model.predict_proba(X)[:, 1]
+    from app.services.shap_contract import positive_class
+    raw = model.predict_proba(X)[:, positive_class(model)]
 
     # 分位数阈值（全量原始概率）
     thresholds = {
@@ -424,31 +430,28 @@ def _ensure_engine(db: Session):
         "medium": float(np.percentile(raw, P_MEDIUM)),
     }
 
-    # ── 决策阈值：在【训练集】上选，避免乐观偏差 ──────────────
-    #
-    # ⚠ 此处是本次修复的重点之一。旧实现是：
-    #       _, test_idx = train_test_split(idx, ...)
-    #       t_opt = _optimal_threshold(raw[test_idx], y[test_idx])   # 在测试集上选
-    #   即「在测试集上挑最优阈值、又在同一测试集上报告指标」—— 阈值本身
-    #   拟合了这批测试数据，指标带乐观偏差，经不起追问。
-    #
-    #   现改为在**训练集**上选阈值，测试集只用于最终的指标报告
-    #   （见 evaluate_at_decision_threshold）。实测两种做法都选中 0.20，
-    #   结论一致，但方法上不再有偏。
+    # 新模型使用训练分区的折外预测选阈值，测试分区只报告最终指标。
+    # 旧模型没有折外记录，保留兼容口径并明确要求重训，不能宣称已消除偏差。
     from sklearn.model_selection import train_test_split
     idx = np.arange(len(df))
-    train_idx, _test_idx = train_test_split(
-        idx, test_size=settings.TEST_SIZE,
-        random_state=settings.RANDOM_STATE, stratify=y,
-    )
-    t_opt = _optimal_threshold(raw[train_idx], y[train_idx])
+    train_idx = None
+    if not validation:
+        train_idx, _test_idx = train_test_split(idx, test_size=settings.TEST_SIZE,
+            random_state=settings.RANDOM_STATE, stratify=y)
+    if validation:
+        t_opt = max(validation, key=lambda row: net_profit(row["tp"], row["fp"], row["fn"]))["threshold"]
+    else:
+        # 兼容旧模型；页面明确标注旧的阈值口径，重训后自动改用折外验证。
+        t_opt = _optimal_threshold(raw[train_idx], y[train_idx])
 
     # 决策阈值在分位数体系中的位置 —— 供前端解释「这条线切掉多少人」
     coverage = float((raw >= t_opt).mean())
 
     # 记录构建时的两个版本号（下次调用据此判断是否需重建，见 _engine_is_fresh）
     from app.services.data_loader import _read_cache_version
-    _engine_cache.update({
+    if _best_model_cache["version"] != _read_model_version():
+        raise ValueError("模型发布已变化，不能发布混合快照")
+    _engine_cache = {
         "df": df,
         "raw": raw,
         "thresholds": thresholds,
@@ -457,9 +460,11 @@ def _ensure_engine(db: Session):
         "decision_coverage": coverage,
         "name": name,
         "ts": time.time(),
-        "model_version": _read_model_version(),
+        "model_version": _best_model_cache["version"],
         "customer_version": _read_cache_version(),
-    })
+        "training_dataset_matches": training_matches,
+        "threshold_basis": "out_of_fold_training_predictions" if validation else "legacy_in_sample_requires_retraining",
+    }
     return _engine_cache
 
 
@@ -1097,7 +1102,7 @@ def classify_single(db: Session, raw_prob: float):
     """单条原始概率 → (概率, 风险等级)。"""
     engine = _ensure_engine(db)
     if engine is None:
-        return round(float(raw_prob), 4), _legacy_level(raw_prob)
+        raise ValueError("风险引擎未就绪，不能使用固定阈值替代")
     p = float(raw_prob)
     return round(p, 4), _level(p, engine["thresholds"])
 
@@ -1109,7 +1114,7 @@ def calibrate_probs(db: Session, raw_probs):
     engine = _ensure_engine(db)
     arr = np.asarray(raw_probs, dtype=float)
     if engine is None:
-        return arr, [_legacy_level(float(p)) for p in arr]
+        raise ValueError("风险引擎未就绪，不能使用固定阈值替代")
     levels = [_level(float(p), engine["thresholds"]) for p in arr]
     return arr, levels
 
@@ -1132,7 +1137,7 @@ def evaluate_at_decision_threshold() -> dict:
 
     返回 {} 表示引擎未就绪或无法评估（调用方应回退展示，不得编数字）。
     """
-    if _engine_cache["raw"] is None:
+    if _engine_cache["raw"] is None or not _engine_cache.get("training_dataset_matches", True):
         return {}
     try:
         from sklearn.model_selection import train_test_split
@@ -1180,6 +1185,11 @@ def evaluate_at_decision_threshold() -> dict:
 
 
 def get_risk_info() -> dict:
+    with _engine_lock:
+        return _get_risk_info_locked()
+
+
+def _get_risk_info_locked() -> dict:
     """当前风险分级标准信息 —— 全系统口径的唯一对外出口。
 
     返回三组信息，语义严格区分（见文件顶部「两个阈值」的说明）：
@@ -1188,6 +1198,10 @@ def get_risk_info() -> dict:
       decision_metrics    决策线在测试集上的实测指标 —— 对外报 recall 时应引用它
       optimal_threshold   保留旧字段名，与 decision_threshold 同值
     """
+    global _engine_cache
+    if _engine_cache["raw"] is not None and not _engine_is_fresh():
+        _engine_cache = _empty_engine_cache()
+        _engine_cache.update(status="unavailable", error="模型或客户快照已变化，需要重新构建引擎")
     if _engine_cache["raw"] is None:
         # ⚠ 冷路径**不得返回伪造的阈值**。旧实现返回写死的
         #   {"critical": 0.7, "high": 0.3, "medium": 0.1}，与真实分位阈值
@@ -1204,6 +1218,9 @@ def get_risk_info() -> dict:
         #   "还没算出来"，而不是拿到一组看似可用的数字。
         return {
             "calibrated": False,
+            "status": "unavailable",
+            "error": _engine_cache.get("error"),
+            "model_version": None,
             "model": None,
             "cost_ratio": COST_RATIO,
             "success_rate": RETENTION_SUCCESS_RATE,
@@ -1217,6 +1234,15 @@ def get_risk_info() -> dict:
         }
     return {
         "calibrated": True,
+        "training_dataset_matches": _engine_cache.get("training_dataset_matches", True),
+        "scoring_cohort": "current_snapshot",
+        "status": "ready",
+        "error": None,
+        "manifest_status": _best_model_cache.get("status"),
+        "probability_calibrated": False,
+        "probability_note": "当前为未校准模型评分；风险等级为相对排名，收益为参数化情景测算。",
+        "threshold_basis": _engine_cache.get("threshold_basis"),
+        "model_version": _engine_cache.get("model_version"),
         "model": _engine_cache["name"],
         "cost_ratio": COST_RATIO,
         # 挽留成功率 —— 必须对外暴露，因为它是"名单规模"的主要决定因素，

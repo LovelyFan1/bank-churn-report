@@ -33,6 +33,8 @@ const USER_KEY = KEY_USER
 export const useAuthStore = defineStore('auth', () => {
   const token = ref(localStorage.getItem(TOKEN_KEY) || '')
   const user = ref(loadUser())
+  const idleTimeout = ref(0)
+  const idleRemaining = ref(0)
 
   function loadUser() {
     try {
@@ -63,6 +65,11 @@ export const useAuthStore = defineStore('auth', () => {
     } catch (_) { /* 隐私模式下可能失败，不影响本次会话 */ }
   }
 
+  function _setPolicy(data) {
+    idleTimeout.value = Number(data.idle_timeout) || 0
+    idleRemaining.value = Number(data.idle_remaining ?? data.idle_timeout) || 0
+  }
+
   /** 第一步：行员号 + 口令。返回 { need_totp, ticket } 或直接完成登录 */
   async function login(username, password) {
     const { data } = await api.post('/auth/login', { username, password })
@@ -70,6 +77,7 @@ export const useAuthStore = defineStore('auth', () => {
       return { needTotp: true, ticket: data.ticket }
     }
     _persist(data.token, data.user)
+    _setPolicy(data)
     return { needTotp: false, user: data.user }
   }
 
@@ -77,14 +85,26 @@ export const useAuthStore = defineStore('auth', () => {
   async function loginTotp(ticket, code) {
     const { data } = await api.post('/auth/login/totp', { ticket, code })
     _persist(data.token, data.user)
+    _setPolicy(data)
     return data.user
   }
 
   /** 拉取当前身份 —— 刷新后校验令牌是否仍有效（可能已过期/被停用） */
   async function fetchMe() {
+    const expectedToken = token.value
     const { data } = await api.get('/auth/me')
+    if (token.value !== expectedToken) throw Object.assign(new Error('会话已变化'), { code: 'ERR_CANCELED' })
     user.value = data.user
+    _setPolicy(data)
     try { localStorage.setItem(USER_KEY, JSON.stringify(data.user)) } catch (_) {}
+    return data
+  }
+
+  async function reportActivity() {
+    const expectedToken = token.value
+    const { data } = await api.post('/auth/activity')
+    if (token.value !== expectedToken) throw Object.assign(new Error('会话已变化'), { code: 'ERR_CANCELED' })
+    _setPolicy(data)
     return data
   }
 
@@ -115,6 +135,8 @@ export const useAuthStore = defineStore('auth', () => {
     resetAssignees()
     token.value = ''
     user.value = null
+    idleTimeout.value = 0
+    idleRemaining.value = 0
   }
 
   /** 清除本地身份（令牌失效 / 会话超时时调用，不发登出请求） */
@@ -123,10 +145,12 @@ export const useAuthStore = defineStore('auth', () => {
     resetAssignees()
     token.value = ''
     user.value = null
+    idleTimeout.value = 0
+    idleRemaining.value = 0
   }
 
   return {
     token, user, isLoggedIn, displayName, roleLabel, permissions,
-    can, login, loginTotp, fetchMe, logout, clear,
+    idleTimeout, idleRemaining, can, login, loginTotp, fetchMe, reportActivity, logout, clear,
   }
 })

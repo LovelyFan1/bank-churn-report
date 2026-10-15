@@ -6,6 +6,7 @@
 
 import json
 import os
+import uuid
 import numpy as np
 from pathlib import Path
 from celery.exceptions import SoftTimeLimitExceeded
@@ -15,9 +16,13 @@ from app.database import SessionLocal
 from app.models.customer import Customer
 from app.models.model_result import ModelResult
 from app.services.data_loader import DataLoader, prepare_features, FEATURE_NAMES
+from app.services.task_submission import track_submission
 from app.config import settings
 
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.base import clone
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import (
@@ -35,15 +40,15 @@ MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 def _get_models():
     """返回模型字典 — 独立函数方便测试和复用。"""
     return {
-        "Logistic Regression": LogisticRegression(
+        "Logistic Regression": make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, random_state=settings.RANDOM_STATE
-        ),
+        )),
         "Random Forest": RandomForestClassifier(
             n_estimators=100, random_state=settings.RANDOM_STATE, n_jobs=-1
         ),
         "XGBoost": xgb.XGBClassifier(
             n_estimators=100, learning_rate=0.1, max_depth=5,
-            random_state=settings.RANDOM_STATE, use_label_encoder=False,
+            random_state=settings.RANDOM_STATE,
             eval_metric="logloss",
         ),
         "LightGBM": lgb.LGBMClassifier(
@@ -57,37 +62,26 @@ def _get_models():
     }
 
 
-def _best_threshold_on_train(model, X_train, y_train) -> float:
-    """在**训练集**上求净收益最大的概率切点（决策阈值）。
-
-    ⚠ 为什么在训练集上选（而不是测试集）：
-      如果在测试集上挑最优阈值、又在同一测试集上报告指标，阈值本身
-      拟合了这批数据，指标会带**乐观偏差**、经不起追问。
-      正确做法是训练集选阈值、测试集评估，两侧不重叠。
-
-    ⚠ 与 risk_scoring.net_profit 同口径（统一走那个函数，不再本地复制公式）。
-      口径自引入「挽留成功率 s」后的变化（见 config.RETENTION_SUCCESS_RATE）：
-          TP 记 +(s × cost_ratio − 1)，FP 记 -1，FN 记 0
-      此前 TP 记 +(cost_ratio − 1)，等价于 s=1.0，会把阈值选得**偏松**
-      （名单偏大）。实测 s 从 1.0 降到 0.30 时，最优阈值从 0.20 升到 0.60。
-
-      ⚠ 这里必须与 risk_scoring 用同一个函数而不是各写一份 ——
-        两处若口径漂移，会出现「meta.json 说阈值 0.2、线上按 0.6 运营」
-        这类无法对账的情况（正是本项目反复出现的缺陷类型）。
-    """
-    from app.services import risk_scoring
-
-    p = model.predict_proba(X_train)[:, 1]
-    best_t, best_profit = 0.5, -float("inf")
+def _threshold_validation(model, X_train, y_train):
+    """仅用训练分区的折外预测调阈值，测试分区只用于最终评估。"""
+    cv = StratifiedKFold(n_splits=settings.CV_FOLDS, shuffle=True,
+                        random_state=settings.RANDOM_STATE)
+    p = np.empty(len(y_train), dtype=float)
+    aucs = []
+    for fit_idx, validation_idx in cv.split(X_train, y_train):
+        fitted = clone(model).fit(X_train[fit_idx], y_train[fit_idx])
+        p[validation_idx] = fitted.predict_proba(X_train[validation_idx])[:, 1]
+        aucs.append(roc_auc_score(y_train[validation_idx], p[validation_idx]))
+    grid = []
     for t in np.arange(0.05, 0.96, 0.05):
-        pred = (p >= t).astype(int)
-        tp = int(np.sum((pred == 1) & (y_train == 1)))
-        fp = int(np.sum((pred == 1) & (y_train == 0)))
-        fn = int(np.sum((pred == 0) & (y_train == 1)))
-        profit = risk_scoring.net_profit(tp, fp, fn)
-        if profit > best_profit:
-            best_profit, best_t = profit, float(t)
-    return best_t
+        pred = p >= t
+        grid.append({"threshold": round(float(t), 4),
+                     "tp": int(np.sum(pred & (y_train == 1))),
+                     "fp": int(np.sum(pred & (y_train == 0))),
+                     "fn": int(np.sum(~pred & (y_train == 1)))})
+    from app.services import risk_scoring
+    best = max(grid, key=lambda r: risk_scoring.net_profit(r["tp"], r["fp"], r["fn"]))
+    return best["threshold"], grid, np.asarray(aucs)
 
 
 def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> dict:
@@ -104,10 +98,10 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
       时真实会发生的结果），同时保留默认 0.5 阈值下的指标供对照，
       字段名加 `at_default` 后缀，避免混淆。
     """
+    decision_thr, validation_grid, cv_scores = _threshold_validation(model, X_train, y_train)
     model.fit(X_train, y_train)
 
     # ── 决策阈值：训练集选 ─────────────────────────────────
-    decision_thr = _best_threshold_on_train(model, X_train, y_train)
     y_proba = model.predict_proba(X_test)[:, 1]
     y_pred = (y_proba >= decision_thr).astype(int)      # 主口径
     y_pred_def = (y_proba >= 0.5).astype(int)           # 对照口径
@@ -130,6 +124,8 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
     # 特征重要性
     if hasattr(model, "feature_importances_"):
         importance = model.feature_importances_.tolist()
+    elif hasattr(model, "named_steps"):
+        importance = np.abs(model[-1].coef_[0]).tolist()
     elif hasattr(model, "coef_"):
         importance = np.abs(model.coef_[0]).tolist()
     else:
@@ -137,8 +133,6 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
     feature_importance = dict(zip(FEATURE_NAMES, importance))
 
     # 交叉验证
-    cv = StratifiedKFold(n_splits=settings.CV_FOLDS, shuffle=True, random_state=settings.RANDOM_STATE)
-    cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="roc_auc")
     cv_mean = float(cv_scores.mean()) if not np.isinf(cv_scores.mean()) else 0.0
     cv_std = float(cv_scores.std()) if not np.isinf(cv_scores.std()) else 0.0
 
@@ -149,6 +143,8 @@ def _train_and_evaluate(model, name: str, X_train, X_test, y_train, y_test) -> d
         "recall": round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
         "f1_score": round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
         "decision_threshold": round(float(decision_thr), 4),
+        "threshold_basis": "out_of_fold_training_predictions",
+        "threshold_validation": validation_grid,
         # ── 对照指标：默认 0.5 阈值下（保留以便追溯，不作为对外口径）──
         "at_default": {
             "threshold": 0.5,
@@ -193,46 +189,29 @@ def _atomic_write_bytes(target: Path, write_fn) -> None:
     os.replace(tmp, target)   # 同目录内原子替换
 
 
-def _save_results_to_disk(models: dict, results: dict, shap_results: dict = None):
-    """将模型文件、元数据、SHAP 结果持久化到磁盘（全部原子写入）。
-
-    写入顺序有意为之：
-        1. 先把**所有**模型写成 .tmp（此时对读取方完全不可见）；
-        2. 逐个 os.replace 模型文件；
-        3. **最后**替换 meta.json。
-
-    因为读取方的入口是 meta.json（先读它选出 best model，再加载对应文件），
-    把 meta.json 放在最后意味着：只有全部模型都就位后，新的 meta 才会出现。
-    残留的窗口是「新 meta 尚未发布、但模型文件已是新版本」，此时旧 meta 仍指向
-    可以正常加载并预测的模型，只是版本略新 —— 不会崩、不会空框。
-    """
+def _save_results_to_disk(models: dict, results: dict, shap_results: dict = None, data_fingerprint=None):
+    """先写不可变模型版本，再原子发布唯一清单；并发任务不会混用文件。"""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── 1) 全部先写临时文件 ──────────────────────────────
-    pending: list[tuple[Path, Path]] = []   # (tmp, final)
+    version = uuid.uuid4().hex
+    generation = MODEL_DIR / "versions" / version
+    generation.mkdir(parents=True)
+    model_files = {}
     for name, model in models.items():
         filename = name.lower().replace(" ", "_") + ".joblib"
-        final = MODEL_DIR / filename
-        tmp = final.with_name(final.name + ".tmp")
-        joblib.dump(model, tmp)
-        pending.append((tmp, final))
-
-    meta = {
-        "results": results,
-        "feature_names": FEATURE_NAMES,
-        "shap_global": shap_results or {},
-    }
-    meta_final = MODEL_DIR / "meta.json"
-    meta_tmp = meta_final.with_name(meta_final.name + ".tmp")
-    with open(meta_tmp, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
-
-    # ── 2) 原子替换模型文件 ──────────────────────────────
-    for tmp, final in pending:
-        os.replace(tmp, final)
-
-    # ── 3) meta.json 最后发布（读取方的"提交点"）─────────
-    os.replace(meta_tmp, meta_final)
+        path = generation / filename
+        joblib.dump(model, path)
+        model_files[name] = str(path.relative_to(MODEL_DIR))
+    meta = {"results": results, "feature_names": FEATURE_NAMES,
+            "shap_global": shap_results or {}, "version": version, "model_files": model_files,
+            "best_model": max(results, key=lambda name: results[name]["cv_auc_mean"]),
+            "selection_basis": "training_cross_validation_auc", "probability_calibrated": False,
+            "dataset_fingerprint": data_fingerprint}
+    meta_tmp = MODEL_DIR / ("meta." + version + ".tmp")
+    from app.services.model_manifest import resolve
+    resolve(MODEL_DIR, meta)  # 完整文件集合及schema校验通过后才发布。
+    (generation / "manifest.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    meta_tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    os.replace(meta_tmp, MODEL_DIR / "meta.json")
 
 
 def _compute_shap(models: dict, X_test, y_test) -> dict:
@@ -255,8 +234,8 @@ def _compute_shap(models: dict, X_test, y_test) -> dict:
                 )
             shap_values = explainer.shap_values(X_sample)
 
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]
+            from app.services.shap_contract import normalize
+            shap_values, _ = normalize(shap_values, explainer.expected_value, model, X_sample.shape)
 
             mean_abs_shap = np.abs(shap_values).mean(axis=0)
             shap_results[name] = dict(
@@ -296,7 +275,8 @@ def _save_results_to_db(db, results: dict):
 
 
 @celery_app.task(bind=True, name="train_all_models")
-def train_all_models_task(self) -> dict:
+@track_submission
+def train_all_models_task(self, data_snapshot: str | None = None) -> dict:
     """Celery 任务: 训练全部模型并持久化。
 
     Returns:
@@ -304,6 +284,9 @@ def train_all_models_task(self) -> dict:
     """
     db = SessionLocal()
     try:
+        from app.services.data_loader import _read_cache_version
+        if data_snapshot is not None and data_snapshot != _read_cache_version():
+            return {'status': 'failed', 'error': '客户数据已改变，请使用新任务重新提交'}
         self.update_state(state="PROGRESS", meta={"step": "loading", "message": "加载数据..."})
 
         loader = DataLoader(db)
@@ -339,7 +322,10 @@ def train_all_models_task(self) -> dict:
 
         self.update_state(state="PROGRESS", meta={"step": "saving", "message": "保存模型和结果..."})
 
-        _save_results_to_disk(models, results, shap_results)
+        from app.services import risk_scoring
+        if data_snapshot is not None and data_snapshot != _read_cache_version():
+            return {'status': 'failed', 'error': '训练期间客户数据改变，未发布该模型'}
+        _save_results_to_disk(models, results, shap_results, risk_scoring.dataset_fingerprint(df))
         _save_results_to_db(db, results)
 
         # ⚠ 让 **backend 进程** 感知到「模型已换新」。
@@ -356,7 +342,7 @@ def train_all_models_task(self) -> dict:
         from app.services import risk_scoring
         risk_scoring.bump_model_version()
 
-        best_model = max(results.keys(), key=lambda x: results[x]["auc"])
+        best_model = max(results.keys(), key=lambda x: results[x]["cv_auc_mean"])
 
         return {
             "status": "completed",

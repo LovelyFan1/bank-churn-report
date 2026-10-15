@@ -36,6 +36,8 @@ Agent 不应独断。MVP 先用"返回待确认 + 前端按钮"实现，
 
 import json
 import os
+import time
+from contextvars import ContextVar
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +47,7 @@ from typing import Any
 # 宿主调试时可用环境变量覆盖。
 _BASE = os.environ.get("AGENT_SELF_BASE", "http://127.0.0.1:8000")
 _TIMEOUT = 30
+_request_deadline = ContextVar("agent_request_deadline", default=None)
 
 
 def _headers() -> dict:
@@ -66,13 +69,17 @@ def _headers() -> dict:
 
 
 def _get(path: str, **params) -> Any:
-    """调用本系统自己的 GET 接口。失败时抛异常，由上层转成 tool error。"""
+    """GET 只读接口；超时受本轮查询的软时间预算限制。"""
+    deadline = _request_deadline.get()
+    remaining = deadline - time.monotonic() if deadline is not None else _TIMEOUT
+    if remaining <= 0:
+        raise TimeoutError("智能体查询已达到时间预算")
     clean = {k: v for k, v in params.items() if v is not None}
     url = _BASE + path
     if clean:
         url += "?" + urllib.parse.urlencode(clean, doseq=True)
     req = urllib.request.Request(url, headers=_headers())
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+    with urllib.request.urlopen(req, timeout=min(_TIMEOUT, remaining)) as r:
         return json.loads(r.read().decode())
 
 
@@ -93,8 +100,14 @@ def get_customer_risk(customer_id: str) -> dict:
     keep = ["customer_id", "surname", "geography", "age", "balance",
             "probability", "risk_level", "value_tier", "expected_value",
             "risk_factors", "channel", "action", "strategy", "reason",
-            "has_active_order"]
+            "has_active_order", "exited"]
     out = {k: d.get(k) for k in keep if k in d}
+    out["risk_factors_source"] = "business_rules"
+    out["risk_factors_note"] = "规则提示不代表模型归因，也不证明因果关系。"
+    try:
+        out["model_explanation"] = _get(f"/api/customers/{urllib.parse.quote(str(customer_id))}/explanation")
+    except Exception as e:
+        out["model_explanation"] = {"error": f"模型解释不可用：{type(e).__name__}"}
     # 补个体经济性 —— 与 note_service / worthiness 同一口径
     try:
         note = _get(f"/api/customers/{urllib.parse.quote(str(customer_id))}/suggested-note")
@@ -109,169 +122,50 @@ def list_customers(risk_level: str | None = None,
                    value_tier: str | None = None,
                    min_balance: float | None = None,
                    max_balance: float | None = None,
-                   sort_by: str = "expected_value",
-                   limit: int = 10,
-                   offset: int = 0) -> dict:
-    """按条件查客户名单。
-
-    risk_level: CRITICAL / HIGH / MEDIUM / LOW
-    value_tier: HIGH / LOW / ZERO
-    sort_by:    expected_value（默认，按"值得投入多少"排）或 probability
-    limit:      返回条数，1~50
-    offset:     跳过前几条（用于「另外几个」「再要一批」）
-
-    ⚠ **用户说「另外三个」「再调几个」「还有吗」时必须传 offset** ——
-      传成上一次的 limit（例如上次取了 3 条，这次 offset=3）。
-      不传的话会**返回一模一样的名单**，用户会以为系统坏了。
-      实测缺陷（用户报告）：说「另外三个」时返回的还是原来那三位。
-
-      offset + limit 都受后端约束：后端 page_size 上限 100，
-      故 offset 超过 100 时本函数会如实说明"无法再往后翻"，
-      而不是静默返回空列表。
-
-    ⚠ 「价值一般 / 中等价值 / 普通客户」→ value_tier 传 **LOW**
-      （本系统价值层只有三档：HIGH ≥10万 / LOW 0~10万 / ZERO 零余额）。
-      不要因为"一般"听起来像中间档就臆造一个不存在的枚举值。
-
-    ⚠ 只返回前 limit 条，并**如实告知总数**。不要假装这是全部 ——
-      `/api/customers` 的 page_size 上限是 100，而决策线内有 6,582 人，
-      任何"给我全部值得打的人"都无法一次返回。
-
-    ⚠ min_balance / max_balance 在本系统**没有后端参数**（接口不支持），
-      故此处用本地过滤实现，并会在返回里标注 `post_filtered: true`
-      以免调用方误以为这是服务端筛选。
-
-    ⚠ 返回的每一项都带 `has_active_order` 与 `worthiness`（见下）。
-      这两个字段是**给界面用的**，由本函数从后端确定性地取回，
-      不经过 LLM —— 前端据此把"已有工单"的人置灰、
-      把"不值得救"的人标出来。若交给 LLM 转述，它可能漏掉或说错。
-    """
-    limit = max(1, min(int(limit or 10), 50))
+                   sort_by: str = "expected_value", limit: int = 10, offset: int = 0,
+                   exited: int = 0, has_order: bool | None = False,
+                   worth_only: bool = False, geography: str | None = None,
+                   exclude_ids: list[str] | None = None, expected_version: str | None = None) -> dict:
+    """查询客户名单；默认仅未流失且没有在途工单，所有筛选在服务端分页前完成。"""
+    limit = int(limit or 10)
+    if not 1 <= limit <= 50:
+        raise ValueError("一次查询支持1至50位，请明确拆分请求")
+    if len(exclude_ids or []) > 500:
+        raise ValueError("连续名单已达500位，请明确开启新范围查询")
     offset = max(0, int(offset or 0))
-    # 后端只支持 sort_by ∈ {probability, expected_value, balance, age, credit_score}。
-    # 传非法值会**静默回退**到 probability（实测），因此这里必须自己校验，
-    # 否则 Agent 以为按期望价值排了、实际是按概率排的。
-    allowed_sort = {"expected_value", "probability", "balance", "age", "credit_score"}
-    if sort_by not in allowed_sort:
-        sort_by = "expected_value"
-
-    need_local = min_balance is not None or max_balance is not None
-
-    # ── offset → 后端分页参数 ─────────────────────────────
-    #
-    # 后端不直接收 offset，只收 page / page_size（内部换算）。
-    # ⚠ 两个硬约束必须在这里处理，否则会**静默返回错数据**：
-    #   1) page_size ≤ 100
-    #   2) 本地过滤（min/max_balance）在**取回之后**做，
-    #      故分页窗口要按"过滤前"算 —— 否则翻页会漏掉/重复客户。
-    #      做法：本地过滤时固定取一页足够大的窗口（100 条），
-    #      用 offset 决定从第几个窗口开始。
-    page_size_cap = 100
-    if need_local:
-        # 过滤场景：按 100 条一页往后翻，保证窗口不重叠
-        fetch = page_size_cap
-        page = offset // page_size_cap + 1
-        skip_in_page = offset % page_size_cap
-    else:
-        fetch = limit
-        page = offset // max(limit, 1) + 1
-        skip_in_page = offset % max(limit, 1)
-
-    if offset >= page_size_cap and not need_local:
-        # 后端 page_size 上限 100 → 无法用单页表达超过 100 的偏移。
-        # 不静默返回空列表，而是如实说明，让模型改用更精确的筛选条件。
-        return {
-            "items": [],
-            "returned": 0,
-            "offset": offset,
-            "limit": limit,
-            "note": (f"无法从第 {offset + 1} 位开始返回："
-                     f"本接口单次最多取前 {page_size_cap} 条。"
-                     f"请改用更精确的筛选条件（如限定 risk_level / value_tier），"
-                     f"或分段多次查询。"),
-            "is_complete": False,
-        }
-
-    d = _get("/api/customers", page=page, page_size=fetch,
-             risk_level=risk_level, value_tier=value_tier,
-             sort_by=sort_by, sort_order="desc")
-
-    items = d.get("items", [])
-    if need_local:
-        if min_balance is not None:
-            items = [c for c in items if (c.get("balance") or 0) >= min_balance]
-        if max_balance is not None:
-            items = [c for c in items if (c.get("balance") or 0) <= max_balance]
-        # 本地过滤后再按页内偏移切
-        items = items[skip_in_page:]
-
-    items = items[:limit]
-
-    keep = ["customer_id", "surname", "balance", "probability",
-            "risk_level", "value_tier", "expected_value", "channel",
-            "action", "has_active_order"]
-
-    # ── 富化：补 worthiness（个体经济性） ─────────────────────
-    # 逐条调 /suggested-note 会比批量端点慢，故用批量端点一次取回。
-    # ⚠ 批量端点上限 200，此处 limit ≤ 50，安全。
-    wmap: dict[str, dict] = {}
-    ids = [c.get("customer_id") for c in items if c.get("customer_id")]
-    if ids:
-        try:
-            q = "&".join(f"customer_ids={urllib.parse.quote(str(i))}" for i in ids)
-            bd = _get(f"/api/customers/suggested-notes/batch?{q}")
-            for it in bd.get("items", []):
-                wmap[it["customer_id"]] = {
-                    "verdict": (it.get("worthiness") or {}).get("verdict"),
-                    "net": (it.get("worthiness") or {}).get("net"),
-                    "ratio": (it.get("worthiness") or {}).get("ratio"),
-                    "breakeven": (it.get("worthiness") or {}).get("breakeven"),
-                }
-        except Exception as e:
-            # 富化失败不阻断主查询 —— worthiness 是增强信息，
-            # 缺了它前端只是少一个标记，不该让整个名单查不出来
-            wmap = {"__error__": f"{type(e).__name__}: {e}"}  # type: ignore
-
-    out_items = []
-    for c in items:
-        row = {k: c.get(k) for k in keep if k in c}
-        cid = c.get("customer_id")
-        row["worthiness"] = wmap.get(cid)
-        out_items.append(row)
-
-    total = d.get("total")
-    # 可建单人数：排除已有进行中工单的 —— 前端据此显示"为 N 人建单"
-    buildable = [r["customer_id"] for r in out_items
-                 if not r.get("has_active_order")]
-    blocked = [r["customer_id"] for r in out_items
-               if r.get("has_active_order")]
-
-    return {
-        "items": out_items,
-        "returned": len(out_items),
-        "matched_total": total,          # 符合筛选条件的总数
-        # ⚠ 本次跳过了前 offset 条 —— 回传出去，让模型知道
-        #   "这不是第一页"，也便于它算下一次该用多少 offset。
-        "offset": offset,
-        "limit": limit,
-        # next_offset：模型要"再要一批"时直接用这个值，不必自己算
-        # （避免它把 offset 和 limit 搞混，返回重复名单）
-        "next_offset": offset + len(out_items),
-        # is_complete 表达"这一轮的名单是否已覆盖全部符合条件的人"。
-        # ⚠ 必须把 offset 算进去：从第 50 位取 10 条时，即使返回了 10 条，
-        #   也远未取完 —— 旧实现只比 len 与 total，会误报"已完整"。
-        "is_complete": (offset + len(out_items)) >= (total or 0),
-        "sorted_by": sort_by,
-        "post_filtered": need_local,     # True = 含本地过滤，非服务端
-        # 供界面直接使用的确定性派生量（不经过 LLM）
-        "buildable_customer_ids": buildable,
-        "blocked_by_active_order": blocked,
-        "note": (
-            f"这是第 {offset + 1}~{offset + len(out_items)} 位，"
-            f"符合条件共 {total} 条。如需继续，传 offset={offset + len(out_items)}。"
-            if total and (offset + len(out_items)) < total else ""
-        ),
-    }
+    if sort_by not in {"expected_value", "probability", "balance", "age", "credit_score"}:
+        raise ValueError("不支持该排序字段")
+    d = _get("/api/customers", page_size=limit, offset=0 if exclude_ids else offset,
+             risk_level=risk_level, value_tier=value_tier, min_balance=min_balance,
+             max_balance=max_balance, exited=exited,
+             has_order=str(has_order).lower() if has_order is not None else None,
+             worth_only=str(worth_only).lower(), sort_by=sort_by, sort_order="desc",
+             geography=geography, exclude_ids=exclude_ids)
+    if d.get("error"):
+        raise ValueError(d["error"])
+    version = (d.get("risk") or {}).get("model_version")
+    if expected_version and version != expected_version:
+        raise ValueError("模型快照已改变，旧名单游标不可继续，请重新查询")
+    keep = ["customer_id", "surname", "balance", "probability", "exited",
+            "risk_level", "value_tier", "expected_value", "channel", "action", "has_active_order"]
+    rows = []
+    for c in d.get("items", []):
+        row = {k: c[k] for k in keep if k in c}
+        from app.services import risk_scoring
+        row["worthiness"] = risk_scoring.worthiness(c["probability"], c["balance"],
+                                                  expected_value=c.get("expected_value"))
+        rows.append(row)
+    total = d.get("matched_total", d.get("total", 0))
+    return {"items": rows, "returned": len(rows), "matched_total": total,
+            "offset": offset, "limit": limit, "next_offset": offset + len(rows),
+            "is_complete": offset + len(rows) >= total, "sorted_by": sort_by,
+            "model_version": version,
+            "post_filtered": False,
+            "buildable_customer_ids": [r["customer_id"] for r in rows
+                                        if r.get("exited") == 0 and not r.get("has_active_order")],
+            "blocked_by_active_order": [r["customer_id"] for r in rows if r.get("has_active_order")],
+            "note": (f"已返回 {len(rows)} 条，符合条件共 {total} 条；下一页 offset={offset + len(rows)}。"
+                     if offset + len(rows) < total else "")}
 
 
 def get_model_thresholds() -> dict:
@@ -293,6 +187,8 @@ def get_model_thresholds() -> dict:
         "cost_ratio": d.get("cost_ratio"),
         "success_rate": d.get("success_rate"),
         "success_rate_source": d.get("success_rate_source"),
+        "probability_note": d.get("probability_note"),
+        "threshold_basis": d.get("threshold_basis"),
         "decision_metrics": {
             "precision": m.get("precision"),
             "recall": m.get("recall"),
@@ -309,7 +205,7 @@ def get_model_thresholds() -> dict:
 
 
 def get_business_summary() -> dict:
-    """查成本收益推算：年度流失、期望挽留人数、干预投入、ROI。
+    """查成本收益推算：样本流失、期望挽留人数、干预投入、ROI。
 
     ⚠ 全部是**推算值**（基于假设客单价与假设挽留成功率），
       不是实际业务结果。回答时必须带上这一点。
@@ -322,6 +218,11 @@ def get_business_summary() -> dict:
             "tp_at_threshold", "expected_retained", "expected_reduced_loss",
             "roi", "basis", "note"]
     return {k: d.get(k) for k in keep if k in d}
+
+
+def get_retention_summary() -> dict:
+    """查询工单标记的挽留结果，明确演示数据及未经回访验证的限制。"""
+    return _get("/api/cost-benefit/retention-summary")
 
 
 def get_workorder_stats() -> dict:
@@ -339,17 +240,20 @@ def get_workorder_stats() -> dict:
         "in_progress": d.get("in_progress"),
         "completed": d.get("completed"),
         "lost": d.get("lost"),
+        "cancelled": d.get("cancelled", 0),
         "assignees": d.get("assignees"),
         "status_meaning": {
             "pending": "待处理", "in_progress": "处理中",
             "completed": "已完成（已标记挽留结果）", "lost": "已流失",
+            "cancelled": "已取消（保留记录，不计入挽留结果）",
         },
     }
 
 
 def list_work_orders(status: str | None = None,
                      assignee: str | None = None,
-                     limit: int = 20) -> dict:
+                     limit: int = 20,
+                     customer_id: str | None = None) -> dict:
     """列出具体工单（含编号、客户、负责人、状态）。
 
     status:   pending / in_progress / completed / lost，留空为全部
@@ -364,12 +268,12 @@ def list_work_orders(status: str | None = None,
     limit = max(1, min(int(limit or 20), 50))
     # 状态白名单校验 —— 传非法值后端会返回空列表而非报错，
     # 会让人误以为"没有这类工单"（与 sort_by 静默回退同类问题）
-    allowed = {"pending", "in_progress", "completed", "lost"}
+    allowed = {"pending", "in_progress", "completed", "lost", "cancelled"}
     if status and status not in allowed:
-        status = None
+        raise ValueError("无效工单状态，不会退回全量查询")
 
     d = _get("/api/work-orders", page=1, page_size=limit,
-             status=status, assignee=assignee)
+             status=status, assignee=assignee, customer_id=customer_id)
 
     keep = ["id", "customer_id", "customer_name", "risk_level",
             "status", "result", "assignee", "strategy",
@@ -389,9 +293,10 @@ def list_work_orders(status: str | None = None,
         "is_complete": len(items) >= (total or 0),
         "filter_status": status,
         "filter_assignee": assignee,
+        "filter_customer_id": customer_id,
         "status_meaning": {
             "pending": "待处理", "in_progress": "处理中",
-            "completed": "已完成", "lost": "已流失",
+            "completed": "已完成", "lost": "已流失", "cancelled": "已取消",
         },
         "note": (f"仅返回前 {len(items)} 条，符合条件共 {total} 条。"
                  if total and len(items) < total else ""),
@@ -437,6 +342,8 @@ def propose_create_work_order(customer_id: str,
         "value_tier_snapshot": d.get("value_tier"),
         "expected_value_snapshot": d.get("expected_value"),
     }
+    if d.get("exited") != 0 or d.get("has_active_order"):
+        raise ValueError("客户已流失或已有在途工单，不能准备挽留建单")
     if not note:
         try:
             sn = _get(f"/api/customers/{urllib.parse.quote(str(customer_id))}/suggested-note")
@@ -481,7 +388,11 @@ def propose_create_work_orders_batch(customer_ids: list[str],
     ids = [c for c in ids if not (c in seen or seen.add(c))]
     if not ids:
         return {"__error__": "customer_ids 不能为空"}
-    ids = ids[:20]
+    if len(ids) > 50:
+        return {"__error__": "单份名单最多50位，请明确拆分请求"}
+    requested_ids = list(ids)
+    remaining_ids = ids[20:]
+    ids = ids[:20]  # 显式分批，剩余对象随提议返回，下一批仍需确认。
 
     items: list[dict] = []
     failed: list[dict] = []
@@ -493,6 +404,9 @@ def propose_create_work_orders_batch(customer_ids: list[str],
             continue
         if not d or not d.get("customer_id"):
             failed.append({"customer_id": cid, "reason": "客户不存在"})
+            continue
+        if d.get("exited") != 0 or d.get("has_active_order"):
+            failed.append({"customer_id": cid, "reason": "已流失或已有在途工单"})
             continue
         item = {
             "customer_id": d.get("customer_id"),
@@ -519,7 +433,7 @@ def propose_create_work_orders_batch(customer_ids: list[str],
             pass   # 理由生成失败不阻断提议
         items.append(item)
 
-    if not items:
+    if not items and not remaining_ids:
         return {"__error__": "没有任何可建单的客户："
                              + "；".join(f"{f['customer_id']}({f['reason']})"
                                         for f in failed[:3])}
@@ -531,6 +445,9 @@ def propose_create_work_orders_batch(customer_ids: list[str],
                    + (f"，负责人 {assignee}" if assignee else ""),
         "items": items,
         "failed": failed,
+        "requested_customer_ids": requested_ids,
+        "remaining_customer_ids": remaining_ids,
+        "batch_limit": 20,
         "requires_confirmation": True,
     }
 
@@ -538,22 +455,24 @@ def propose_create_work_orders_batch(customer_ids: list[str],
 def propose_update_work_order(order_id: int,
                               status: str | None = None,
                               assignee: str | None = None,
-                              note: str | None = None) -> dict:
+                              note: str | None = None,
+                              customer_id: str | None = None) -> dict:
     """**提议**修改工单（改状态/负责人/备注），不会立即执行。
 
     status: pending / in_progress / completed / lost
 
     用这个回答「把这张单标为已完成」「派给李铭」「取消这张待处理工单」。
 
-    ⚠ "取消"在本系统的语义是：把工单**删除**或**改回非进行中状态**。
-      若用户说"取消工单"，通常想要的是**删除**（不再跟进），
-      故请用 propose_delete_work_order；若只是想停止处理，
-      用本工具把 status 改成合适的值。
-      拿不准时，先向用户确认要删除还是改状态。
+    取消使用 status=cancelled，保留记录；仅允许取消待处理或处理中工单。
+    customer_id 必须是用户指定或当前焦点客户，不得从其他客户的工单反推。
 
     ⚠ 这是**写操作**，必须经用户确认。不要在回答里声称"已经改好了"。
     """
     d = _get(f"/api/work-orders/{int(order_id)}")
+    if not customer_id or d.get("customer_id") != customer_id.upper():
+        raise ValueError("工单不属于指定客户，已拦截")
+    if status == "cancelled" and d.get("status") not in ("pending", "in_progress"):
+        raise ValueError("只能取消待处理或处理中的工单")
     return {
         "__pending_action__": True,
         "action": "update_work_order",
@@ -563,6 +482,7 @@ def propose_update_work_order(order_id: int,
                     + (f"，负责人改为 {assignee}" if assignee else "")),
         "payload": {
             "order_id": int(order_id),
+            "customer_id": customer_id.upper(),
             "status": status,
             "assignee": assignee,
             "note": note,
@@ -577,10 +497,10 @@ def propose_update_work_order(order_id: int,
     }
 
 
-def propose_delete_work_order(order_id: int) -> dict:
-    """**提议**删除工单（即"取消这张单"），不会立即执行。
+def propose_delete_work_order(order_id: int, customer_id: str | None = None) -> dict:
+    """**提议**永久删除工单，仅适用于用户明确要求删除，不等于取消。
 
-    用这个回答「取消这张工单」「删掉这个待处理单」。
+    取消请用 propose_update_work_order(status='cancelled')。
 
     ⚠ 删除是不可逆的。返回体里带 `current`（当前状态与客户），
       供前端在确认面板上把"要删的是哪一张"显示清楚 ——
@@ -589,13 +509,15 @@ def propose_delete_work_order(order_id: int) -> dict:
     ⚠ 这是**写操作**，必须经用户确认。不要在回答里声称"已经删了"。
     """
     d = _get(f"/api/work-orders/{int(order_id)}")
+    if not customer_id or d.get("customer_id") != customer_id.upper():
+        raise ValueError("工单不属于指定客户，已拦截")
     return {
         "__pending_action__": True,
         "action": "delete_work_order",
-        "summary": (f"取消（删除）工单 #{order_id} —— "
+        "summary": (f"永久删除工单 #{order_id} —— "
                     f"客户 {d.get('customer_id')} {d.get('customer_name')}，"
                     f"当前状态 {d.get('status')}"),
-        "payload": {"order_id": int(order_id)},
+        "payload": {"order_id": int(order_id), "customer_id": customer_id.upper()},
         "current": {
             "status": d.get("status"),
             "assignee": d.get("assignee"),
@@ -617,6 +539,11 @@ def propose_delete_work_order(order_id: int) -> dict:
 #     · 用户要的是"我能用它做什么"，不是"这个函数内部怎么实现的"
 #   两者同源于本表，因此不会出现"界面说的和实际工具不符"。
 TOOL_SPECS = {
+    "get_retention_summary": {
+        "fn": get_retention_summary, "write": False,
+        "label": "查工单挽留结果及数据来源限制",
+        "description": get_retention_summary.__doc__,
+    },
     "get_customer_risk": {
         "fn": get_customer_risk,
         "write": False,
@@ -638,7 +565,7 @@ TOOL_SPECS = {
     "get_business_summary": {
         "fn": get_business_summary,
         "write": False,
-        "label": "查成本收益推算：年度流失、期望挽留人数、干预投入、ROI",
+        "label": "查成本收益推算：样本流失、期望挽留人数、干预投入、ROI",
         "description": get_business_summary.__doc__.strip().split("\n")[0],
     },
     "get_workorder_stats": {
@@ -679,7 +606,7 @@ TOOL_SPECS = {
     "propose_delete_work_order": {
         "fn": propose_delete_work_order,
         "write": True,
-        "label": "提议删除工单（即「取消这张单」），不会立即执行",
+        "label": "提议永久删除工单（与取消不同），不会立即执行",
         "description": propose_delete_work_order.__doc__.strip().split("\n")[0],
     },
 }

@@ -81,6 +81,68 @@ _VERDICT_CN = {
 
 # ── 主入口 ────────────────────────────────────────────────
 
+def to_text(answer: dict) -> str:
+    """公共兜底文本只由核验后的答案生成，不能返回写手原始草稿。"""
+    parts = []
+    def add(value):
+        value = str(value or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    add(answer.get("headline"))
+    if answer.get("text"):
+        add(answer["text"])
+    else:
+        for entity in answer.get("entities") or []:
+            primary = entity.get("primary") or {}
+            add(" ".join(str(value) for value in (
+                entity.get("customer_id"), entity.get("surname"), primary.get("label"),
+                primary.get("value_text")) if value))
+            for item in entity.get("secondary") or []:
+                add(f"{item.get('label', '')}：{item.get('value', '')}")
+        for fact in answer.get("facts") or []:
+            add(f"{fact.get('label', '')}：{fact.get('value', '')}")
+    warning = answer.get("warning") or {}
+    add(warning.get("text"))
+    for insight in answer.get("insights") or []:
+        add(insight)
+    return "\n".join(parts)
+
+def select_primary(tool_results: list[dict], question: str) -> dict | None:
+    # 按用户任务选择主结果，辅助查询不能覆盖客户名单或业务问题。
+    main = None
+    successful = [tr for tr in tool_results if tr.get("ok")]
+    preferred = []
+    if "实际" in question and any(w in question for w in ("挽留", "回访")):
+        preferred = ["get_retention_summary"]
+    elif any(w in question for w in ("推荐", "名单", "调出", "另外", "再来", "找出")) or (
+            any(tr['tool'] == 'list_customers' for tr in successful)
+            and any(w in question for w in ('列出', '继续', '客户'))):
+        preferred = ["list_customers"]
+    elif any(tr['tool'] == 'get_customer_risk' for tr in successful) and any(
+            w in question for w in ('风险', '概率', '详情', '余额')):
+        preferred = ['get_customer_risk']
+    elif "工单" in question:
+        preferred = ["get_workorder_stats", "list_work_orders"] if any(w in question for w in ("统计", "多少", "总数")) else ["list_work_orders"]
+    elif any(w in question for w in ("阈值", "决策线", "召回率")):
+        preferred = ["get_model_thresholds"]
+    elif any(w in question for w in ("收益", "ROI", "投入")):
+        preferred = ["get_business_summary"]
+    elif "客户" in question or any(tr["tool"] == "get_customer_risk" for tr in successful):
+        preferred = ["get_customer_risk", "list_customers"]
+    for name in preferred:
+        main = next((tr for tr in reversed(successful) if tr["tool"] == name), None)
+        if main:
+            break
+    if preferred and main is None:
+        return None
+    for tr in reversed(tool_results) if main is None else []:
+        if tr.get("ok"):
+            main = tr
+            break
+
+    return main
+
+
 def build(tool_results: list[dict], question: str,
           llm_headline: str = "", llm_insights: list[str] | None = None) -> dict:
     """把工具返回构造成结构化答案。
@@ -88,7 +150,7 @@ def build(tool_results: list[dict], question: str,
     返回：
       kind        customer_list / customer_detail / thresholds / business /
                   workorders / pending / text
-      headline    一句话结论（优先用 LLM 写的，缺失时用确定性兜底）
+      headline    一句话结论（由主任务同一工具结果生成）
       warning     警示（样本不完整等），无则 None
       entities    实体列表（客户卡片）
       facts       键值对（口径类回答用）
@@ -105,31 +167,47 @@ def build(tool_results: list[dict], question: str,
             "text": llm_headline or "未能取得数据，无法回答该问题。",
         }
 
-    # 取最后一个成功的工具结果作为主结果（ReAct 可能调多个工具，
-    # 最后一个通常是模型认为最能回答问题的那个）
-    main = None
-    for tr in reversed(tool_results):
-        if tr.get("ok"):
-            main = tr
-            break
+    main = select_primary(tool_results, question)
+    successful = [tr for tr in tool_results if tr.get("ok")]
 
     if main is None:
         errs = [f"{t['tool']}: {(t.get('data') or {}).get('error')}"
-                for t in tool_results]
+                for t in tool_results if not t.get('ok')]
         return {
             "kind": "text",
             "headline": llm_headline or "查询失败",
             "warning": None, "entities": [], "facts": [], "actions": [],
             "insights": llm_insights or [],
-            "text": "以下查询未成功：\n" + "\n".join(errs),
+            "text": "以下查询未成功：\n" + "\n".join(errs) if errs else "没有取得当前问题需要的主结果，请明确查询对象。",
         }
 
     name = main["tool"]
     data = main["data"] or {}
+    # 主标题与卡片由同一结果生成，避免模型标题引用辅助查询中的客户。
+    llm_headline = ""
+    if name == "get_retention_summary":
+        return {"kind": "business", "headline": "工单标记的挽留结果（未经回访验证）",
+                "warning": {"level": "warn", "text": data.get("note") or
+                    "包含演示工单，不能据此证明实际挽留效果。", "hint": ""},
+                "entities": [], "actions": [], "insights": [],
+                "facts": [{"label": "已结案", "value": str(data.get("total_completed", 0))},
+                          {"label": "标记挽留", "value": str(data.get("retained", 0))},
+                          {"label": "标记流失", "value": str(data.get("lost", 0))}],
+                "text": "以上为工单结果标记，不代表独立验证的客户回访或增量收益。"}
 
     if name == "list_customers":
         return _from_customer_list(data, llm_headline, llm_insights)
     if name == "get_customer_risk":
+        details = [tr["data"] for tr in successful if tr["tool"] == "get_customer_risk"]
+        if len(details) > 1:
+            details = list({item["customer_id"]: item for item in details}.values())
+            answer = _from_customer_list({"items": details, "returned": len(details),
+                "matched_total": len(details), "is_complete": True}, "", llm_insights)
+            answer["facts"] = []
+            for item in details:
+                for fact in _from_customer_detail(item, "", None)["facts"]:
+                    answer["facts"].append({**fact, "label": f"{item['customer_id']} · {fact['label']}"})
+            return answer
         return _from_customer_detail(data, llm_headline, llm_insights)
     if name == "get_model_thresholds":
         return _from_thresholds(data, llm_headline, llm_insights)
@@ -182,7 +260,7 @@ def _from_customer_list(data: dict, headline: str,
             "surname": c.get("surname"),
             # 主指标：决策依据，界面应放大显示
             "primary": {
-                "label": "期望挽回",
+                "label": "风险资产评分",
                 "value_text": _yuan(c.get("expected_value")),
                 "value_wan": _wan(c.get("expected_value")),
                 "raw": c.get("expected_value"),
@@ -195,7 +273,7 @@ def _from_customer_list(data: dict, headline: str,
             "action": c.get("action") or "",
             # 按钮可用性 —— 由后端确定，前端不得自行推断
             "has_active_order": has_order,
-            "can_create_order": not has_order,
+            "can_create_order": not has_order and c.get("exited") == 0,
             "worthiness": {
                 "verdict": verdict,
                 "net_text": _yuan(w.get("net")) if w else None,
@@ -203,7 +281,7 @@ def _from_customer_list(data: dict, headline: str,
             },
         }
         entities.append(entity)
-        if not has_order:
+        if not has_order and c.get("exited") == 0:
             buildable.append(cid)
 
     # ── 警示：样本不完整 ────────────────────────────────────
@@ -284,7 +362,7 @@ def _from_customer_detail(data: dict, headline: str,
         "customer_id": data.get("customer_id"),
         "surname": data.get("surname"),
         "primary": {
-            "label": "期望挽回",
+            "label": "风险资产评分",
             "value_text": _yuan(data.get("expected_value")),
             "value_wan": _wan(data.get("expected_value")),
             "raw": data.get("expected_value"),
@@ -296,7 +374,7 @@ def _from_customer_detail(data: dict, headline: str,
         "tags": tags,
         "action": data.get("action") or "",
         "has_active_order": has_order,
-        "can_create_order": not has_order,
+        "can_create_order": not has_order and data.get("exited") == 0,
         "worthiness": {
             "verdict": verdict,
             "net_text": _yuan(w.get("net")) if w else None,
@@ -305,9 +383,16 @@ def _from_customer_detail(data: dict, headline: str,
     }
 
     facts = [
-        {"label": "风险因素", "value": "、".join(data.get("risk_factors") or []) or "无"},
+        {"label": "规则提示（非模型归因）", "value": "、".join(data.get("risk_factors") or []) or "无"},
         {"label": "建议渠道", "value": data.get("channel") or "—"},
     ]
+    explanation = data.get("model_explanation") or {}
+    if explanation.get("top_factors"):
+        facts.append({"label": "模型归因（SHAP，非因果结论）", "value": "、".join(
+            f"{factor['feature']}：{factor['impact']:+.4f}"
+            for factor in explanation["top_factors"][:5])})
+    elif explanation.get("error"):
+        facts.append({"label": "模型归因不可用", "value": str(explanation["error"])})
     if w:
         facts.append({"label": "个体净收益", "value": _yuan(w.get("net"))})
         facts.append({"label": "盈亏平衡点", "value": _yuan(w.get("breakeven"))})
@@ -320,7 +405,7 @@ def _from_customer_detail(data: dict, headline: str,
             "targets": [], "needs_confirm": False,
             "note": f"{cid} 已有进行中的工单，需先处理完毕。",
         })
-    else:
+    elif data.get("exited") == 0:
         actions.append({
             "id": "create_orders", "label": f"为 {cid} 建单",
             "targets": [cid], "needs_confirm": True, "blocked": [],
@@ -346,8 +431,8 @@ def _from_workorder_list(data: dict, headline: str,
 
     ⚠ 工单卡片与客户卡片**刻意不同**：工单的主标识是 `order_id`（不是客户），
       且每张单可执行的动作取决于其**当前状态**：
-        pending / in_progress → 可"开始处理"、可"取消（删除）"
-        completed / lost      → 已是终态，只能"重新处理"或删除
+        pending / in_progress → 可取消（保留记录）
+        completed / lost / cancelled → 不提供取消按钮
       这个判断由 Python 依据 status 做出，不交给 LLM ——
       否则它会提议一个语义上不成立的动作（如把已完成的再标记完成）。
     """
@@ -355,13 +440,12 @@ def _from_workorder_list(data: dict, headline: str,
     entities = []
     actions = []
 
-    _ST_CN = {"pending": "待处理", "in_progress": "处理中",
-              "completed": "已完成", "lost": "已流失"}
+    from app.services.work_order_labels import STATUS_LABELS as _ST_CN, status_label, result_label
 
     for o in items:
         st = o.get("status")
         oid = o.get("order_id") or o.get("id")
-        tags = [_ST_CN.get(st, st or "—")]
+        tags = [status_label(st)]
         if o.get("risk_level"):
             tags.append(_RISK_CN.get(o["risk_level"], o["risk_level"]))
 
@@ -377,7 +461,8 @@ def _from_workorder_list(data: dict, headline: str,
                 "raw": oid,
             },
             "secondary": [
-                {"label": "状态", "value": _ST_CN.get(st, st or "—")},
+                {"label": "状态", "value": status_label(st)},
+                {"label": "处理结果", "value": result_label(o.get('result'))},
                 {"label": "负责人", "value": o.get("assignee") or "未指派"},
             ],
             "tags": tags,
@@ -390,8 +475,7 @@ def _from_workorder_list(data: dict, headline: str,
         })
 
     # ── 按状态汇总可执行的动作 ──────────────────────────────
-    # ⚠ 只对**有意义的**状态给出按钮。已完成/已流失的单不该出现"取消"以外的
-    #   状态动作 —— 那会误导用户去做语义上多余的操作。
+    # 只有未结工单提供取消按钮，已结案工单不能再取消。
     open_ids = [ (o.get("order_id") or o.get("id"))
                  for o in items if o.get("status") in ("pending", "in_progress") ]
     if open_ids:
@@ -401,7 +485,7 @@ def _from_workorder_list(data: dict, headline: str,
                 "label": f"取消工单 #{open_ids[0]}",
                 "targets": open_ids,
                 "needs_confirm": True,
-                "note": "取消＝删除该工单，不可恢复。",
+                "note": "取消后停止跟进，保留工单与审计记录。",
             })
         else:
             actions.append({
@@ -409,7 +493,7 @@ def _from_workorder_list(data: dict, headline: str,
                 "label": f"取消这 {len(open_ids)} 张未结工单",
                 "targets": open_ids,
                 "needs_confirm": True,
-                "note": "取消＝删除工单，不可恢复。",
+                "note": "取消后停止跟进，保留工单与审计记录。",
             })
 
     if not headline:
@@ -517,6 +601,7 @@ def _from_workorders(data: dict, headline: str,
         {"label": "处理中", "value": str(data.get("in_progress"))},
         {"label": "已完成", "value": str(data.get("completed"))},
         {"label": "已流失", "value": str(data.get("lost"))},
+        {"label": "已取消", "value": str(data.get("cancelled", 0))},
         {"label": "负责人", "value": "、".join(data.get("assignees") or []) or "—"},
     ]
     if not headline:

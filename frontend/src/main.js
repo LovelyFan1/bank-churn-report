@@ -4,7 +4,7 @@ import router from './router'
 import './style.css'
 import App from './App.vue'
 import { setUnauthorizedHandler } from './api'
-import { clearAuthStorage } from './utils/userStorage'
+import { useAuthStore } from './stores/auth'
 
 const app = createApp(App)
 app.use(createPinia())
@@ -23,7 +23,7 @@ setUnauthorizedHandler((detail) => {
   //   令牌失效意味着"要重新登录了"，凭据必须清；
   //   但用户自己的对话历史应当保留，下次登录还在。
   //   隔离由"按用户分键"保证（见 utils/userStorage.js），不靠删除。
-  clearAuthStorage()
+  useAuthStore().clear()
   router.replace({ path: '/login', query: { expired: '1', msg: detail || '' } })
 })
 

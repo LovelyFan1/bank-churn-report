@@ -11,7 +11,10 @@
       <div class="animate-spin rounded-full h-10 w-10 border-2 border-indigo-400 border-t-transparent"></div>
     </div>
 
-    <template v-else>
+<template v-else>
+      <p v-if="ordersError || statsError" role="alert" class="text-red-700">加载失败：{{ ordersError || statsError }} <button @click="fetchOrders(); fetchStats()">重试</button></p>
+      <p v-if="actionError" role="alert" class="text-red-700">操作失败：{{ actionError }}</p>
+      <p v-if="ordersLoading" role="status">正在刷新工单…</p>
       <!-- Stats Cards -->
       <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <div class="glass-card p-5" v-for="s in statsCards" :key="s.key">
@@ -42,7 +45,7 @@
           class="search-input"
           @input="onSearchInput"
         />
-        <button class="btn btn-primary btn-sm" @click="openCreate()">＋ 创建工单</button>
+        <button v-if="auth.can('order:write')" class="btn btn-primary btn-sm" @click="openCreate()">＋ 创建工单</button>
       </div>
 
       <!-- 脱敏提示：说明"为什么看不到客户信息" -->
@@ -63,7 +66,7 @@
               <th>风险等级</th>
               <th v-if="!masked">流失概率</th>
               <th>触达渠道</th>
-              <th v-if="!masked">期望价值</th>
+              <th v-if="!masked">风险资产评分</th>
               <th>工单状态</th>
               <th>负责人</th>
               <th>创建时间</th>
@@ -147,11 +150,11 @@
                 </td>
                 <td class="text-gray-500 text-xs">{{ fmtDate(o.created_at) }}</td>
                 <td v-if="!masked" @click.stop>
-                  <button class="btn btn-outline btn-xs" @click="openEdit(o)">✎</button>
+                  <button class="btn btn-outline btn-xs" :aria-label="'编辑工单 ' + o.id" @click="openEdit(o)">✎</button>
                   <!-- ⚠ 删除仅 order:write（经理及以上）可见。专员没有该权限，
                        显示了也只会得到 403 —— 不如不显示。 -->
                   <button v-if="canAssign" class="btn btn-outline btn-xs ml-1"
-                          @click="deleteOrder(o)">✕</button>
+                          :aria-label="'删除工单 ' + o.id" @click="deleteOrder(o)">✕</button>
                 </td>
               </tr>
               <!-- Detail Panel -->
@@ -162,6 +165,9 @@
                       <!-- 脱敏：风险因素/推荐策略/备注都会复述客户画像，故隐藏 -->
                       <div v-if="!masked"><dt>风险因素</dt><dd><span v-for="f in o.risk_factors" :key="f" class="risk-tag">{{ f }}</span></dd></div>
                       <div v-if="!masked"><dt>推荐策略</dt><dd class="text-indigo-300">{{ o.strategy || '—' }}</dd></div>
+                      <div v-if="!masked"><dt>结果来源 / 复核</dt><dd>{{ o.result_source === 'demo' ? '演示' : o.result_source === 'manual' ? '人工观察声明' : '历史来源未明' }} · {{ o.verification_state === 'verified' ? '已复核（' + o.verified_by + '）' : '未复核' }}</dd></div>
+                      <div v-if="!masked"><dt>观察与证据</dt><dd>{{ fmtDate(o.observation_start) }} 至 {{ fmtDate(o.observation_end) }} · {{ o.result_evidence || '未记录' }}</dd></div>
+                      <div v-if="!masked && o.result_source === 'manual' && o.result && o.verification_state !== 'verified' && auth.can('order:write')"><dt>独立复核</dt><dd><button class="btn btn-outline btn-sm" :disabled="isOwnObservation(o)" :title="isOwnObservation(o) ? '记录人或负责人不能自行复核' : '需要已结束的观察窗口和证据'" @click="confirmDialog = { title:'复核观察结果', body:'仅复核观察窗口和记录证据，不认定实际利润或干预因果收益。', onConfirm: () => verifyResult(o) }">复核结果</button></dd></div>
                       <div v-if="!masked"><dt>备注</dt><dd class="text-gray-400">{{ o.note || '—' }}</dd></div>
                       <!-- ── 建单人 / 负责人 ──────────────────────
                            这两个此前**详情面板里完全没有**（列表有负责人列、
@@ -181,7 +187,7 @@
                                 class="legacy-tag" title="不在当前行员名单中">历史</span>
                         </dd>
                       </div>
-                      <div><dt>处理结果</dt><dd>{{ o.result === 'retained' ? '✅ 已挽留' : o.result === 'lost' ? '❌ 已流失' : '—' }}</dd></div>
+                      <div><dt>处理结果</dt><dd>{{ resultLabel(o.result) }}</dd></div>
                       <div><dt>更新时间</dt><dd class="text-gray-400">{{ fmtDate(o.updated_at) }}</dd></div>
                       <div><dt>完成时间</dt><dd class="text-gray-400">{{ fmtDate(o.completed_at) || '—' }}</dd></div>
                       <!-- 快照溯源：等级是建单时按当时那套阈值判的，不随模型重训改变 -->
@@ -201,7 +207,7 @@
                         <dt>价值层（建单时快照）</dt>
                         <dd v-if="o.value_tier_snapshot" class="text-gray-400">
                           {{ valueTierLabel(o.value_tier_snapshot) }}<span v-if="!masked"> ·
-                          期望价值 ¥{{ Math.round(o.expected_value_snapshot || 0).toLocaleString() }}</span>
+                          风险资产评分 ¥{{ Math.round(o.expected_value_snapshot || 0).toLocaleString() }}</span>
                         </dd>
                         <dd v-else class="text-gray-600">该工单创建于快照功能上线前，无留存依据</dd>
                       </div>
@@ -227,7 +233,8 @@
                       <button v-if="o.status === 'pending'" class="btn btn-sm btn-status" style="background:#1d4ed8;color:#fff" @click="changeStatus(o, 'in_progress')">▶ 开始处理</button>
                       <button v-if="o.status === 'in_progress'" class="btn btn-sm btn-status" style="background:#065f46;color:#6ee7b7" @click="changeStatus(o, 'completed')">✓ 标记完成</button>
                       <button v-if="o.status === 'in_progress'" class="btn btn-sm btn-status" style="background:#7f1d1d;color:#fca5a5" @click="changeStatus(o, 'lost')">✕ 标记流失</button>
-                      <button v-if="o.status === 'completed' || o.status === 'lost'" class="btn btn-outline btn-sm btn-status" @click="changeStatus(o, 'in_progress')">↩ 重新处理</button>
+                      <button v-if="['pending', 'in_progress'].includes(o.status)" class="btn btn-outline btn-sm btn-status" @click="changeStatus(o, 'cancelled')">⏹ 取消工单</button>
+                      <button v-if="['completed', 'lost', 'cancelled'].includes(o.status)" class="btn btn-outline btn-sm btn-status" @click="changeStatus(o, 'in_progress')">↩ 重新处理</button>
 
                       <!-- 完整状态下拉：任意状态可直接互转，不必按顺序点按钮 -->
                       <select
@@ -259,7 +266,7 @@
     </template>
 
     <!-- Modal -->
-    <div v-if="modalOpen" class="modal-overlay" @click.self="closeModal">
+    <Dialog :open="!!modalOpen" title="工单信息" :busy="submitting" @close="closeModal">
       <div class="modal">
         <div class="modal-header">
           <h2>{{ editingId ? '编辑工单 #' + editingId : '创建工单' }}</h2>
@@ -293,7 +300,7 @@
             </div>
             <div class="form-group">
               <label>风险等级</label>
-              <select v-model="form.risk_level">
+              <select v-model="form.risk_level" disabled title="风险等级由建单时模型快照确定">
                 <option value="CRITICAL">🔴 极高 CRITICAL</option>
                 <option value="HIGH">🟠 高危 HIGH</option>
                 <option value="MEDIUM">🟡 中等 MEDIUM</option>
@@ -319,7 +326,7 @@
               <select v-if="canAssign && staffList.length" v-model="form.assignee">
                 <option value="" disabled>请选择负责人</option>
                 <option v-for="a in staffList" :key="a.username" :value="a.username">
-                  {{ a.display_name }}（{{ a.role_label }}）
+                  {{ a.display_name }}（{{ a.username }}·{{ a.department || a.role_label }}）
                 </option>
               </select>
               <input v-else :value="assigneeName(form.assignee)" readonly class="readonly"
@@ -360,6 +367,7 @@
                     {{ noteLoading ? '生成中…' : '重新生成' }}
                   </button>
                 </div>
+                <p v-if="lookupLoading" class="text-sm">正在核对客户…</p>
                 <p v-if="lookupError" class="note-assist-hint note-assist-err">{{ lookupError }}</p>
                 <p v-else-if="noteLoading" class="note-assist-hint">正在读取该客户实时打分结果…</p>
                 <p v-else-if="noteFailed" class="note-assist-hint note-assist-err">
@@ -383,15 +391,16 @@
         </div>
         <div class="modal-footer">
           <button class="btn btn-outline" @click="closeModal">取消</button>
-          <button class="btn btn-primary" @click="submitOrder">{{ editingId ? '保存修改' : '确认创建' }}</button>
+          <p v-if="submitError" role="alert" class="text-red-700">{{ submitError }}</p>
+          <button class="btn btn-primary" :disabled="!canSubmit" @click="submitOrder">{{ editingId ? '保存修改' : '确认创建' }}</button>
         </div>
       </div>
-    </div>
+    </Dialog>
 
     <!-- 状态变更确认弹窗 —— 结案与「从终态回退」都需二次确认。
          用自绘弹窗而非 window.confirm：后者是同步阻塞的浏览器原生框，
          样式与整站割裂，且无法标注"危险操作"的语义色。 -->
-    <div v-if="confirmDialog" class="modal-overlay" @click.self="confirmDialog = null">
+    <Dialog :open="!!confirmDialog" title="确认操作" :danger="true" @close="confirmDialog = null">
       <div class="modal" style="max-width: 420px">
         <div class="modal-header">
           <h2>{{ confirmDialog.title }}</h2>
@@ -404,6 +413,22 @@
           <p class="text-sm text-gray-400" style="line-height: 1.7; white-space: pre-line">
             {{ confirmDialog.body }}
           </p>
+          <label v-if="confirmDialog.result !== undefined" class="form-group">
+            人工声明的处理结果
+            <select v-model="confirmDialog.result">
+              <option value="" disabled>请选择结果</option>
+              <option value="retained">声明已挽留（待复核）</option>
+              <option value="lost">声明已流失（待复核）</option>
+            </select>
+          </label>
+          <div v-if="confirmDialog.observation" class="form-grid mt-3">
+            <label class="form-group">观察开始<input v-model="confirmDialog.observation.observation_start" type="datetime-local" /></label>
+            <label class="form-group">观察截止<input v-model="confirmDialog.observation.observation_end" type="datetime-local" /></label>
+            <label class="form-group">证据来源<input v-model="confirmDialog.observation.result_evidence" maxlength="2000" placeholder="回访/CRM记录编号，勿填敏感内容" /></label>
+            <label class="form-group">实际成本（元，可不填）<input v-model.number="confirmDialog.observation.actual_cost" type="number" min="0" step="0.01" /></label>
+            <label class="form-group">记录收益（元，可不填）<input v-model.number="confirmDialog.observation.actual_benefit" type="number" min="0" step="0.01" /></label>
+            <p class="text-sm text-slate-700">这是结果声明；窗口结束并经其他经理复核后才标记已核验。收益记录不证明干预增量。</p>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn btn-outline" @click="confirmDialog = null">取消</button>
@@ -412,11 +437,11 @@
             :style="confirmDialog.danger
               ? 'background:#7f1d1d;color:#fca5a5'
               : 'background:#1d4ed8;color:#fff'"
-            @click="runConfirm()"
+            :disabled="confirmDialog.result === ''" @click="runConfirm()"
           >确认</button>
         </div>
       </div>
-    </div>
+    </Dialog>
 
     <!-- Toast -->
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
@@ -424,8 +449,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
+import Dialog from '../components/Dialog.vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import api from '../api'
+import { useAuthStore } from '../stores/auth'
 import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, riskColor, probColor, fmtPercent, valueTierLabel, channelLabel, fmtWan } from '../utils/risk'
 // ⚠ 别名导入：本页已有一个 `assignees`（"按负责人筛选"下拉的**实际取值**列表，
@@ -441,15 +468,21 @@ import {
 // 卸载时取消，避免占着浏览器同域连接槽拖慢下一页。
 // ⚠ 写操作（POST/PUT/DELETE）**不经 scope** —— 已提交的请求不能因离开页面而中断。
 const scope = useRequestScope()
+const auth = useAuthStore()
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
+const ordersLoading = ref(false)
+const ordersError = ref('')
+const statsError = ref('')
+const actionError = ref('')
+let orderRequest = 0
 const orders = ref([])
 // 后端是否已脱敏客户身份（无 customer:identify 权限时为 true）。
 // ⚠ 由后端下发，前端不自己判角色 —— 权限口径只有一处来源。
 const masked = ref(false)
 const maskNotice = ref('')
-const stats = reactive({ total: 0, pending: 0, in_progress: 0, completed: 0, lost: 0, assignees: [], scoped_to_me: false })
+const stats = reactive({ total: 0, pending: 0, in_progress: 0, completed: 0, lost: 0, cancelled: 0, assignees: [], scoped_to_me: false })
 const currentFilter = ref('all')
 const searchText = ref('')
 // 按负责人筛选 —— 组长看「小李手上有多少单」用得到。
@@ -481,6 +514,19 @@ let toastTimer = null
 const noteLoading = ref(false)
 const noteFailed = ref('')
 const lookupError = ref('')
+const lookupLoading = ref(false)
+const validCustomerId = ref('')
+const submitting = ref(false)
+const submitError = ref('')
+const canSubmit = computed(() => !submitting.value && !!form.assignee && (editingId.value || (auth.can('order:write') && !!validCustomerId.value && !!form.customer_name && validCustomerId.value === form.customer_id.trim() && !lookupLoading.value)))
+watch(() => form.customer_id, () => {
+  if (editingId.value) return
+  noteToken++
+  validCustomerId.value = ''; form.customer_name = ''; form.geography = ''; form.probability = 0; form.balance = 0
+  form.risk_factors = []; form.strategy = ''; form.note = ''; form.thresholds_snapshot = null; form.model_used = null
+  form.value_tier_snapshot = null; form.expected_value_snapshot = null; suggestion.value = null; noteLoading.value = false; lookupLoading.value = false
+  lookupError.value = ''; submitError.value = ''
+}, { flush: 'sync' })
 const suggestion = ref(null)
 let noteToken = 0
 
@@ -507,6 +553,7 @@ function verdictLabel(v) {
  */
 async function lookupCustomer() {
   const cid = (form.customer_id || '').trim()
+  validCustomerId.value = ''
   lookupError.value = ''
   noteFailed.value = ''
   suggestion.value = null
@@ -516,12 +563,13 @@ async function lookupCustomer() {
   }
   // 作废在途请求 —— 连续改编号时，先发的可能后返回，会覆盖成别人的信息
   const token = ++noteToken
+  lookupLoading.value = true
 
   try {
     const { data: c } = await scope.get(`/customers/${cid}`)
     if (token !== noteToken) return
     Object.assign(form, {
-      customer_id: c.customer_id,
+      customer_id: cid,
       customer_name: c.surname || '',
       geography: c.geography || '',
       risk_level: c.risk_level || 'MEDIUM',
@@ -532,6 +580,7 @@ async function lookupCustomer() {
       value_tier_snapshot: c.value_tier || null,
       expected_value_snapshot: c.expected_value ?? null,
     })
+    validCustomerId.value = cid
     // 分级依据快照：取不到就留空，由后端在 create_work_order 里补齐
     // （后端本就有兜底逻辑，这里不重复实现，避免两处各写一套）
     try {
@@ -543,10 +592,12 @@ async function lookupCustomer() {
     } catch (_) { /* 快照取不到不影响建单 */ }
   } catch (e) {
     if (token !== noteToken) return
-    lookupError.value = `未找到客户 ${cid}：` + (e.response?.data?.detail || e.message)
+    lookupLoading.value = false
+    lookupError.value = `客户 ${cid} 无法加载：` + (e.response?.data?.detail || e.message)
     return
   }
 
+  lookupLoading.value = false
   // 再取建议理由（失败不阻塞建单，只提示）
   noteLoading.value = true
   try {
@@ -596,10 +647,11 @@ const statsCards = computed(() => [
     value: stats.total,
     color: '#17335c',
   },
-  { key: 'pending', label: '⏳ 待处理', value: stats.pending, color: '#fbbf24' },
-  { key: 'in_progress', label: '🔄 处理中', value: stats.in_progress, color: '#60a5fa' },
-  { key: 'completed', label: '✅ 已完成', value: stats.completed, color: '#34d399' },
-  { key: 'lost', label: '❌ 已流失', value: stats.lost, color: '#f87171' },
+  { key: 'pending', label: '⏳ 待处理', value: stats.pending, color: '#92400e' },
+  { key: 'in_progress', label: '🔄 处理中', value: stats.in_progress, color: '#1d4ed8' },
+  { key: 'completed', label: '✅ 已完成', value: stats.completed, color: '#0f766e' },
+  { key: 'lost', label: '❌ 已流失', value: stats.lost, color: '#b91c1c' },
+  { key: 'cancelled', label: '⏹ 已取消', value: stats.cancelled, color: '#5b6b83' },
 ])
 
 const filters = [
@@ -608,20 +660,17 @@ const filters = [
   { key: 'in_progress', label: '🔄 处理中' },
   { key: 'completed', label: '✅ 已完成' },
   { key: 'lost', label: '❌ 已流失' },
+  { key: 'cancelled', label: '⏹ 已取消' },
 ]
 
 // ── Methods ─────────────────────────────────────────
 // riskLabel / riskBadgeClass / riskColor / probColor / fmtPercent
 // 已抽到 src/utils/risk.js —— 全局唯一口径。
 // 注意 riskColor 现在由 utils 提供，调用点不再用本地定义。
-function statusLabel(s) {
-  const m = { pending: '待处理', in_progress: '处理中', completed: '已完成', lost: '已流失' }
-  return m[s] || s
-}
+import { statusLabel, resultLabel, STATUS_OPTIONS } from '../utils/workOrders'
 
 // 状态下拉的选项顺序 —— 按业务流转的自然顺序排列（而非字母序），
 // 让「待处理 → 处理中 → 已完成」的推进方向一目了然。
-const STATUS_OPTIONS = ['pending', 'in_progress', 'completed', 'lost']
 /**
  * 格式化后端返回的时间戳。
  *
@@ -715,6 +764,14 @@ function toggleDetail(o) {
 //   1) 结案（completed / lost）—— 会写 completed_at，且 lost 意味着客户已流失
 //   2) 从终态回退 —— 会清掉 result / completed_at，属撤销操作
 const _STATUS_RULES = {
+  cancelled: {
+    confirm: (o) => ({
+      title: '取消该工单（保留记录）？',
+      body: `工单 #${o.id} · ${o.customer_id} ${o.customer_name} 将停止跟进，历史记录会保留。`,
+      danger: false,
+    }),
+    result: null,
+  },
   pending: {
     // 回退到待处理：清空结案痕迹（否则会留下"处理中却带着完成时间"的脏数据）
     confirm: (o) => (o.status === 'pending' ? null : {
@@ -725,7 +782,7 @@ const _STATUS_RULES = {
     result: null,
   },
   in_progress: {
-    confirm: (o) => ((o.status === 'completed' || o.status === 'lost') ? {
+    confirm: (o) => (['completed', 'lost', 'cancelled'].includes(o.status) ? {
       title: '重新处理该工单？',
       body: `工单 #${o.id} 将从「${statusLabel(o.status)}」退回处理中，已记录的「处理结果」与「完成时间」会被清空。`,
       danger: false,
@@ -735,10 +792,10 @@ const _STATUS_RULES = {
   completed: {
     confirm: (o) => (o.status === 'completed' ? null : {
       title: '标记为「已完成」？',
-      body: `确认客户 ${o.customer_name}（${o.customer_id}）挽留成功？该操作会记录完成时间。`,
+      body: `确认客户 ${o.customer_name}（${o.customer_id}）已处理完毕？请依据回访填写结果；处理完成不会自动计为挽留成功。`,
       danger: false,
     }),
-    result: 'retained',
+    result: null,
   },
   lost: {
     confirm: (o) => (o.status === 'lost' ? null : {
@@ -757,7 +814,7 @@ const confirmDialog = ref(null)
 function runConfirm() {
   const d = confirmDialog.value
   confirmDialog.value = null
-  d?.onConfirm?.()
+  d?.onConfirm?.(d.result, d.observation)
 }
 
 /**
@@ -769,6 +826,10 @@ function runConfirm() {
  */
 async function changeStatus(o, newStatus, opts = {}) {
   if (!newStatus || newStatus === o.status) return
+  if (newStatus === 'cancelled' && !['pending', 'in_progress'].includes(o.status)) {
+    showToast('只能取消待处理或处理中的工单')
+    return
+  }
 
   const rule = _STATUS_RULES[newStatus]
   if (!rule) return
@@ -779,7 +840,8 @@ async function changeStatus(o, newStatus, opts = {}) {
     if (cfg) {
       confirmDialog.value = {
         ...cfg,
-        onConfirm: () => changeStatus(o, newStatus, { skipConfirm: true }),
+        ...(newStatus === 'completed' ? { result: '', observation: { observation_start:'', observation_end:'', result_evidence:'', actual_cost:null, actual_benefit:null } } : {}),
+        onConfirm: (result, observation) => changeStatus(o, newStatus, { skipConfirm: true, result, observation }),
       }
       return
     }
@@ -795,7 +857,8 @@ async function changeStatus(o, newStatus, opts = {}) {
     // 所以回退时必须显式送 null，否则留下"处理中却已完成"的脏数据。
     await api.put(`/work-orders/${o.id}`, {
       status: newStatus,
-      result: rule.result,
+      result: newStatus === 'completed' ? opts.result : rule.result,
+      ...(opts.observation ? { ...opts.observation, observation_start: opts.observation.observation_start ? new Date(opts.observation.observation_start).toISOString() : null, observation_end: opts.observation.observation_end ? new Date(opts.observation.observation_end).toISOString() : null } : {}),
     })
     showToast(`工单 #${o.id} 状态已更新为「${statusLabel(newStatus)}」`)
     // 重新拉取：stats 计数与 result/completed_at 都变了，需以服务端为准
@@ -807,6 +870,7 @@ async function changeStatus(o, newStatus, opts = {}) {
 }
 
 function openCreate(preset) {
+  if (!auth.can('order:write')) return
   editingId.value = null
   resetForm(preset)
   modalOpen.value = true
@@ -861,19 +925,22 @@ function resetForm(preset) {
 }
 
 function closeModal() {
+  if (submitting.value) return
+  noteToken++; validCustomerId.value = ''; lookupLoading.value = false
   modalOpen.value = false
   editingId.value = null
 }
 
 async function submitOrder() {
-  if (!form.customer_id || !form.customer_name) {
+  if (!canSubmit.value) return
+  if (!editingId.value && (!form.customer_id || !form.customer_name)) {
     showToast('请填写客户信息')
     return
   }
+  submitting.value = true; submitError.value = ''
   try {
     if (editingId.value) {
       await api.put(`/work-orders/${editingId.value}`, {
-        risk_level: form.risk_level,
         strategy: form.strategy,
         assignee: form.assignee,
         note: form.note,
@@ -883,12 +950,13 @@ async function submitOrder() {
       await api.post('/work-orders', { ...form })
       showToast('工单创建成功')
     }
+    submitting.value = false
     closeModal()
     fetchOrders()
     fetchStats()
   } catch (e) {
-    showToast('操作失败: ' + (e.response?.data?.detail || e.message))
-  }
+    submitError.value = e.response?.data?.detail || e.message
+  } finally { submitting.value = false }
 }
 
 /**
@@ -901,6 +969,16 @@ async function submitOrder() {
  *   **不显示删的是哪一张**（工单号、客户名都看不到），删除不可逆，
  *   用户无法确认自己点对了行。
  */
+async function verifyResult(o) {
+  actionError.value = ''
+  try { await api.post(`/work-orders/${o.id}/verify`); await fetchOrders(); showToast('观察结果已复核') }
+  catch (e) { actionError.value = e.response?.data?.detail || e.message }
+}
+function isOwnObservation(o) {
+  const username = auth.user?.username
+  return !!username && [o.result_recorded_by, o.assignee_username, o.assignee].includes(username)
+}
+
 function deleteOrder(o) {
   confirmDialog.value = {
     title: '删除该工单？',
@@ -929,27 +1007,32 @@ async function doDeleteOrder(id) {
 }
 
 async function fetchStats() {
+  statsError.value = ''
   try {
     const { data } = await scope.get('/work-orders/stats')
     // data 含 total/pending/.../assignees/scoped_to_me，一次并入
     Object.assign(stats, data)
-  } catch (_) {}
+  } catch (e) { if (scope.isActive()) statsError.value = e.response?.data?.detail || e.message }
 }
 
 async function fetchOrders() {
+  const request = ++orderRequest
+  ordersLoading.value = true; ordersError.value = ''
   try {
     const params = { page: page.value, page_size: 20 }
     if (currentFilter.value !== 'all') params.status = currentFilter.value
     if (assigneeFilter.value) params.assignee = assigneeFilter.value
     if (searchText.value) params.search = searchText.value
     const { data } = await scope.get('/work-orders', { params })
+    if (request !== orderRequest || !scope.isActive()) return
     orders.value = data.items
     totalPages.value = data.total_pages
     masked.value = !!data.masked
     maskNotice.value = data.mask_notice || ''
-  } catch (_) {
-    orders.value = []
-  }
+  } catch (e) {
+    if (request !== orderRequest || !scope.isActive()) return
+    orders.value = []; ordersError.value = e.response?.data?.detail || e.message
+  } finally { if (request === orderRequest && scope.isActive()) ordersLoading.value = false }
 }
 
 function showToast(msg) {
@@ -968,6 +1051,7 @@ onMounted(async () => {
 
 // 卸载时清理：toast 定时器 + 搜索防抖定时器（此前都残留）
 onBeforeUnmount(() => {
+  noteToken++; orderRequest++
   clearTimeout(toastTimer)
   clearTimeout(searchTimer)
 })
@@ -1000,8 +1084,8 @@ defineExpose({ openCreate })
   transition: .15s; white-space: nowrap;
 }
 .note-assist-btn:hover:not(:disabled) { background: #eef3fb; }
-.note-assist-btn:disabled { color: #9aa7bd; border-color: #e5e9f0; cursor: default; }
-.note-assist-hint { font-size: 11.5px; color: #7c8aa5; line-height: 1.7; margin: 0; }
+.note-assist-btn:disabled { color: #5b6b83; border-color: #e5e9f0; cursor: default; }
+.note-assist-hint { font-size: 11.5px; color: #5b6b83; line-height: 1.7; margin: 0; }
 .note-assist-err { color: #b45309; }
 /* 四档经济性判定色（非风险等级，故不复用 .risk-* 类名） */
 .v-worth    { color: #0f766e; }
@@ -1033,7 +1117,7 @@ defineExpose({ openCreate })
 table { width: 100%; border-collapse: collapse; }
 thead th {
   text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 600;
-  color: #7c8aa5; text-transform: uppercase; letter-spacing: .5px;
+  color: #5b6b83; text-transform: uppercase; letter-spacing: .5px;
   border-bottom: 1px solid #e5e9f0; background: #f8fafc;
 }
 tbody td {
@@ -1052,11 +1136,13 @@ tbody tr:hover { background: #f8fafc; }
 .status-tag.in_progress { background: #e8f0fe; color: #1d4ed8; }
 .status-tag.completed   { background: #e0f2f1; color: #0f766e; }
 .status-tag.lost        { background: #fde8e8; color: #c81e1e; }
+.status-tag.cancelled   { background: #eef2f6; color: #64748b; }
 .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
 .status-dot.pending     { background: #a16207; }
 .status-dot.in_progress { background: #1d4ed8; }
 .status-dot.completed   { background: #0f766e; }
 .status-dot.lost        { background: #c81e1e; }
+.status-dot.cancelled   { background: #64748b; }
 
 /* ── 状态下拉（列表内直接改状态）─────────────────────
    ⚠ 这是"建单后没法调状态"的主因修复：
@@ -1084,6 +1170,7 @@ tbody tr:hover { background: #f8fafc; }
 .status-select.in_progress { background-color: #e8f0fe; color: #1d4ed8; }
 .status-select.completed   { background-color: #e0f2f1; color: #0f766e; }
 .status-select.lost        { background-color: #fde8e8; color: #c81e1e; }
+.status-select.cancelled   { background-color: #eef2f6; color: #64748b; }
 
 /* ── 行展开指示 ──────────────────────────────────────
    此前行上**没有任何**可展开线索（实测 hasChevronOrIcon=false），
@@ -1091,7 +1178,7 @@ tbody tr:hover { background: #f8fafc; }
 .chev {
   display: inline-block;
   width: 14px;
-  color: #b6c2d4;
+  color: #5b6b83;
   font-size: 11px;
   transition: transform .18s ease, color .18s ease;
   transform-origin: 50% 50%;
@@ -1124,8 +1211,8 @@ tbody tr.expanded { background: #f1f5f9; }
 .st-pending { color: #b45309; }
 .st-in_progress { color: #1d4ed8; }
 .st-completed { color: #15803d; }
-.st-lost { color: #9aa7bd; }
-.detail-panel dt { font-size: 11px; color: #9aa7bd; margin-bottom: 2px; }
+.st-lost { color: #5b6b83; }
+.detail-panel dt { font-size: 11px; color: #5b6b83; margin-bottom: 2px; }
 /* 历史负责人标记 —— 该取值不在当前行员名单里（旧姓名或已停用账号）。
    标注出来是为了区分"数据问题"与"界面 bug"，不是错误提示。 */
 .legacy-tag {
@@ -1144,7 +1231,7 @@ tbody tr.expanded { background: #f1f5f9; }
 }
 .modal {
   background: #ffffff; border: 1px solid #e5e9f0;
-  border-radius: 12px; width: 560px; max-height: 85vh; overflow-y: auto;
+  border-radius: 12px; width: 560px; max-width: calc(100vw - 32px); max-height: 85vh; overflow-y: auto;
   animation: slideUp .25s ease;
   box-shadow: 0 20px 60px rgba(15,23,42,.18);
 }
@@ -1157,7 +1244,7 @@ tbody tr.expanded { background: #f1f5f9; }
 .modal-header h2 { font-size: 16px; font-weight: 700; color: #17335c; }
 .modal-close {
   width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9;
-  border: none; color: #7c8aa5; cursor: pointer; font-size: 14px; transition: .2s;
+  border: none; color: #5b6b83; cursor: pointer; font-size: 14px; transition: .2s;
 }
 .modal-close:hover { background: #e5e9f0; color: #374151; }
 .modal-body { padding: 20px 24px; }
@@ -1169,7 +1256,7 @@ tbody tr.expanded { background: #f1f5f9; }
 /* ── Form ── */
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form-group { display: flex; flex-direction: column; gap: 5px; }
-.form-group label { font-size: 12px; color: #7c8aa5; font-weight: 600; }
+.form-group label { font-size: 12px; color: #5b6b83; font-weight: 600; }
 .form-group input, .form-group select, .form-group textarea {
   background: #ffffff; border: 1px solid #d5dce8;
   border-radius: 8px; padding: 9px 12px; color: #1f2937; font-size: 13px;
@@ -1183,7 +1270,7 @@ tbody tr.expanded { background: #f1f5f9; }
 .form-group select { cursor: pointer; }
 .form-group select option { background: #ffffff; color: #1f2937; }
 .form-group .readonly {
-  background: #f8fafc; border-style: dashed; cursor: default; color: #7c8aa5;
+  background: #f8fafc; border-style: dashed; cursor: default; color: #5b6b83;
 }
 
 /* ── Toast ── */

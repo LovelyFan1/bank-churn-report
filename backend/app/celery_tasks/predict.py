@@ -16,6 +16,7 @@ from app.models.customer import Customer
 from app.services.data_loader import DataLoader, prepare_features, GEOGRAPHY_MAP, GENDER_MAP, FEATURE_NAMES
 from app.config import settings
 from app.services import risk_scoring
+from app.services.task_submission import track_submission
 
 import joblib
 from pathlib import Path
@@ -25,62 +26,13 @@ MODEL_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
 
 def _load_best_model():
-    """从磁盘加载 AUC 最高的模型。失败时返回 (None, None)，不抛异常。
-
-    ⚠ 旧实现是裸的 json.load + joblib.load，**没有任何异常处理**。
-    实测：把 meta.json 截断成一半（模拟训练任务正在写入的中间状态），
-        predict.py 版   → 抛 JSONDecodeError（任务整体失败）
-        risk_scoring 版 → 返回 (None, None)，降级为"模型未就绪"并记 warning
-    同一份文件、两种处理，说明这里漏了防护。
-    train.py 用原子写（tempfile + os.replace）后撞上的概率已很低，但
-    "读的时候文件恰好不存在/损坏"仍会发生（例如首次部署、误删、磁盘写满），
-    本函数是任务入口，不该因此把整个 batch_score 打成 failed。
-    现与 risk_scoring._load_best_model 对齐：重试 + 降级 + warning。
-    """
+    from app.services.model_manifest import resolve
     import logging
-    import time as _time
-    logger = logging.getLogger(__name__)
-
-    meta_path = MODEL_DIR / "meta.json"
-    if not meta_path.exists():
-        return None, None
-
-    ATTEMPTS = 3
-    meta = None
-    last_err: Exception | None = None
-    for attempt in range(ATTEMPTS):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            break
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            last_err = e
-            if attempt < ATTEMPTS - 1:
-                _time.sleep(0.15 * (attempt + 1))
-
-    if meta is None:
-        logger.warning("predict: 读取 %s 失败（已重试 %d 次）: %s: %s",
-                       meta_path, ATTEMPTS, type(last_err).__name__, last_err)
-        return None, None
-
     try:
-        results = meta["results"]
-        best_name = max(results.keys(), key=lambda x: results[x]["auc"])
-    except (KeyError, TypeError, ValueError) as e:
-        logger.warning("predict: meta.json 结构异常，无法选出最佳模型: %s: %s",
-                       type(e).__name__, e)
-        return None, None
-
-    model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
-    if not model_path.exists():
-        logger.warning("predict: 最佳模型文件不存在: %s", model_path)
-        return None, None
-
-    try:
-        return joblib.load(model_path), best_name
-    except Exception as e:
-        logger.warning("predict: 加载模型 %s 失败: %s: %s",
-                       model_path, type(e).__name__, e)
+        manifest = resolve(MODEL_DIR)
+        return joblib.load(manifest.path), manifest.best_model
+    except Exception as error:
+        logging.getLogger(__name__).warning("批量模型清单不可用：%s", error)
         return None, None
 
 
@@ -126,7 +78,8 @@ def _risk_factors(c: Customer) -> list:
 
 
 @celery_app.task(bind=True, name="batch_score_all")
-def batch_score_task(self, top_n: int = 100) -> dict:
+@track_submission
+def batch_score_task(self, top_n: int = 100, model_snapshot: dict | None = None) -> dict:
     """Celery 任务: 全量批量打分，分块处理避免 OOM。
 
     Args:
@@ -139,9 +92,24 @@ def batch_score_task(self, top_n: int = 100) -> dict:
     try:
         self.update_state(state="PROGRESS", meta={"step": "loading", "message": "加载最佳模型..."})
 
-        model, best_name = _load_best_model()
-        if model is None:
-            return {"status": "failed", "error": "模型尚未训练，请先调用 train 接口"}
+        from app.services import model_manifest
+        from app.services.data_loader import _read_cache_version, get_cached_customer_df
+        if model_snapshot is None:
+            manifest = model_manifest.resolve(MODEL_DIR)
+            engine = risk_scoring._ensure_engine(db)
+            if engine is None or engine['model_version'] != manifest.revision:
+                raise ValueError("模型与风险引擎快照不一致，请重新提交")
+            model_snapshot = {"meta": manifest.meta, "model_version": manifest.revision,
+                              "thresholds": dict(engine['thresholds']),
+                              "customer_version": engine['customer_version'], "status": manifest.status}
+        manifest = model_manifest.resolve(MODEL_DIR, model_snapshot['meta'])
+        model, best_name = joblib.load(manifest.path), manifest.best_model
+        if model_snapshot['customer_version'] != _read_cache_version():
+            raise ValueError("客户快照已改变，请重新提交")
+        fingerprint = manifest.meta.get('dataset_fingerprint')
+        if fingerprint and not manifest.meta['results'][best_name].get('threshold_validation') and risk_scoring.dataset_fingerprint(get_cached_customer_df(db)) != fingerprint:
+            raise ValueError("客户数据不匹配固定模型快照")
+        thresholds = dict(model_snapshot['thresholds'])
 
         loader = DataLoader(db)
         total = loader.total_count
@@ -160,8 +128,10 @@ def batch_score_task(self, top_n: int = 100) -> dict:
         processed = 0
         for chunk in loader.iter_chunks():
             X, _, _ = prepare_features(chunk)
-            raw_probs = model.predict_proba(X)[:, 1]
-            cal_probs, levels = risk_scoring.calibrate_probs(db, raw_probs)
+            from app.services.shap_contract import positive_class
+            raw_probs = model.predict_proba(X)[:, positive_class(model)]
+            cal_probs = np.asarray(raw_probs, dtype=float)
+            levels = [risk_scoring._level(float(prob), thresholds) for prob in cal_probs]
 
             for i in range(len(cal_probs)):
                 prob = float(cal_probs[i])
@@ -216,6 +186,8 @@ def batch_score_task(self, top_n: int = 100) -> dict:
         _enrich_with_shap(model, top_n_records)
 
         top_customers = [r[1] for r in top_n_records]
+        if model_snapshot['customer_version'] != _read_cache_version():
+            raise ValueError("评分期间客户数据已改变，未发布混合结果")
 
         return {
             "status": "completed",
@@ -223,12 +195,14 @@ def batch_score_task(self, top_n: int = 100) -> dict:
             "top_customers": top_customers,
             "risk_distribution": risk_dist,
             "model_used": best_name,
+            "model_version": model_snapshot['model_version'],
+            "manifest_status": model_snapshot['status'],
         }
 
     except SoftTimeLimitExceeded:
         return {"status": "timeout", "error": "批量预测超时"}
     except Exception as e:
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": "批量评分未通过模型或数据快照检查", "reason": type(e).__name__}
     finally:
         db.close()
 
@@ -272,28 +246,23 @@ def _enrich_with_shap(model, top_records: list) -> None:
     def _fallback():
         for _prob, record, _ in top_records:
             record["risk_factors"] = _risk_factors_from_row(record)
+            record["risk_factors_basis"] = "business_rules"
+            record["shap_unavailable_reason"] = "模型解释未能通过支持性或贡献加和检查"
             _apply_strategy(record)
 
     try:
         import shap
 
-        # ⚠ 不传 model_output —— 默认 raw 是唯一被 tree_path_dependent 支持的尺度
-        explainer = shap.TreeExplainer(model)
+        from app.services.shap_contract import explain
         features_matrix = np.array([r[2] for r in top_records])
-        shap_values = explainer.shap_values(features_matrix)
-
-        if isinstance(shap_values, list):
-            shap_values = shap_values[1]  # 二分类取正类
-
-        shap_values = np.asarray(shap_values)
-        if shap_values.ndim != 2 or shap_values.shape[1] != len(FEATURE_NAMES):
-            # 形状不符 → 宁可回退，也不能让索引悄悄错位
-            raise ValueError(
-                f"SHAP 输出形状 {shap_values.shape} 与 FEATURE_NAMES"
-                f"({len(FEATURE_NAMES)}) 不匹配"
-            )
+        explanation = explain(model, features_matrix)
+        shap_values = explanation["values"]
 
         for idx, (_prob, record, _) in enumerate(top_records):
+            record.update(shap_output_space=explanation["output_space"],
+                shap_base_value=explanation["base_value"], shap_additivity_checked=True,
+                shap_positive_class=1, shap_contributions=shap_values[idx].tolist(),
+                risk_factors_basis="shap_ratio_of_positive_contributions")
             shap_vals = shap_values[idx]
             pairs = [(FEATURE_NAMES[i], float(shap_vals[i]))
                      for i in range(len(FEATURE_NAMES))]

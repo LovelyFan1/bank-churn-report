@@ -4,8 +4,10 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.services.cost_benefit_service import get_cost_benefit_service
+from app.services import auth_deps, auth_service as auth
 
-router = APIRouter(prefix="/api/cost-benefit", tags=["CostBenefit"])
+router = APIRouter(prefix="/api/cost-benefit", tags=["CostBenefit"],
+                   dependencies=[Depends(auth_deps.require_perm(auth.PERM_INSIGHT_VIEW))])
 
 
 @router.get("/thresholds")
@@ -20,7 +22,7 @@ async def get_threshold_analysis(
 
 @router.get("/summary")
 async def get_business_summary(db: Session = Depends(get_db)):
-    """业务摘要 - 年化成本收益（**推算值**：模型测试集指标 × 假设客单价）"""
+    """业务摘要 - 静态样本情景测算（**推算值**：模型测试集指标 × 假设客单价）"""
     service = get_cost_benefit_service(db)
     return service.get_business_summary()
 

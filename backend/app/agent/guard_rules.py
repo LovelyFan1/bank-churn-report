@@ -49,7 +49,7 @@ _RULES = [
             "result（retained/lost）来自 seed_work_orders.py 的硬编码常量表"
             "STATUS_PLAN，是按序写死的比例，不是客户真实反馈。"
             "因此任何「成功率」都不可计算 —— 系统中唯一出现的是"
-            "RETENTION_SUCCESS_RATE = 0.30，那是**行业保守假设值**，"
+            "RETENTION_SUCCESS_RATE = 0.30，那是**演示假设值，缺少真实业务验证**，"
             "用于成本模型推算，不是实测结果。"
         ),
         "instead": "可以问：当前成本模型假设的挽留成功率是多少、它如何影响名单规模；或查工单各自的处理状态与标记结果。",
@@ -145,6 +145,9 @@ def check(question: str) -> GuardHit | None:
         return None
 
     q = question.strip()
+    if re.search(r"未来|明年|下个月|下季度", q) and re.search(r"多少|下降|增长|趋势|预测|会", q):
+        return GuardHit(key="future_trend", reason="当前数据没有时间序列和预测窗口，不能预测未来人数或趋势。",
+                        instead="可以查询当前样本的风险分布和测算条件。")
 
     # 豁免一：问句里含具体客户编号 → 一定是想问这个客户，不拦
     if _NUMERIC_CLIENT_ID.search(q):
@@ -197,32 +200,7 @@ def known_topics() -> list[dict]:
 # 设计取舍：识别到写意图但**没有客户编号**时，不强制（无法构造参数），
 #   交给 LLM 正常追问 —— 强行调用只会得到一个报错的工具结果。
 
-_WRITE_KEYWORDS = [
-    "建单", "建个单", "建工单", "创建工单", "创建工作单", "开个工单",
-    # ⚠ "建立工单" 必须单列（实测缺陷，用户报告）：
-    #   表里有「建工单」但没有「建立工单」—— 中间多了个"立"字，
-    #   正则匹配不到。而"建立工单"恰恰是最自然的书面说法之一。
-    #   实测：用户说「帮我把这三位建立工单」，写意图**完全没被识别**，
-    #   于是不强制调提议工具、前端拿不到确认面板，
-    #   用户只看到一条"未指定负责人"的单条提议。
-    "建立工单", "建立起工单", "建立挽留工单", "建挽留工单",
-    "派给", "派单", "分配给", "指派给", "安排给",
-    "帮我建", "给我建", "给.*建.*单", "帮.*建.*单", "把.*建.*单",
-    "生成工单", "下个工单", "开单",
-    # ── 取消/删除/改单（实测缺口 diag116）──────────────────
-    # 用户问「帮我取消已建单待处理状态客户」时，Agent **没有任何工具**
-    # 能完成这件事，却凭记忆答「没有已建单待处理状态的客户」。
-    # 补上这两类关键词后，写意图会被识别并走强制提议流程。
-    "取消工单", "取消已建单", "取消建单", "取消这个单", "取消那张单",
-    "删除工单", "删掉工单", "删掉这个单", "删了这单",
-    "标记为已完成", "标记完成", "标为完成", "结单",
-    "改状态", "修改工单", "改成处理中", "改成已流失",
-]
-
-# 明确的"不要执行"信号 —— 用于排除询问性问法
-_INQUIRY_KEYWORDS = ["能不能", "可以吗", "该不该", "要不要", "是否应该", "为什么"]
-
-_CID_RE = re.compile(r"\bC\d{4,}\b", re.IGNORECASE)
+_CID_RE = re.compile(r"(?<![A-Za-z0-9])C\d{4,}(?![A-Za-z0-9])", re.IGNORECASE)
 
 # 「这三位 / 这几个 / 他们」这类**指代**表达。
 #
@@ -242,10 +220,76 @@ _CID_RE = re.compile(r"\bC\d{4,}\b", re.IGNORECASE)
 #   本函数只负责回答"这是不是一个写指令"，对象由调用方
 #   结合 context 补齐（见 detect_write_intent_multi）。
 _REFERENTIAL = re.compile(
-    r"(这|那)(几|两|三|四|五|六|七|八|九|十|\d+)?\s*(位|个|名|人|张|条|批)|"
+    r"第[零一二三四五六七八九十百两\d]+\s*(?:位|个|名)|"
+    r"(这|那)(几|[零一二三四五六七八九十百两]+|\d+)?\s*(位|个|名|人|张|条|批)|"
     r"他们|它们|她们|上述|上面(这|那)?(几|些|些个)?|刚才(那|这)?(几|些)?|"
     r"这些|那些|全部|所有"
 )
+
+
+_ACTION_PATTERNS = {
+    "create": re.compile(r"(?:创建|建立(?:起)?|生成|开个|下个)(?:挽留)?(?:工单|工作单)|"
+                         r"建(?:个)?(?:挽留)?(?:工单|单)|开单|派单|派给|分配给|指派给|安排给|"
+                         r"(?:给|帮|把)[^。；]*建[^。；]*单"),
+    "cancel": re.compile(r"取消|停止跟进|撤销|作废"),
+    "delete": re.compile(r"删除|删掉|删了"),
+    "update": re.compile(r"修改|更新|改状态|改成|标记(?:为)?|标为|结单|改派"),
+}
+_CONSULTATION = re.compile(r"怎么|如何|能不能|能否|可以吗|该不该|要不要|是否|为什么|"
+                           r"查询|查看|支持|有哪些|有没有|多少|区别|含义|已取消|已删除")
+_NEGATION = re.compile(r"不要|别|不想|不需要|不允许|禁止|暂不|无需|不")
+
+
+def write_intents(question: str) -> dict:
+    """受控动作解析；否定按分句/动作生效，只查询与不执行约束整轮。"""
+    q = (question or "").strip()
+    if re.search(r"(?:只|仅)(?:查询|查看|阅读|读|看)|不执行|仅供|只是示例", q):
+        return {}
+    intents = {}
+    previous = []
+    # 保留编号间的逗号；转折拆开，避免否定取消同时否定正向创建。
+    clauses = re.split(r"[。；;\n]|[，,](?!\s*C\d{4,})|但是|不过|但|而是", q, flags=re.I)
+    for clause in clauses:
+        if re.search(r"取消建单|取消提议|撤回提议|撤回建单", clause):
+            previous = []
+            continue
+        if _CONSULTATION.search(clause):
+            previous = []
+            continue
+        current = []
+        matched = False
+        for action, pattern in _ACTION_PATTERNS.items():
+            match = pattern.search(clause)
+            matched = matched or match is not None
+            if match is None or _NEGATION.search(clause[:match.end()]):
+                continue
+            current.append(action)
+            entry = intents.setdefault(action, {"customer_ids": [], "clauses": []})
+            entry["clauses"].append(clause)
+            for cid in _CID_RE.findall(clause):
+                if cid.upper() not in entry["customer_ids"]:
+                    entry["customer_ids"].append(cid.upper())
+        if current:
+            previous = current
+        elif not matched and previous and _extract_assignee(clause):
+            for action in previous:
+                intents[action]["clauses"].append(clause)
+        else:
+            previous = []
+    return intents
+
+
+def write_action_error(question: str, action: str, customer_ids=None) -> str | None:
+    """供LLM工具和最终提议共用；没有明确动作意图时不生成确认凭据。"""
+    intent = write_intents(question).get(action)
+    if intent is None:
+        return "用户未明确要求该写操作，或已否定该动作；本次只查询，不生成写操作提议。"
+    explicit = intent["customer_ids"]
+    if explicit and customer_ids:
+        ids = customer_ids if isinstance(customer_ids, list) else [customer_ids]
+        if any(str(cid).upper() not in explicit for cid in ids):
+            return "写操作对象与该动作的明确客户不一致，请分别指定动作和对象。"
+    return None
 
 
 def detect_write_intent(question: str) -> tuple[bool, str | None, str | None]:
@@ -260,7 +304,7 @@ def detect_write_intent(question: str) -> tuple[bool, str | None, str | None]:
     ⚠ 询问性问法不算写意图：
       「C034525 要不要建单」是**咨询**，应让模型回答该不该建；
       「给 C034525 建单」是**指令**，必须走待确认流程。
-      区分靠 _INQUIRY_KEYWORDS。
+      区分由 write_intents 的动作与分句约束完成。
 
     ⚠ 为什么要在这里抽负责人（而非交给 LLM）：当识别到写意图时，
       图会**强制**调用 propose_create_work_order（tool_choice），
@@ -292,47 +336,35 @@ def detect_write_intent_multi(question: str) -> tuple[bool, list[str], str | Non
         return False, [], None
     q = question.strip()
 
-    # 询问性问法 → 不是写指令
-    if any(k in q for k in _INQUIRY_KEYWORDS):
-        return False, [], None
-
-    hit = False
-    for kw in _WRITE_KEYWORDS:
-        if re.search(kw, q):
-            hit = True
-            break
-    if not hit:
+    intent = write_intents(q).get("create")
+    if intent is None:
         return False, [], None
 
     # 全部编号（保序去重）—— 不再只取第一个
-    cids: list[str] = []
-    for m in _CID_RE.findall(q):
-        c = m.upper()
-        if c not in cids:
-            cids.append(c)
+    cids = list(intent["customer_ids"])
 
     # ⚠ 没有显式编号但含指代（"这三位"）时，**仍然算写意图** ——
     #   对象留给调用方用上下文补齐。旧实现直接返回 False，
     #   导致整条强制提议链路不触发（这是用户报告的核心缺陷）。
     #   注意：既无编号又无指代时返回 False（无法构造参数，
     #   强行调用工具只会得到报错结果，见本模块顶部的设计取舍）。
-    if not cids and not _REFERENTIAL.search(q):
+    action_text = "，".join(intent["clauses"])
+    if not cids and not _REFERENTIAL.search(action_text):
         return False, [], None
 
-    return True, cids, _extract_assignee(q)
+    return True, cids, _extract_assignee(action_text)
 
 
 # 负责人抽取：匹配「负责人(是|写|叫|填)?X」「派给X」「指派给X」「分配给X」
 # X 为 2~4 个中文字 或 ASCII 单词。已知系统内负责人：
 #   111 / 张思远 / 李铭 / 王晓芸 / 赵敏 / 陈立群
 _ASSIGNEE_PATTERNS = [
-    re.compile(r"负责人(?:是|写|叫|填|为|：|:)?\s*([\u4e00-\u9fa5A-Za-z0-9]{1,10})"),
+    re.compile(r"负责人(?:是|写|叫|填|为|用|：|:)?\s*([\u4e00-\u9fa5A-Za-z0-9]{1,10})"),
     re.compile(r"(?:派给|指派给|分配给|安排给|交给)\s*([\u4e00-\u9fa5A-Za-z0-9]{1,10})"),
 ]
 
 # 这些词出现在负责人位置说明抽取失败（是动词/助词而非人名）
-_ASSIGNEE_STOPWORDS = {"他", "她", "它", "我", "你", "客户", "这个人", "该客户",
-                       "一下", "吧", "了", "的", "处理", "跟进"}
+_ASSIGNEE_STOPWORDS = {"一下", "吧", "了", "的", "处理", "跟进"}
 
 
 def _extract_assignee(q: str) -> str | None:

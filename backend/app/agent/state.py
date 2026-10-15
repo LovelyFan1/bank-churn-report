@@ -38,6 +38,7 @@ class AgentState(TypedDict, total=False):
     # ── 输入 ────────────────────────────────────────────
     session_id: str
     question: str
+    deadline: float
 
     # ── 会话上下文（短期记忆，指针式）─────────────────────
     # ⚠ 为什么放在 state 而不是进程内存：生产是 `uvicorn --workers 4`，

@@ -25,6 +25,8 @@ import InfoTip from '../components/InfoTip.vue'
 import { AGENT_KEY_PREFIX, KEY_USER, agentKeyFor } from '../utils/userStorage'
 import { assignees as staffList, canAssign, loadAssignees, defaultAssignee } from '../utils/assignees'
 import { riskLabel } from '../utils/risk'
+import { batchPlan } from '../utils/agentBatch'
+import { statusLabel } from '../utils/workOrders'
 
 /**
  * 会话持久化 —— 用户要求「切换窗口时会话不消失」。
@@ -133,6 +135,8 @@ const health = ref(null)
 const caps = ref(null)
 const listEl = ref(null)
 const restored = ref(false)   // 是否从缓存恢复过（用于提示用户）
+const sessionError = ref('')
+const contextExpired = ref(false)
 
 /**
  * 会话上下文（短期记忆）—— 只存编号等指针，不存内容。
@@ -149,6 +153,9 @@ const restored = ref(false)   // 是否从缓存恢复过（用于提示用户�
  * 体积：约 100 token，**不随轮次增长**（上限 20 个实体，溢出淘汰最旧）。
  */
 const agentContext = ref({ customers: [], orders: [] })
+const newSessionId = () => globalThis.crypto?.randomUUID?.() || `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`
+const sessionId = ref(newSessionId())
+const sessionVersion = ref(0)
 
 const samples = [
   '帮我调出挽回价值最高的3个客户',
@@ -160,6 +167,8 @@ const samples = [
 onMounted(async () => {
   // ── 先恢复会话，再拉能力清单（避免恢复的内容被覆盖）──
   const saved = loadSession()
+  if (saved?.sessionId) sessionId.value = saved.sessionId
+  if (Number.isInteger(saved?.sessionVersion)) sessionVersion.value = saved.sessionVersion
   if (saved && saved.turns.length) {
     // ⚠ 恢复时把交互态重置：确认中 / 展开依据等瞬时状态不该被持久化，
     //   否则刷新后会看到「执行中…」这种卡住的假状态。
@@ -179,6 +188,7 @@ onMounted(async () => {
     agentContext.value = {
       customers: Array.isArray(saved.context.customers) ? saved.context.customers : [],
       orders: Array.isArray(saved.context.orders) ? saved.context.orders : [],
+      focus_customer_id: saved.context.focus_customer_id || null,
     }
   }
 
@@ -187,6 +197,17 @@ onMounted(async () => {
     health.value = data
   } catch (e) {
     health.value = { available: false, reason: e.message }
+  }
+  if (saved?.sessionId) {
+    try {
+      const { data } = await api.get(`/agent/session/${encodeURIComponent(sessionId.value)}`)
+      agentContext.value = data.context || { customers: [], orders: [] }
+      sessionVersion.value = data.session_version
+      contextExpired.value = data.expired
+    } catch (e) {
+      agentContext.value = { customers: [], orders: [] }
+      sessionError.value = '服务端上下文未能恢复，请重新查询。'
+    }
   }
   try {
     const { data } = await api.get('/agent/capabilities')
@@ -214,7 +235,7 @@ onMounted(async () => {
  */
 let suppressPersist = false
 
-watch([turns, agentContext], ([val]) => {
+watch([turns, agentContext, sessionVersion], ([val]) => {
   if (suppressPersist) return
   // ⚠ 键在**写入时**才计算（而非模块级常量）—— 登录人可能在
   //   本次会话中变化（登出再登录），用常量会把新账号的数据
@@ -239,7 +260,10 @@ watch([turns, agentContext], ([val]) => {
       confirmResult: t.confirmResult,
       confirmError: t.confirmError,
       batch: t.batch ? {
+        kind: t.batch.kind, detail: t.batch.detail,
         targets: t.batch.targets, blocked: t.batch.blocked,
+        remaining: t.batch.remaining, requested: t.batch.requested,
+        previousResults: t.batch.previousResults,
         assignee: t.batch.assignee, result: t.batch.result,
         error: t.batch.error, open: false, running: false,
       } : null,
@@ -252,6 +276,8 @@ watch([turns, agentContext], ([val]) => {
       turns: slim.slice(-MAX_TURNS),
       // 上下文（约 100 token 的指针清单）—— 刷新后追问仍成立
       context: agentContext.value,
+      sessionId: sessionId.value,
+      sessionVersion: sessionVersion.value,
     }))
   } catch (e) {
     // 配额满 / 隐私模式禁用 storage —— 不该影响正常对话
@@ -260,22 +286,42 @@ watch([turns, agentContext], ([val]) => {
 }, { deep: true })
 
 /** 清空会话 —— 用户需要能主动丢弃**自己**的本地缓存 */
-function clearSession() {
+function pendingTokens(turn) {
+  return [...new Set([turn.pending?.confirmation_token,
+    ...(turn.batch?.items || []).map(it => it.confirmation_token),
+    ...(turn.batch?.proposals || []).map(it => it.confirmation_token)].filter(Boolean))]
+}
+
+async function clearSession() {
+  if (sending.value) return
+  try {
+    await api.post(`/agent/session/${encodeURIComponent(sessionId.value)}/clear`, {
+      confirmation_tokens: turns.value.flatMap(pendingTokens),
+    })
+  } catch (e) {
+    sessionError.value = e.response?.data?.detail || e.message
+    return
+  }
   // 先删键、再清 turns，并用 suppressPersist 跳过 watcher 的空写，
   // 保证"清空"是彻底且立刻生效的（见 watcher 注释）
   // ⚠ 只删**当前用户**的键，不影响其他账号的历史
   try { localStorage.removeItem(storeKey()) } catch (_) { /* 忽略 */ }
   suppressPersist = true
+  sessionError.value = ''
+  contextExpired.value = false
   turns.value = []
   // ⚠ 上下文必须一起清 —— 否则"清空会话"后模型仍记得之前的人，
   //   用户会以为清空没生效（这是最容易被忽略的一处状态残留）
   agentContext.value = { customers: [], orders: [] }
+  sessionId.value = newSessionId()
+  sessionVersion.value = 0
   restored.value = false
   nextTick(() => { suppressPersist = false })
 }
 
 const BASIS = {
-  llm_verified: { label: '模型作答 · 数字已校验', cls: 'b-verified' },
+  llm_verified: { label: '系统数据 · 模型解读需复核', cls: 'b-verified' },
+  system_data: { label: '系统数据 · 确定性查询', cls: 'b-verified' },
   llm_partial_dropped: { label: '模型解读含未溯源数字 · 已丢弃该段，数据不受影响', cls: 'b-fallback' },
   // system_meta = 系统模板直接回答（你是谁/能做什么/技术栈）。
   // 与 LLM 无关，因此不存在幻觉可能，但也不是"数据查询"。
@@ -301,14 +347,16 @@ async function send(text) {
 
   try {
     // ⚠ context 随请求回传 —— 这是让模型能理解「第二个」「他」的唯一途径。
-    //   后端保持无状态，故必须每轮带上（详见 agentContext 的说明）。
+    //   后端使用持久化任务状态；副本用于界面恢复，版本号防止过期提交。
     const { data } = await api.post('/agent/ask', {
       question: q,
-      session_id: 'ui',
+      session_id: sessionId.value,
+      session_version: sessionVersion.value,
       context: agentContext.value,
-    })
+    }, { timeout: 90000 })
     // 更新上下文：后端返回的是**合并后的**新清单，直接替换
     if (data.context) agentContext.value = data.context
+    if (Number.isInteger(data.session_version)) sessionVersion.value = data.session_version
 
     const pending = data.pending_action || null
     // ── 批量提议自动展开为批量确认面板 ──────────────────────
@@ -328,12 +376,16 @@ async function send(text) {
         ? {
             open: true,
             kind: 'create',
-            targets: (pending.items || []).map((it) => it.customer_id),
+            targets: batchPlan(pending.requested_customer_ids || (pending.items || []).map(it => it.customer_id)).current,
+            remaining: pending.remaining_customer_ids || [],
+            requested: pending.requested_customer_ids || (pending.items || []).map(it => it.customer_id),
+            previousResults: [],
             blocked: (pending.items || [])
               .filter((it) => it.has_active_order)
               .map((it) => it.customer_id),
             items: pending.items || [],
-            assignee: defaultAssignee(),
+            assignee: (pending.items || [])[0]?.assignee || defaultAssignee(),
+            failed: pending.failed || [],
             running: false,
             result: null,
             error: '',
@@ -360,6 +412,13 @@ async function send(text) {
       confirmResult: null,
     })
   } catch (e) {
+    if (e.response?.status === 409) {
+      try {
+        const { data } = await api.get(`/agent/session/${encodeURIComponent(sessionId.value)}`)
+        agentContext.value = data.context
+        sessionVersion.value = data.session_version
+      } catch { /* 保留原始错误，允许下次主动重试。 */ }
+    }
     turns.value.push({
       role: 'agent',
       answer: { kind: 'text', headline: '请求失败', text: e.response?.data?.detail || e.message },
@@ -378,12 +437,16 @@ async function scrollToEnd() {
 }
 
 /** 打开批量确认面板（方案 A 第一步：先看清楚要建什么，再确认） */
-function openBatch(turn, action) {
+async function openBatch(turn, action) {
+  const plan = batchPlan(action.targets)
   // 单人不再"重新发问"，统一走面板 —— 见模板 ⑦ 的说明
   turn.batch = {
     open: true,
     kind: 'create',
-    targets: [...(action.targets || [])],
+    targets: plan.current,
+    remaining: plan.remaining,
+    requested: plan.requested,
+    previousResults: [],
     blocked: action.blocked || [],
     // ⚠ 预填当前登录人，不再留空。
     //   后端建单已要求负责人必填，留空会让整批被拒；
@@ -394,16 +457,51 @@ function openBatch(turn, action) {
     result: null,
     error: '',
   }
+  await prepareBatch(turn)
+}
+
+async function nextBatch(turn) {
+  const b = turn.batch
+  if (!b || b.running || !b.remaining?.length) return
+  if (b.result) b.previousResults.push(b.result)
+  const plan = batchPlan(b.remaining)
+  b.targets = plan.current
+  b.remaining = plan.remaining
+  b.result = null
+  b.items = []
+  b.failed = []
+  await prepareBatch(turn)
+}
+
+async function prepareBatch(turn) {
+  const b = turn.batch
+  if (!b || b.running) return
+  b.running = true
+  b.error = ''
+  try {
+    const { data } = await api.post('/agent/prepare-create', {
+      customer_ids: b.targets, assignee: b.assignee,
+    })
+    b.items = data.items || []
+    b.failed = data.failed || []
+    if (b.items.length) b.assignee = b.items[0].assignee
+    if (!b.items.length) b.error = b.failed.map(it => `${it.customer_id}：${it.reason}`).join('；')
+  } catch (e) {
+    b.items = []
+    b.error = e.response?.data?.detail || e.message
+  } finally {
+    b.running = false
+  }
 }
 
 /**
  * 打开取消工单确认面板。
  *
- * ⚠ 删除不可逆，面板上必须把"要删哪一张"显示清楚（工单号 + 客户 + 当前状态），
+ * 面板必须把要取消的工单显示清楚（工单号 + 客户 + 当前状态），
  *   故这里从 answer.entities 里把对应工单的信息取出来展示，
  *   而不是只显示一个 id。
  */
-function openCancel(turn, action) {
+async function openCancel(turn, action) {
   const ids = action.targets || []
   const byId = new Map()
   for (const e of (turn.answer.entities || [])) {
@@ -425,14 +523,38 @@ function openCancel(turn, action) {
                 || (e?.secondary || []).find(s => s.label === '状态')?.value || '',
       }
     }),
-    running: false,
+    running: true,
     result: null,
     error: '',
   }
+  const b = turn.batch
+  b.proposals = []
+  try {
+    for (const item of b.detail) {
+      const { data } = await api.post('/agent/prepare-order-cancel', {
+        order_id: item.order_id, customer_id: item.customer_id,
+      })
+      b.proposals.push(data)
+      item.customer_name = data.current.customer_name
+      item.status = data.current.status
+    }
+  } catch (e) {
+    b.error = e.response?.data?.detail || e.message
+  } finally {
+    b.running = false
+  }
 }
 
-function closeBatch(turn) {
-  if (turn.batch) turn.batch.open = false
+async function closeBatch(turn) {
+  if (!turn.batch || turn.batch.running) return
+  try {
+    await api.post('/agent/retract', { confirmation_tokens: pendingTokens(turn) })
+    turn.batch.open = false
+    turn.cancelled = true
+    turn.batch.items = []
+  } catch (e) {
+    turn.batch.error = e.response?.data?.detail || e.message
+  }
 }
 
 /** 提交批量建单 —— 唯一落库入口，且必须用户点了确认 */
@@ -443,22 +565,27 @@ async function submitBatch(turn) {
   b.error = ''
   try {
     if (b.kind === 'cancel') {
-      // 取消（删除）逐条调 confirm —— 删除是单条操作，
-      // 且失败要能逐条汇报（某一张已被别人删掉时不应整批回滚）
+      if (b.proposals?.length !== b.targets.length) {
+        throw new Error('未能核对全部工单，请关闭面板并重新查询。')
+      }
+      // 使用准备阶段生成的凭据逐条确认；状态过期或失败逐条汇报。
       const results = []
       const failed = []
       for (const oid of b.targets) {
         try {
+          const pending = b.proposals.find(p => p.payload.order_id === oid)
           const { data } = await api.post('/agent/confirm', {
-            action: 'delete_work_order',
-            payload: { order_id: oid },
+            action: pending.action, payload: pending.payload,
+            confirmation_token: pending.confirmation_token,
           })
-          results.push({ order_id: oid, deleted_order: data.deleted_order })
+          results.push({ order_id: oid, order: data.order })
+          syncOrderContext(data)
         } catch (e) {
           failed.push({ order_id: oid,
                         reason: e.response?.data?.detail || e.message })
         }
       }
+      if (b.targets.length > 1) agentContext.value.focus_customer_id = null
       b.result = {
         cancelled: true,
         succeeded: results.length,
@@ -471,9 +598,14 @@ async function submitBatch(turn) {
       }
     } else {
       const { data } = await api.post('/agent/confirm-batch', {
-        customer_ids: b.targets,
-        assignee: b.assignee || '',
+        proposals: (b.items || []).map(it => ({
+          action: 'create_work_order', confirmation_token: it.confirmation_token,
+          payload: Object.fromEntries(Object.entries(it).filter(([key]) => key !== 'confirmation_token')),
+        })),
       })
+      data.failed = [...(data.failed || []), ...(b.failed || [])]
+      data.failed_count = data.failed.length
+      data.requested = new Set([...b.targets, ...data.failed.map(it => it.customer_id)]).size
       b.result = data
     }
   } catch (e) {
@@ -484,16 +616,27 @@ async function submitBatch(turn) {
 }
 
 async function confirmAction(turn) {
-  if (!turn.pending || turn.confirming) return
+  if (!turn.pending || turn.confirming || turn.confirmed || turn.cancelled) return
   turn.confirming = true
   turn.confirmError = ''
   try {
     const { data } = await api.post('/agent/confirm', {
       action: turn.pending.action,
       payload: turn.pending.payload,
+      confirmation_token: turn.pending.confirmation_token,
     })
     turn.confirmed = true
-    turn.confirmResult = data.order
+    turn.confirmResult = data.order || { id: data.order_id, ...data.deleted_order }
+    syncOrderContext(data)
+    turn.answer.warning = null
+    turn.answer.headline = `${receiptLabel(turn)} #${turn.confirmResult.id} · ${turn.confirmResult.customer_id}`
+    for (const entity of turn.answer.entities || []) {
+      if (entity.order_id !== turn.confirmResult.id) continue
+      const statusText = data.deleted ? '已永久删除' : statusLabel(turn.confirmResult.status)
+      entity.tags = [statusText]
+      entity.secondary = (entity.secondary || []).map(s => s.label === '当前状态'
+        ? { label: '执行后状态', value: statusText } : s)
+    }
   } catch (e) {
     turn.confirmError = e.response?.data?.detail || e.message
   } finally {
@@ -501,10 +644,15 @@ async function confirmAction(turn) {
   }
 }
 
-function cancelAction(turn) {
+async function cancelAction(turn) {
   // ⚠ 不能把 pending 置 null：确认区外层是 v-if="t.pending"，
   //   置空会让容器消失，"已取消"提示永远不显示。
-  turn.cancelled = true
+  try {
+    await api.post('/agent/retract', { confirmation_tokens: pendingTokens(turn) })
+    turn.cancelled = true
+  } catch (e) {
+    turn.confirmError = e.response?.data?.detail || e.message
+  }
 }
 
 /** 确认按钮文案 —— 必须随写操作类型变化，否则会误导用户 */
@@ -512,8 +660,25 @@ function confirmLabel(action) {
   return {
     create_work_order: '确认建单',
     update_work_order: '确认修改',
-    delete_work_order: '确认取消工单',
+    delete_work_order: '确认永久删除',
   }[action] || '确认执行'
+}
+
+function syncOrderContext(data) {
+  const order = data.order || { id: data.order_id, ...data.deleted_order }
+  const ctx = agentContext.value
+  ctx.orders = (ctx.orders || []).filter(o => o.order_id !== order.id)
+  if (!data.deleted && order.id) {
+    ctx.orders.unshift({ order_id: order.id, customer_id: order.customer_id,
+      name: order.customer_name, status: order.status })
+  }
+  ctx.focus_customer_id = order.customer_id || null
+}
+
+function receiptLabel(turn) {
+  if (turn.pending.action === 'delete_work_order') return '✅ 已永久删除工单'
+  if (turn.pending.action === 'create_work_order') return '✅ 已创建工单'
+  return turn.confirmResult?.status === 'cancelled' ? '✅ 已取消工单（记录保留）' : '✅ 已修改工单'
 }
 
 /**
@@ -563,13 +728,14 @@ function warnClass(level) {
       </div>
       <div class="agent-status">
         <button v-if="turns.length" class="btn-clear" @click="clearSession"
-                title="清空本地保存的对话记录">清空会话</button>
+                :disabled="sending" title="清空显示缓存、当前服务端上下文和待确认凭据，并开始新会话">清空会话</button>
         <span :class="['dot', health?.available ? 'ok' : 'off']"></span>
         <span v-if="health?.available" class="status-txt">已连接 · {{ health.model }}</span>
         <span v-else class="status-txt off">不可用：{{ health?.reason || '检测中…' }}</span>
       </div>
     </div>
 
+    <p v-if="sessionError" role="alert" class="err">{{ sessionError }}</p>
     <!-- 能力范围：只列「能做什么」。
          ⚠ 按用户要求**不展示"答不了"那一栏**。
            边界拦截逻辑本身不受影响（guard_rules 仍在调模型前拦下三类问题），
@@ -594,8 +760,10 @@ function warnClass(level) {
     <div ref="listEl" class="chat">
       <!-- 恢复提示：让用户知道这些是本地缓存，不是本次新问的 -->
       <div v-if="restored && turns.length" class="restored-tip">
-        ↩ 已从本地缓存恢复上次对话（{{ turns.length }} 条）。会话仅存于本浏览器，
-        服务端不保存上下文。
+        ↩ 已恢复本浏览器保存的上次对话（{{ turns.length }} 条）。服务端按账号保存必要上下文，
+        最后一次对话后 {{ health?.session_policy?.context_ttl_seconds ? health.session_policy.context_ttl_seconds / 60 + '分钟' : '期限以服务端政策为准' }}失效。
+        清空会话同时清理当前服务端上下文和待确认凭据。
+        <span v-if="contextExpired">旧上下文已过期，请重新查询客户；历史记录仅供查看。</span>
       </div>
 
       <div v-if="!turns.length" class="empty">
@@ -652,7 +820,7 @@ function warnClass(level) {
               </div>
               <div class="e-foot">
                 <span class="e-action">→ {{ e.action }}</span>
-                <span v-if="!e.can_create_order" class="e-blocked">已有进行中的工单</span>
+                <span v-if="!e.can_create_order && !e.order_id" class="e-blocked">已有进行中的工单</span>
               </div>
             </div>
           </div>
@@ -708,13 +876,13 @@ function warnClass(level) {
                  同样产出 entities/facts（见 graph.node_verify），
                  所以"要确认的是什么"是看得见的，不是只有两个按钮。 -->
           <div v-if="t.pending" class="pending">
-            <div class="pending-head">⏸ 此操作尚未执行，需要你确认</div>
+            <div v-if="!t.confirmed && !t.cancelled" class="pending-head">⏸ 此操作尚未执行，需要你确认</div>
             <div class="pending-actions">
               <template v-if="t.confirmed">
                 <div class="done">
-                  {{ t.pending.action === 'delete_work_order'
-                     ? '✅ 已取消工单' : '✅ 已创建工单' }}
+                  {{ receiptLabel(t) }}
                   <span v-if="t.confirmResult?.id"> #{{ t.confirmResult.id }}</span>
+                  <span v-if="t.confirmResult?.customer_id"> · {{ t.confirmResult.customer_id }} {{ t.confirmResult.customer_name }}</span>
                 </div>
               </template>
               <template v-else-if="t.cancelled">
@@ -726,30 +894,36 @@ function warnClass(level) {
                 <button class="btn-confirm"
                         :class="{ 'btn-danger-solid': t.pending.action === 'delete_work_order' }"
                         :disabled="t.confirming" @click="confirmAction(t)">
-                  {{ t.confirming ? '执行中…' : confirmLabel(t.pending.action) }}
+                  {{ t.confirming ? '执行中…' : t.pending.payload?.status === 'cancelled' ? '确认取消工单（保留记录）' : confirmLabel(t.pending.action) }}
                 </button>
-                <button class="btn-cancel" :disabled="t.confirming" @click="cancelAction(t)">取消</button>
+                <button class="btn-cancel" :disabled="t.confirming" @click="cancelAction(t)">放弃操作</button>
               </template>
             </div>
             <p v-if="t.confirmError" class="err">{{ t.confirmError }}</p>
           </div>
           <!-- ⑨ 批量确认面板（方案 A）—— 先看清要建什么，再一次性提交 -->
           <div v-if="t.batch?.open" class="batch-panel">
+            <p v-if="t.batch.kind === 'create'" class="batch-skip">
+              共请求 {{ t.batch.requested?.length || t.batch.targets.length }} 位（编号去重）；本批 {{ t.batch.targets.length }} 位，待下一批 {{ t.batch.remaining?.length || 0 }} 位。每批最多20位，均需另行确认。
+            </p>
+            <p v-for="(r, idx) in (t.batch.previousResults || [])" :key="idx">
+              第{{ idx + 1 }}批：成功{{ r.succeeded }}，失败{{ r.failed_count || 0 }}，跳过{{ r.skipped_count || 0 }}。
+            </p>
             <div class="batch-head">
               {{ t.batch.kind === 'cancel' ? '取消工单确认' : '批量建单确认' }}
-              <span class="batch-count">{{ t.batch.targets.length }} 张</span>
+              <span class="batch-count">{{ t.batch.kind === 'cancel' ? t.batch.targets.length : (t.batch.items?.length || 0) }} 张</span>
             </div>
 
             <div v-if="!t.batch.result">
-              <!-- 取消：必须把"删的是哪一张"显示清楚 -->
+              <!-- 取消：逐张核对服务端返回的客户与状态 -->
               <template v-if="t.batch.kind === 'cancel'">
                 <ul class="batch-list">
                   <li v-for="d in t.batch.detail" :key="d.order_id">
                     #{{ d.order_id }} · {{ d.customer_id }} {{ d.customer_name }}
-                    <span class="batch-st">{{ d.status }}</span>
+                    <span class="batch-st">{{ statusLabel(d.status) }}</span>
                   </li>
                 </ul>
-                <p class="batch-danger">⚠ 删除不可恢复，工单将从系统中移除。</p>
+                <p class="batch-danger">取消后停止跟进，工单及历史记录会保留，不计入挽留成功或流失结果。</p>
               </template>
               <template v-else>
                 <!-- 有 items（来自 Agent 批量提议）时显示客户卡片，
@@ -772,13 +946,19 @@ function warnClass(level) {
                 <p v-if="t.batch.blocked.length" class="batch-skip">
                   已自动排除（已有进行中工单）：{{ t.batch.blocked.join('、') }}
                 </p>
+                <ul v-if="t.batch.failed?.length" class="br-list err">
+                  <li v-for="failure in t.batch.failed" :key="failure.customer_id">
+                    未纳入本次确认：{{ failure.customer_id }} · {{ failure.reason }}
+                  </li>
+                </ul>
                 <div class="batch-assignee">
                   <label>负责人（必选，默认派给发起人）</label>
                   <!-- 与页面建单同一份行员名单、同一接口 —— 三处入口行为一致 -->
-                  <select v-if="canAssign && staffList.length" v-model="t.batch.assignee">
+                  <select v-if="canAssign && staffList.length" v-model="t.batch.assignee"
+                          :disabled="t.batch.running" @change="prepareBatch(t)">
                     <option value="" disabled>请选择负责人</option>
                     <option v-for="a in staffList" :key="a.username" :value="a.username">
-                      {{ a.display_name }}（{{ a.role_label }}）
+                      {{ a.display_name }}（{{ a.username }}·{{ a.department || a.role_label }}）
                     </option>
                   </select>
                   <!-- ⚠ 名单拉取失败时的兜底。若这里显示为空且不可选，
@@ -797,13 +977,14 @@ function warnClass(level) {
               <div class="batch-btns">
                 <button class="btn-confirm"
                         :class="{ 'btn-danger-solid': t.batch.kind === 'cancel' }"
-                        :disabled="t.batch.running" @click="submitBatch(t)">
+                        :disabled="t.batch.running || (t.batch.kind !== 'cancel' && !t.batch.items?.length)" @click="submitBatch(t)">
                   {{ t.batch.running ? '执行中…'
                      : (t.batch.kind === 'cancel'
                         ? `确认取消这 ${t.batch.targets.length} 张工单`
-                        : `确认为这 ${t.batch.targets.length} 人建单`) }}
+                        : `确认为这 ${t.batch.items?.length || 0} 人建单`) }}
                 </button>
                 <button class="btn-cancel" :disabled="t.batch.running" @click="closeBatch(t)">取消</button>
+                <button v-if="!t.batch.items?.length && t.batch.remaining?.length" class="btn-confirm" :disabled="t.batch.running" @click="nextBatch(t)">准备下一批（仍需确认）</button>
               </div>
               <p v-if="t.batch.error" class="err">{{ t.batch.error }}</p>
             </div>
@@ -821,8 +1002,8 @@ function warnClass(level) {
                 </li>
                 <li v-for="d in (t.batch.result.deleted || [])" :key="'d' + d.order_id">
                   已取消工单 #{{ d.order_id }}
-                  <span v-if="d.deleted_order">
-                    （{{ d.deleted_order.customer_id }} {{ d.deleted_order.customer_name }}）
+                  <span v-if="d.order">
+                    （{{ d.order.customer_id }} {{ d.order.customer_name }}，记录保留）
                   </span>
                 </li>
               </ul>
@@ -839,6 +1020,7 @@ function warnClass(level) {
                 <ul class="br-list"><li v-for="s in t.batch.result.skipped" :key="s">{{ s }}</li></ul>
               </template>
               <button class="btn-cancel" @click="closeBatch(t)">关闭</button>
+              <button v-if="t.batch.remaining?.length" class="btn-confirm" @click="nextBatch(t)">准备下一批 {{ Math.min(20, t.batch.remaining.length) }} 位（仍需确认）</button>
             </div>
           </div>
 
@@ -876,18 +1058,18 @@ function warnClass(level) {
 
 <style scoped>
 /* 浅色银行管理台风格 —— 与全站一致 */
-.agent-page { display: flex; flex-direction: column; height: calc(100vh - 120px); gap: 12px; }
+.agent-page { display: flex; flex-direction: column; height: calc(100dvh - 120px); gap: 12px; }
 .agent-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .agent-title { font-size: 20px; font-weight: 700; color: #17335c; margin: 0 0 4px; }
-.agent-sub { font-size: 12.5px; color: #7c8aa5; margin: 0; max-width: 720px; line-height: 1.6; }
+.agent-sub { font-size: 12.5px; color: #5b6b83; margin: 0; max-width: 720px; line-height: 1.6; }
 .agent-status { display: flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }
 .dot.ok { background: #10b981; box-shadow: 0 0 6px rgba(16,185,129,.6); }
 .dot.off { background: #ef4444; }
-.status-txt { color: #7c8aa5; }
+.status-txt { color: #5b6b83; }
 .status-txt.off { color: #b91c1c; }
 .btn-clear { font-size: 11.5px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
-             background: #fff; color: #7c8aa5; border: 1px solid #e5e9f0; margin-right: 4px; }
+             background: #fff; color: #5b6b83; border: 1px solid #e5e9f0; margin-right: 4px; }
 .btn-clear:hover { color: #b91c1c; border-color: #f5c2c2; }
 
 .restored-tip { font-size: 11.5px; color: #5b6b85; background: #f8fafc;
@@ -895,14 +1077,14 @@ function warnClass(level) {
                 padding: 7px 11px; line-height: 1.6; }
 
 .caps { background: #fff; border: 1px solid #e5e9f0; border-radius: 8px; padding: 10px 14px; }
-.caps summary { font-size: 12.5px; color: #7c8aa5; cursor: pointer; }
+.caps summary { font-size: 12.5px; color: #5b6b83; cursor: pointer; }
 /* 只剩一栏（能力范围不展示"答不了"），故不再用两列网格 */
 .caps-body { margin-top: 10px; }
 .caps-col h4 { font-size: 12px; color: #17335c; margin: 0 0 6px; }
 .caps-col ul { margin: 0; padding-left: 16px; }
 .caps-col li { font-size: 11.5px; color: #5b6b85; line-height: 1.7; }
 .caps-col code { color: #1d4ed8; font-size: 11px; }
-.caps-note { font-size: 11px; color: #8b9ab5; line-height: 1.6; margin: 6px 0 0; }
+.caps-note { font-size: 11px; color: #5b6b83; line-height: 1.6; margin: 6px 0 0; }
 .write-tag { font-size: 10px; color: #b45309; border: 1px solid #f0dfa8;
              background: #fdf6e3; border-radius: 8px; padding: 0 5px; margin-left: 4px; }
 
@@ -913,7 +1095,7 @@ function warnClass(level) {
 .empty { margin: auto; text-align: center; }
 .empty-icon { font-size: 34px; margin-bottom: 8px; }
 .empty-title { font-size: 15px; color: #17335c; margin: 0 0 4px; }
-.empty-hint { font-size: 12px; color: #8b9ab5; margin: 0 0 16px; }
+.empty-hint { font-size: 12px; color: #5b6b83; margin: 0 0 16px; }
 .samples { display: flex; flex-direction: column; gap: 7px; align-items: center; }
 .sample-chip { font-size: 12.5px; color: #1d4ed8; background: #eef3fb; border: 1px solid #c7d6ee;
                border-radius: 16px; padding: 7px 15px; cursor: pointer; transition: .15s; }
@@ -970,12 +1152,12 @@ function warnClass(level) {
 
 .e-body { display: flex; align-items: flex-end; gap: 20px; }
 .e-primary { flex-shrink: 0; }
-.e-primary-label { font-size: 10.5px; color: #8b9ab5; }
+.e-primary-label { font-size: 10.5px; color: #5b6b83; }
 .e-primary-value { font-size: 21px; font-weight: 700; color: #0f766e; line-height: 1.25; }
-.e-primary-sub { font-size: 10.5px; color: #8b9ab5; }
+.e-primary-sub { font-size: 10.5px; color: #5b6b83; }
 .e-secondary { display: flex; gap: 16px; padding-bottom: 3px; flex-wrap: wrap; }
 .e-sec-item { display: flex; flex-direction: column; }
-.e-sec-label { font-size: 10.5px; color: #8b9ab5; }
+.e-sec-label { font-size: 10.5px; color: #5b6b83; }
 .e-sec-value { font-size: 13px; font-weight: 600; color: #1f2937; }
 
 .e-foot { display: flex; align-items: center; gap: 10px; margin-top: 9px;
@@ -988,7 +1170,7 @@ function warnClass(level) {
 .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
          gap: 8px 16px; margin-bottom: 10px; }
 .fact { display: flex; flex-direction: column; padding: 6px 0; border-bottom: 1px solid #f1f5f9; }
-.f-label { font-size: 10.5px; color: #8b9ab5; }
+.f-label { font-size: 10.5px; color: #5b6b83; }
 .f-value { font-size: 14px; font-weight: 600; color: #1f2937; }
 .f-note { font-size: 10px; color: #a8b3c4; margin-top: 1px; }
 
@@ -1007,7 +1189,7 @@ function warnClass(level) {
 .btn-action.btn-danger { background: #dc2626; }
 .btn-action.btn-danger:hover { background: #b91c1c; }
 .btn-confirm.btn-danger-solid { background: #dc2626; }
-.action-note { font-size: 11px; color: #8b9ab5; }
+.action-note { font-size: 11px; color: #5b6b83; }
 .batch-st { font-size: 10.5px; color: #b45309; background: #fdf6e3;
             border-radius: 8px; padding: 0 6px; margin-left: 5px; }
 .batch-danger { font-size: 11.5px; color: #b91c1c; background: #fdecec;
@@ -1023,10 +1205,10 @@ function warnClass(level) {
                background: #7c3aed; color: #fff; border: none; font-weight: 600; }
 .btn-confirm:disabled { opacity: .6; cursor: default; }
 .btn-cancel { font-size: 12.5px; padding: 6px 14px; border-radius: 6px; cursor: pointer;
-              background: #fff; color: #7c8aa5; border: 1px solid #c7d6ee; }
+              background: #fff; color: #5b6b83; border: 1px solid #c7d6ee; }
 .done { font-size: 12.5px; color: #0f766e; }
 .err { font-size: 12px; color: #b91c1c; margin: 6px 0 0; }
-.muted { font-size: 12px; color: #8b9ab5; }
+.muted { font-size: 12px; color: #5b6b83; }
 
 /* ⑨ 批量确认面板 */
 .batch-panel { margin-top: 10px; padding: 12px 14px; border-radius: 9px;
@@ -1046,7 +1228,7 @@ function warnClass(level) {
   background: #f8fafc; font-family: inherit;
 }
 .batch-items li.is-blocked { background: #fdf6e3; }
-.bi-cid { font-family: ui-monospace, monospace; font-size: 11px; color: #8b9ab5; }
+.bi-cid { font-family: ui-monospace, monospace; font-size: 11px; color: #5b6b83; }
 .bi-name { font-size: 12.5px; font-weight: 600; color: #17335c; }
 .bi-tag { font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
           background: #eef3fb; color: #1d4ed8; }
@@ -1057,11 +1239,11 @@ function warnClass(level) {
 .batch-skip { font-size: 11.5px; color: #b45309; background: #fdf6e3;
               border-radius: 6px; padding: 5px 9px; margin: 0 0 9px; }
 .batch-assignee { margin-bottom: 10px; }
-.batch-assignee label { display: block; font-size: 11px; color: #8b9ab5; margin-bottom: 4px; }
+.batch-assignee label { display: block; font-size: 11px; color: #5b6b83; margin-bottom: 4px; }
 .batch-assignee input { width: 100%; max-width: 240px; font-size: 12.5px; padding: 6px 10px;
                         border: 1px solid #e5e9f0; border-radius: 6px; color: #1f2937; }
 /* 名单加载中/无权限的说明 —— 避免用户以为"系统不给选负责人" */
-.assignee-hint { font-size: 10.5px; color: #8b9ab5; margin: 4px 0 0; }
+.assignee-hint { font-size: 10.5px; color: #5b6b83; margin: 4px 0 0; }
 .batch-btns { display: flex; gap: 8px; align-items: center; }
 .batch-result .br-line { font-size: 12.5px; font-weight: 600; margin: 8px 0 4px; }
 .br-line.ok { color: #0f766e; }
@@ -1076,12 +1258,12 @@ function warnClass(level) {
 .ev-body { margin-top: 6px; border-left: 2px solid #e5e9f0; padding-left: 10px; }
 .ev-row { font-size: 11px; color: #5b6b85; line-height: 1.8; }
 .ev-row code { color: #1d4ed8; }
-.ev-args { color: #8b9ab5; margin-left: 6px; }
+.ev-args { color: #5b6b83; margin-left: 6px; }
 .ev-ok { margin-left: 8px; }
 .ev-ok.yes { color: #0f766e; }
 .ev-ok.no { color: #b91c1c; }
 
-.thinking { font-size: 12.5px; color: #7c8aa5; display: flex; align-items: center; gap: 8px; }
+.thinking { font-size: 12.5px; color: #5b6b83; display: flex; align-items: center; gap: 8px; }
 .spinner { width: 12px; height: 12px; border: 2px solid #e5e9f0; border-top-color: #1d4ed8;
            border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -1094,5 +1276,6 @@ function warnClass(level) {
 .composer textarea:disabled { opacity: .5; }
 .btn-send { padding: 0 22px; border-radius: 8px; border: none; background: #1d4ed8; color: #fff;
             font-size: 13px; font-weight: 600; cursor: pointer; }
-.btn-send:disabled { background: #e5e9f0; color: #8b9ab5; cursor: default; }
+.btn-send:disabled { background: #e5e9f0; color: #5b6b83; cursor: default; }
+@media(max-width:767px) { .page-head, .as-header, .chat-header { flex-wrap:wrap; gap:8px; } .bubble { max-width:100%; overflow-wrap:anywhere; } .composer { gap:6px; } .composer textarea { min-width:0; } .btn-send { padding:0 12px; } }
 </style>

@@ -324,21 +324,21 @@ function useDemo(row) {
   flex-shrink: 0;
 }
 .brand-title { font-size: 16px; font-weight: 700; color: #17335c; margin: 0; }
-.brand-sub { font-size: 12px; color: #8a97ad; margin: 3px 0 0; }
+.brand-sub { font-size: 12px; color: #5b6b83; margin: 3px 0 0; }
 
 /* 步骤指示 */
 .steps { display: flex; align-items: center; gap: 8px; margin-bottom: 22px; }
 .step { display: flex; align-items: center; gap: 6px; }
 .dot {
   width: 20px; height: 20px; border-radius: 50%;
-  background: #e5e9f0; color: #9aa7bd;
+  background: #e5e9f0; color: #475569;
   font-size: 11px; font-weight: 700;
   display: flex; align-items: center; justify-content: center;
 }
 .step.on .dot { background: #1d4ed8; color: #fff; }
-.txt { font-size: 12px; color: #9aa7bd; }
+.txt { font-size: 12px; color: #5b6b83; }
 .step.on .txt { color: #17335c; font-weight: 600; }
-.opt { font-style: normal; color: #b6c0d0; font-weight: 400; }
+.opt { font-style: normal; color: #5b6b83; font-weight: 400; }
 .step-line { flex: 1; height: 1px; background: #e5e9f0; }
 .step-line.on { background: #1d4ed8; }
 
@@ -398,7 +398,7 @@ function useDemo(row) {
   letter-spacing: 4px;
 }
 .td-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
-.td-left { font-size: 11px; color: #9aa7bd; }
+.td-left { font-size: 11px; color: #5b6b83; }
 .td-use {
   height: 26px; padding: 0 12px;
   border: 1px solid #f0c36d; border-radius: 7px;
@@ -408,7 +408,7 @@ function useDemo(row) {
 .td-use:hover { background: #fff7e6; }
 .td-detail { margin-top: 9px; }
 .td-detail summary {
-  font-size: 11.5px; color: #8a97ad; cursor: pointer; outline: none;
+  font-size: 11.5px; color: #5b6b83; cursor: pointer; outline: none;
 }
 .td-detail summary:hover { color: #1d4ed8; }
 .td-secret { margin: 7px 0 0; font-size: 11px; color: #5b6b83; line-height: 1.7; }
@@ -428,7 +428,7 @@ function useDemo(row) {
 .demo { margin-top: 18px; border-top: 1px solid #eef1f6; padding-top: 12px; }
 .demo-toggle {
   background: none; border: none; cursor: pointer;
-  color: #8a97ad; font-size: 12px; padding: 0;
+  color: #5b6b83; font-size: 12px; padding: 0;
 }
 .demo-toggle:hover { color: #1d4ed8; }
 .demo-list { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
@@ -440,8 +440,8 @@ function useDemo(row) {
 .demo-row:hover { background: #f4f7fd; }
 .du { font-family: ui-monospace, Menlo, monospace; color: #1d4ed8; width: 66px; }
 .dn { color: #17335c; flex: 1; }
-.dm { color: #9aa7bd; font-size: 11px; }
-.demo-hint { margin: 8px 0 0; font-size: 11px; color: #9aa7bd; }
+.dm { color: #5b6b83; font-size: 11px; }
+.demo-hint { margin: 8px 0 0; font-size: 11px; color: #5b6b83; }
 .demo-hint code {
   background: #f1f4f9; padding: 1px 5px; border-radius: 4px;
   font-family: ui-monospace, Menlo, monospace; color: #17335c;
@@ -449,6 +449,6 @@ function useDemo(row) {
 
 .foot {
   margin-top: 20px; text-align: center;
-  font-size: 11.5px; color: #9aa7bd; line-height: 1.7;
+  font-size: 11.5px; color: #5b6b83; line-height: 1.7;
 }
 </style>

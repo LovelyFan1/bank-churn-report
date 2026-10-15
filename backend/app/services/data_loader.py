@@ -198,10 +198,14 @@ def prepare_features(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str
     """从 DataFrame 提取特征矩阵 X、标签 y、特征名列表。"""
     y = df["exited"].values
 
-    X_numeric = df[NUMERIC_FEATURES].values
+    if not df['geography'].isin(GEOGRAPHY_MAP).all() or not df['gender'].isin(GENDER_MAP).all():
+        raise ValueError('客户特征编码包含未知地区或性别')
+    X_numeric = df[NUMERIC_FEATURES].to_numpy(dtype=float)
+    if not np.isfinite(X_numeric).all():
+        raise ValueError('客户特征存在缺失或非有限值')
 
-    X_geography = df["geography"].map(GEOGRAPHY_MAP).fillna(0).values.reshape(-1, 1)
-    X_gender = df["gender"].map(GENDER_MAP).fillna(0).values.reshape(-1, 1)
+    X_geography = df["geography"].map(GEOGRAPHY_MAP).values.reshape(-1, 1)
+    X_gender = df["gender"].map(GENDER_MAP).values.reshape(-1, 1)
 
     X = np.hstack([X_numeric, X_geography, X_gender])
 

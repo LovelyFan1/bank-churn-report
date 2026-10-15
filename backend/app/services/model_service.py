@@ -54,53 +54,26 @@ class ModelService:
     # 故拆成 _ensure_meta()（读元数据）与 _ensure_loaded()（读模型对象）。
 
     def _ensure_meta(self) -> bool:
-        """只加载 meta.json —— 评估指标 / ROC / 特征重要性 / 混淆矩阵都在里面。
-
-        只读 meta 比全加载快约 222 倍。此前 4 个接口因此各白慢 1.5 秒。
-
-        ⚠ 失败处理（本函数曾是"故障隐形"的元凶）：
-          旧实现是 `except Exception: return False` —— 把 json.load 的所有异常
-          吞掉，于是模型文件正在被重写、读到半截 JSON 时，接口**静默返回**
-          {"error": "模型尚未训练"} 且 HTTP 200。日志里连一条 500 都没有，
-          运维无从察觉，前端只表现为"页面只剩空框"。
-
-          现在：真实不存在（文件缺失）才直接返回 False；读取/解析失败属于
-          "可能是写入窗口或文件损坏"，做几次短重试并记录 warning。写入端已改为
-          原子替换（见 celery_tasks/train.py 的 _atomic_write_bytes），
-          正常情况下这里不会再失败；重试是为磁盘/网络挂载抖动的兜底。
-        """
-        if self._meta is not None:
+        from app.services.model_manifest import resolve
+        try:
+            manifest = resolve(MODEL_DIR)
+            previous = getattr(self, "_manifest", None)
+            if previous is None or previous.revision != manifest.revision:
+                self._models.clear()
+            self._manifest = manifest
+            self._meta = manifest.meta
             return True
-
-        meta_path = MODEL_DIR / "meta.json"
-        if not meta_path.exists():
-            # 真的没有模型 —— 这是合法的"尚未训练"，不算异常
+        except Exception as error:
+            self._meta = None
+            self._manifest = None
+            self._models.clear()
+            logger.warning("模型清单不可用：%s", error)
             return False
-
-        # 读取失败大概率是撞上了训练写入窗口，短暂退避重试
-        ATTEMPTS = 3
-        last_err: Optional[Exception] = None
-        for attempt in range(ATTEMPTS):
-            try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    self._meta = json.load(f)
-                return True
-            except (json.JSONDecodeError, ValueError, OSError) as e:
-                last_err = e
-                if attempt < ATTEMPTS - 1:
-                    time.sleep(0.15 * (attempt + 1))
-
-        logger.warning(
-            "读取 %s 失败（已重试 %d 次）: %s: %s —— "
-            "该次请求将退化为「模型未就绪」，请检查是否有训练任务正在写入",
-            meta_path, ATTEMPTS, type(last_err).__name__, last_err,
-        )
-        return False
 
     def get_best_model_name(self) -> Optional[str]:
         if not self._ensure_meta():
             return None
-        return max(self._meta["results"].keys(), key=lambda x: self._meta["results"][x]["auc"])
+        return risk_scoring.select_model(self._meta)
 
     def get_best_model(self):
         """取 AUC 最高的模型对象。
@@ -117,10 +90,12 @@ class ModelService:
         if not name:
             return None
         if name not in self._models:
-            path = MODEL_DIR / (name.lower().replace(" ", "_") + ".joblib")
-            if not path.exists():
+            try:
+                self._models[name] = joblib.load(self._manifest.path)
+            except Exception as error:
+                self._models.clear()
+                logger.warning("模型文件无法加载：%s", error)
                 return None
-            self._models[name] = joblib.load(path)
         return self._models.get(name)
 
     # ── 读取评估结果（从磁盘 meta.json）───────────────────
@@ -206,7 +181,10 @@ class ModelService:
 
         return {
             "models": comparison,
-            "best_model": comparison[0]["model_name"],
+            "best_model": self._manifest.best_model,
+            "model_version": self._manifest.revision,
+            "manifest_status": self._manifest.status,
+            "selection_basis": self._meta.get('selection_basis', 'legacy_cv_or_declared'),
             # 说明为什么最优那行的 recall 可能与 meta.json 不同源
             "note": (
                 "最优模型行取自**当前引擎口径**（决策阈值随 COST_RATIO 与"
@@ -222,8 +200,9 @@ class ModelService:
 
         curves = {}
         for name, result in self._meta["results"].items():
-            curves[name] = result.get("roc_curve", {})
-        return {"curves": curves}
+            from app.services.curve_sampling import simplify
+            curves[name] = simplify(result.get("roc_curve", {}))
+        return {"curves": curves, "model_version": self._manifest.revision, "metrics_unchanged": True}
 
     def get_feature_importance(self) -> Dict[str, Any]:
         if not self._ensure_meta():
@@ -236,6 +215,8 @@ class ModelService:
         return {
             "features": self._meta.get("feature_names", FEATURE_NAMES),
             "importance": importance_data,
+            "model_version": self._manifest.revision,
+            "best_model": self._manifest.best_model,
         }
 
     def get_confusion_matrices(self) -> Dict[str, Any]:
@@ -254,6 +235,8 @@ class ModelService:
         return {
             "features": self._meta.get("feature_names", FEATURE_NAMES),
             "shap_importance": self._meta.get("shap_global", {}),
+            "model_version": self._manifest.revision,
+            "best_model": self._manifest.best_model,
         }
 
     # ── 单条预测（轻量，API 直接调用）─────────────────────
@@ -264,25 +247,16 @@ class ModelService:
         if model is None:
             return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
 
-        features = np.array([[
-            customer_data.get("credit_score", 650),
-            customer_data.get("age", 39),
-            customer_data.get("tenure", 5),
-            customer_data.get("balance", 76000),
-            customer_data.get("num_products", 2),
-            customer_data.get("has_credit_card", 1),
-            customer_data.get("is_active_member", 1),
-            customer_data.get("estimated_salary", 100000),
-            customer_data.get("satisfaction_score", 3),
-            customer_data.get("points_earned", 500),
-            GEOGRAPHY_MAP.get(customer_data.get("geography", "France"), 0),
-            GENDER_MAP.get(customer_data.get("gender", "Male"), 0),
-        ]])
+        from app.schemas.prediction import feature_vector
+        features = feature_vector(customer_data)
 
-        raw_probability = float(model.predict_proba(features)[0][1])
+        from app.services.shap_contract import positive_class
+        raw_probability = float(model.predict_proba(features)[0][positive_class(model)])
         probability, risk_level = risk_scoring.classify_single(self.db, raw_probability)
 
         info = risk_scoring.get_risk_info()
+        if info.get("model_version") != self._manifest.revision:
+            raise ValueError("模型快照已切换，请重试")
         optimal_threshold = info.get("optimal_threshold") or 0.5
         prediction = 1 if probability >= optimal_threshold else 0
 
@@ -296,7 +270,9 @@ class ModelService:
             "probability": probability,
             "risk_level": risk_level,
             "risk_color": risk_color,
-            "model_used": self.get_best_model_name(),
+            "model_used": self._manifest.best_model,
+            "model_version": self._manifest.revision,
+            "manifest_status": self._manifest.status,
             "optimal_threshold": optimal_threshold,
         }
 
@@ -309,6 +285,9 @@ class ModelService:
         model = self.get_best_model()
         if model is None:
             return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
+        engine = risk_scoring._ensure_engine(self.db)
+        if engine is None or engine['model_version'] != self._manifest.revision:
+            return {'error': '模型和数据快照不匹配', 'basis': 'unavailable'}
 
         from app.services.data_loader import prepare_features, get_cached_customer_df
         from sklearn.model_selection import train_test_split
@@ -323,45 +302,29 @@ class ModelService:
             random_state=settings.RANDOM_STATE, stratify=y,
         )
 
-        features = np.array([[
-            customer_data.get("credit_score", 650),
-            customer_data.get("age", 39),
-            customer_data.get("tenure", 5),
-            customer_data.get("balance", 76000),
-            customer_data.get("num_products", 2),
-            customer_data.get("has_credit_card", 1),
-            customer_data.get("is_active_member", 1),
-            customer_data.get("estimated_salary", 100000),
-            customer_data.get("satisfaction_score", 3),
-            customer_data.get("points_earned", 500),
-            GEOGRAPHY_MAP.get(customer_data.get("geography", "France"), 0),
-            GENDER_MAP.get(customer_data.get("gender", "Male"), 0),
-        ]])
+        from app.schemas.prediction import feature_vector
+        features = feature_vector(customer_data)
 
         try:
-            if hasattr(model, "feature_importances_"):
-                explainer = shap.TreeExplainer(model)
-            else:
-                explainer = shap.KernelExplainer(
-                    model.predict_proba,
-                    shap.sample(X_train, min(100, len(X_train))),
-                )
-            shap_values = explainer.shap_values(features)
-
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]
+            from app.services.shap_contract import explain
+            explanation = explain(model, features, background=X_train)
+            shap_values = explanation["values"]
 
             shap_vals = shap_values[0]
             contribution = dict(zip(FEATURE_NAMES, [round(float(v), 6) for v in shap_vals]))
             sorted_contrib = sorted(contribution.items(), key=lambda x: abs(x[1]), reverse=True)
 
-            base_value = explainer.expected_value
-            if isinstance(base_value, list):
-                base_value = base_value[1]
+            base_value = explanation["base_value"]
 
             return {
-                "model_used": self.get_best_model_name(),
+                "model_used": self._manifest.best_model,
+            "model_version": self._manifest.revision,
+            "manifest_status": self._manifest.status,
                 "base_value": round(float(base_value), 4),
+                "basis": "model_shap",
+                "output_space": explanation["output_space"],
+                "positive_class": 1,
+                "additivity_checked": True,
                 "contributions": contribution,
                 "top_factors": [
                     {"feature": f, "impact": v, "direction": "positive" if v > 0 else "negative"}
@@ -369,7 +332,7 @@ class ModelService:
                 ],
             }
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": "模型解释未能通过支持性或贡献加和检查", "basis": "unavailable", "reason": type(e).__name__}
 
 
 def get_model_service(db: Session) -> ModelService:

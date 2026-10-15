@@ -156,19 +156,26 @@ def build_reason(
 
     # ── 追加口径尾注 ────────────────────────────────────────
     # ⚠ 这一步不是"客套"。理由里出现了具体金额，就必须说明它是**推算**的，
-    #   因为：s=0.30 是行业假设值（本系统无任何真实挽留结果数据），
+    #   因为：s=0.30 是演示假设值（本系统无任何真实挽留结果数据），
     #   AVG_CUSTOMER_VALUE=50,000 是假设值，且与真实流失客户平均余额
     #   （实测 ¥90,960）偏差 81.9% —— 见 diag91。不标注等于默认它可信。
     note += (
-        f"〔口径：概率/等级/因素来自模型实时打分；"
-        f"金额按假设客单价 {_yuan(settings.AVG_CUSTOMER_VALUE)}、"
-        f"假设挽留成功率 {s:.0%} 推算，非实际业务结果〕"
+        f"〔口径：概率为模型评分，等级按相对排名，因素为业务规则提示；"
+        f"个体情景金额=概率×该客户余额 {_yuan(balance or 0)}×假设成功率 {s:.0%}；"
+        f"单次成本={_yuan(settings.AVG_CUSTOMER_VALUE)}假设客单价÷成本比。"
+        f"余额作价值代理，金额未经增量效果验证，不代表实际利润或收入〕"
     )
 
     return {
         "note": note,
         "worthiness": w,
         "basis": "deterministic_template",
+        "metric_basis": {
+            "expected_value": "risk_asset_score(probability*customer_balance)",
+            "expected_recoverable": "individual_scenario(expected_value*assumed_success_rate)",
+            "net": "individual_scenario_less_assumed_intervention_cost",
+            "value_source": "this_customer_balance", "is_actual_outcome": False,
+        },
         "components": {
             "probability": round(float(prob or 0), 4),
             "balance": round(float(balance or 0), 2),

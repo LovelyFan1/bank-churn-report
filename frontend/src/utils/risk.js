@@ -12,7 +12,7 @@ export const RISK_LEVELS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
 
 const LABELS = { CRITICAL: '极高', HIGH: '高危', MEDIUM: '中等', LOW: '低风险' }
 // 浅色底适配：语义色（红/橙/黄/绿）保留，加深一档保证对比度
-const COLORS = { CRITICAL: '#c81e1e', HIGH: '#b45309', MEDIUM: '#a16207', LOW: '#0f766e' }
+const COLORS = { CRITICAL: '#c81e1e', HIGH: '#b45309', MEDIUM: '#854d0e', LOW: '#0f766e' }
 
 /** 模型未训练时的回退阈值 —— 与后端 risk_scoring._legacy_level 保持一致 */
 export const LEGACY_THRESHOLDS = { critical: 0.7, high: 0.3, medium: 0.1 }

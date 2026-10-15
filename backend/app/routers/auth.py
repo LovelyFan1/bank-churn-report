@@ -7,7 +7,7 @@
     POST /login/totp 第二步：临时票据 + 动态口令
                      → 返回正式令牌
     GET  /me         当前身份 + 权限清单（前端据此控制按钮可见性）
-    POST /logout     登出（写审计；JWT 无状态故服务端不销毁令牌）
+    POST /logout     登出（共享撤销记录 + 审计）
     POST /change-password  改口令
 
 **为什么登录分两步、中间用"临时票据"而不是两次都传口令**
@@ -90,29 +90,30 @@ def _user_public(u: User) -> dict:
 
 
 def _issue(u: User, request: Request, db: Session,
-           message: str = "登录成功") -> dict:
+           message: str = "登录成功", auth_method: str = "password") -> dict:
     """签发正式令牌并写登录审计。
 
     ⚠ 必须传 db —— 早先版本传 db=None，导致 write_audit 内部
       `db.add()` 抛 AttributeError 被 except 吞掉，**审计静默丢失**
       却不报错。登录审计是 4A 的硬要求，不能在"看起来成功了"的情况下丢。
     """
-    token = auth.make_token({"sub": u.username, "role": u.role,
-                             "scope": "full", "name": u.display_name or ""})
+    token = auth.make_session_token(db, u)
     u.last_login_at = auth.now()
     u.last_login_ip = deps._client_ip(request)
     u.failed_attempts = 0
     u.locked_until = None
     deps.write_audit(db, user=u, action="login", source="ui",
-                     success=True, message=message,
+                     success=True, message=message, auth_method=auth_method,
                      ip=deps._client_ip(request))
     return {"token": token, "user": _user_public(u),
             "expires_in": settings.AUTH_TOKEN_TTL_MINUTES * 60,
-            "idle_timeout": settings.AUTH_IDLE_MINUTES * 60}
+            "idle_timeout": settings.AUTH_IDLE_MINUTES * 60,
+            "idle_remaining": min(settings.AUTH_IDLE_MINUTES, settings.AUTH_TOKEN_TTL_MINUTES) * 60}
 
 
 @router.get("/me")
-async def me(user: User = Depends(deps.current_user)):
+async def me(request: Request, user: User = Depends(deps.current_user),
+             db: Session = Depends(get_db)):
     """当前登录人 + 权限清单。
 
     ⚠ 前端**必须**用这个接口驱动按钮可见性，而不是自己写一份角色判断 ——
@@ -121,9 +122,23 @@ async def me(user: User = Depends(deps.current_user)):
     return {
         "user": _user_public(user),
         "auth_enabled": settings.AUTH_ENABLED,
-        "idle_timeout": settings.AUTH_IDLE_MINUTES * 60,
+        **auth.session_policy(db, getattr(request.state, "auth_payload", None)),
         "token_ttl": settings.AUTH_TOKEN_TTL_MINUTES * 60,
     }
+
+
+@router.post("/activity")
+async def activity(request: Request, user: User = Depends(deps.current_user),
+                   db: Session = Depends(get_db)):
+    """实际用户操作的限频上报入口；自动读取/轮询不走此接口。"""
+    if not settings.AUTH_ENABLED:
+        return auth.session_policy(db)
+    payload = getattr(request.state, "auth_payload", None)
+    if payload is None:
+        raise HTTPException(401, "会话不存在，请重新登录")
+    result = auth.record_activity(db, payload)
+    db.commit()
+    return result
 
 
 @router.get("/policy")
@@ -182,6 +197,8 @@ async def demo_totp(body: DemoTotpRequest, request: Request,
     u = db.query(User).filter(User.username == payload.get("sub")).first()
     if u is None or not u.is_active:
         raise HTTPException(status_code=401, detail="用户不可用")
+    if payload.get("auth_version") != (u.auth_version or 0):
+        raise HTTPException(401, "口令已修改，请重新登录")
     if not (u.totp_enabled and u.totp_secret):
         raise HTTPException(status_code=404, detail="该账号未绑定动态口令")
 
@@ -216,7 +233,7 @@ async def login(body: LoginRequest, request: Request,
     #   否则攻击者在锁定期间仍能迫使服务器做 12 万次哈希 —— 变成放大器。
     if u is not None and u.locked_until and u.locked_until > auth.now():
         left = int((u.locked_until - auth.now()).total_seconds())
-        deps.write_audit(db, user=None, action="login", target=username,
+        deps.write_audit(db, user=None, action="login", auth_method="password", target=username,
                          success=False, message=f"账号锁定中，剩余 {left}s",
                          ip=ip, commit=True)
         raise HTTPException(
@@ -234,7 +251,7 @@ async def login(body: LoginRequest, request: Request,
             if lock:
                 u.locked_until = auth.now() + timedelta(seconds=lock)
             db.commit()
-        deps.write_audit(db, user=None, action="login", target=username,
+        deps.write_audit(db, user=None, action="login", auth_method="password", target=username,
                          success=False,
                          message="用户不存在" if u is None else "口令错误",
                          ip=ip, commit=True)
@@ -251,7 +268,7 @@ async def login(body: LoginRequest, request: Request,
         raise HTTPException(status_code=401, detail=_BAD_CRED)
 
     if not u.is_active:
-        deps.write_audit(db, user=None, action="login", target=username,
+        deps.write_audit(db, user=None, action="login", auth_method="password", target=username,
                          success=False, message="账号已停用", ip=ip, commit=True)
         raise HTTPException(status_code=403, detail="账号已停用，请联系管理员")
 
@@ -261,7 +278,8 @@ async def login(body: LoginRequest, request: Request,
     # 这一点在 /me 里如实反映 totp_enabled=false。
     if settings.AUTH_REQUIRE_TOTP and u.totp_enabled:
         ticket = auth.make_token(
-            {"sub": u.username, "scope": "pre_totp", "role": u.role},
+            {"sub": u.username, "scope": "pre_totp", "role": u.role,
+             "auth_version": u.auth_version or 0},
             ttl_minutes=_PRE_TOTP_TTL)
         return {"need_totp": True, "ticket": ticket,
                 "expires_in": _PRE_TOTP_TTL * 60}
@@ -293,6 +311,11 @@ async def login_totp(body: TotpRequest, request: Request,
     u = db.query(User).filter(User.username == payload.get("sub")).first()
     if u is None or not u.is_active:
         raise HTTPException(status_code=401, detail="用户不可用")
+    if payload.get("auth_version") != (u.auth_version or 0):
+        raise HTTPException(401, "口令已修改，请重新登录")
+
+    if u.locked_until and u.locked_until > auth.now():
+        raise HTTPException(423, "账号已锁定，请稍后重新登录")
 
     if not auth.totp_verify(u.totp_secret or "", body.code):
         u.failed_attempts = (u.failed_attempts or 0) + 1
@@ -300,11 +323,11 @@ async def login_totp(body: TotpRequest, request: Request,
         if lock:
             u.locked_until = auth.now() + timedelta(seconds=lock)
         db.commit()
-        deps.write_audit(db, user=None, action="login_totp", target=u.username,
+        deps.write_audit(db, user=None, action="login", auth_method="totp", target=u.username,
                          success=False, message="动态口令错误", ip=ip, commit=True)
         raise HTTPException(status_code=401, detail="动态口令不正确或已过期")
 
-    out = _issue(u, request, db, message="登录成功（双因素）")
+    out = _issue(u, request, db, message="登录成功（双因素）", auth_method="totp")
     db.commit()
     return out
 
@@ -313,15 +336,21 @@ async def login_totp(body: TotpRequest, request: Request,
 async def logout(request: Request,
                  user: User = Depends(deps.current_user),
                  db: Session = Depends(get_db)):
-    """登出。
-
-    ⚠ 必须如实说明：JWT 是无状态的，服务端**无法**让已签发的令牌失效。
-      此接口只写审计、前端丢弃令牌。真银行靠集中会话管理解决。
-    """
+    """在共享数据库撤销当前 JWT，同时提交登出审计。"""
+    import time
+    from app.models.user import RevokedToken
+    authorization = request.headers.get("authorization") or ""
+    if authorization.lower().startswith("bearer "):
+        payload = auth.decode_token(authorization.split(" ", 1)[1].strip())
+        jti = payload.get("jti")
+        if jti:
+            db.query(RevokedToken).filter(RevokedToken.expires_at <= time.time()).delete()
+            db.merge(RevokedToken(jti=jti, expires_at=payload["exp"]))
     deps.write_audit(db, user=user, action="logout", source="ui",
-                     message="用户登出", ip=deps._client_ip(request), commit=True)
-    return {"ok": True,
-            "note": "服务端已记录登出；令牌为无状态 JWT，请前端一并丢弃"}
+                     message="用户登出，令牌已撤销", ip=deps._client_ip(request))
+    db.commit()
+    return {"ok": True, "note": "令牌已撤销，请前端清除登录状态"}
+
 
 
 @router.post("/change-password")
@@ -353,12 +382,17 @@ async def change_password(body: ChangePasswordRequest, request: Request,
     if auth.verify_password(body.new_password, u.password_hash):
         raise HTTPException(status_code=422, detail="新口令不能与原口令相同")
 
-    u.password_hash = auth.hash_password(body.new_password)
-    u.must_change_password = 0
+    count = db.query(User).filter(User.id == u.id, User.is_active == 1,
+                                 User.auth_version == u.auth_version).update({
+        "password_hash": auth.hash_password(body.new_password),
+        "must_change_password": 0, "auth_version": User.auth_version + 1,
+    }, synchronize_session="fetch")
+    if count != 1:
+        raise HTTPException(401, "认证状态已变化，请重新登录")
     deps.write_audit(db, user=u, action="change_password", success=True,
                      message="口令已修改", ip=deps._client_ip(request))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "reauth_required": True}
 
 
 def _check_password_strength(pw: str) -> str | None:
@@ -384,6 +418,7 @@ def _check_password_strength(pw: str) -> str | None:
 @router.get("/audit")
 async def audit_list(limit: int = 50, action: str | None = None,
                      username: str | None = None,
+                     auth_method: str | None = None, success: bool | None = None,
                      user: User = Depends(
                          deps.require_perm(auth.PERM_AUDIT_VIEW)),
                      db: Session = Depends(get_db)):
@@ -395,12 +430,19 @@ async def audit_list(limit: int = 50, action: str | None = None,
     limit = max(1, min(int(limit or 50), 200))
     q = db.query(AuditLog)
     if action:
-        q = q.filter(AuditLog.action == action)
+        q = q.filter(AuditLog.action.in_(["login", "login_totp"]) if action == "login" else AuditLog.action == action)
     if username:
         q = q.filter(AuditLog.username == username)
+    from sqlalchemy import or_, and_
+    if auth_method:
+        q = q.filter(or_(AuditLog.auth_method == auth_method,
+            and_(AuditLog.auth_method.is_(None), AuditLog.action == 'login_totp'))) if auth_method == 'totp' else q.filter(AuditLog.auth_method == auth_method)
+    if success is not None:
+        q = q.filter(AuditLog.success == int(success))
+    total = q.count()
     rows = q.order_by(AuditLog.id.desc()).limit(limit).all()
     return {
-        "total": db.query(AuditLog).count(),
+        "total": total,
         "items": [{
             "id": r.id,
             "username": r.username,
@@ -408,6 +450,7 @@ async def audit_list(limit: int = 50, action: str | None = None,
             "role": r.role,
             "role_label": auth.ROLE_LABELS.get(r.role, r.role),
             "action": r.action,
+            "auth_method": r.auth_method or ("totp" if r.action == "login_totp" else "historical_unknown" if r.action == "login" else None),
             "target": r.target,
             "detail": r.detail,
             "source": r.source,

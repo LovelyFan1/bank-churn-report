@@ -13,12 +13,13 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.services import auth_deps, auth_service as auth
 from app.services.cost_benefit_service import get_cost_benefit_service
 
 router = APIRouter(prefix="/api/portfolio", tags=["Portfolio"])
 
 
-@router.get("/matrix")
+@router.get("/matrix", dependencies=[Depends(auth_deps.require_perm(auth.PERM_INSIGHT_VIEW))])
 async def get_segment_matrix(db: Session = Depends(get_db)):
     """价值层 × 风险等级 矩阵。
 

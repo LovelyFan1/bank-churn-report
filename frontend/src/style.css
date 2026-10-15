@@ -252,3 +252,32 @@ thead th,
   background-color: #f8fafc;
   background-clip: padding-box;
 }
+
+/* Shared readable colors and reflow; wide data tables scroll within their page. */
+:root { --text-primary:#17335c; --text-secondary:#5b6b83; --success:#065f46; --border:#d5dce8; }
+main, main > div, .glass-card, .metric-card { min-width:0; }
+input, select, textarea { max-width:100%; min-width:0; box-sizing:border-box; }
+.page-subtitle, .text-gray-400, .text-gray-500, .text-gray-300 { color:var(--text-secondary); }
+.text-indigo-300, .text-indigo-400, .text-purple-400 { color:#6d28d9; }
+.text-green-400, .text-emerald-400 { color:var(--success); }
+button:focus-visible, a:focus-visible { outline:3px solid #1d4ed8; outline-offset:3px; }
+.table-scroll { overflow-x:auto; max-width:100%; }
+.table-scroll thead th { top:0; }
+@media(max-width:767px) {
+  .page-head, .page-header, .filters { flex-wrap:wrap; gap:12px; }
+  .search-input { min-width:0; width:100%; }
+  .form-grid { grid-template-columns:minmax(0,1fr) !important; }
+  .modal-header h2 { overflow-wrap:anywhere; }
+  .table-scroll::before { content:'表格可横向滑动'; display:block; color:var(--text-secondary); padding:8px; font-size:12px; }
+}
+@media(prefers-reduced-motion:reduce) { *, *::before, *::after { animation-duration:0.01ms !important; transition-duration:0.01ms !important; } }
+
+.text-orange-400, .text-orange-500, .text-amber-400, .text-amber-500 { color:#9a3412; }
+.text-red-400, .text-red-500 { color:#b91c1c; }
+.text-yellow-400, .text-yellow-500 { color:#854d0e; }
+.text-blue-400 { color:#1d4ed8; }
+
+@media(max-width:767px) { main .flex.items-center.justify-between { flex-wrap:wrap; gap:12px; } }
+
+.filters, .page-head, .page-header { flex-wrap:wrap; }
+.tabs { min-width:0; max-width:100%; flex-wrap:wrap; }

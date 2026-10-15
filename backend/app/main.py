@@ -1,5 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
+from fastapi.exceptions import RequestValidationError
+from app.validation import validation_error_handler
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import sys
@@ -7,6 +10,7 @@ import threading
 
 from app.config import settings
 from app.database import engine, Base, get_db
+from app.migrate import run_migrations
 from app.models.customer import Customer
 from app.models.user import User
 from app.models.work_order import WorkOrder
@@ -25,6 +29,7 @@ app = FastAPI(
     version=settings.VERSION,
     debug=settings.DEBUG,
 )
+app.add_exception_handler(RequestValidationError, validation_error_handler)
 
 # ── 中间件注册顺序（实测查证 Starlette 源码后确定）────────
 #
@@ -37,6 +42,7 @@ app = FastAPI(
 # 浏览器于是拦掉响应，前端只看到笼统的 "Network Error" 而不是 401。
 # 那种现象极易被误判成"后端挂了"，排查成本很高。
 from app.middleware.auth import AuthMiddleware  # noqa: E402
+app.add_middleware(GZipMiddleware, minimum_size=2000)
 app.add_middleware(AuthMiddleware)              # 内层：先鉴权
 
 app.add_middleware(                              # 外层：后执行，负责跨域
@@ -78,6 +84,7 @@ async def startup_event():
     以为在用标定数据，实际在用合成数据。
     """
     Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
 
     db = next(get_db())
     try:
@@ -212,8 +219,10 @@ async def get_dashboard_summary(user: User = Depends(auth_deps.current_user)):
         else:
             for s in scored:
                 risk_dist[s["risk_level"]] += 1
+            from app.services.customer_service import _filtered_customers
+            candidates, _ = _filtered_customers(db, exited=0, has_order=False)
             top_customers = sorted(
-                scored, key=lambda x: x["expected_value"], reverse=True
+                candidates, key=lambda x: x["expected_value"], reverse=True
             )[:10]
 
         # 3) 成本收益（推算值）

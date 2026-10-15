@@ -11,6 +11,8 @@
 
 import json
 import logging
+import threading
+import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -30,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 CLUSTER_DIR = Path(__file__).parent.parent.parent / "saved_models"
 
+
+_scatter_lock = threading.Lock()
+_scatter_cache = {'key': None, 'time': 0, 'payload': None}
 
 class ClusteringService:
     """聚类读取 + 画像服务 — 无全局状态，线程安全。"""
@@ -350,6 +355,18 @@ class ClusteringService:
     MAX_SCATTER_POINTS = 15000
 
     def get_3d_scatter_data(self) -> Dict[str, Any]:
+        from app.services.data_loader import _read_cache_version
+        artifacts = tuple((p.name, p.stat().st_mtime_ns) for p in CLUSTER_DIR.glob('cluster_*') if p.is_file())
+        key = (str(self.db.get_bind().url), _read_cache_version(), artifacts)
+        with _scatter_lock:
+            if _scatter_cache['key'] == key and time.monotonic()-_scatter_cache['time'] < 300:
+                return _scatter_cache['payload']
+            result = self._compute_scatter_data()
+            if not result.get('error'):
+                _scatter_cache.update(key=key,time=time.monotonic(),payload=result)
+            return result
+
+    def _compute_scatter_data(self) -> Dict[str, Any]:
         """获取降维散点数据（用于前端可视化）。
 
         ⚠ 默认使用 **t-SNE** 二维嵌入，而非 PCA。原因（实测，勿回退）：
@@ -476,6 +493,8 @@ class ClusteringService:
     def _scatter_payload(self, plotted, *, method, explained_variance,
                          axis_range, total_points, sampled) -> Dict[str, Any]:
         """把带坐标的 DataFrame 组装成前端契约。tsne / pca 两条路径共用。"""
+        from app.services.sampling import bounded_sample
+        plotted = bounded_sample(plotted, self.MAX_SCATTER_POINTS)
         scatter_data = []
         for cluster_id in sorted(plotted["cluster_id"].unique()):
             cluster_df = plotted[plotted["cluster_id"] == cluster_id]

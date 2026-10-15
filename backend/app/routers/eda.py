@@ -3,8 +3,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.services.eda_service import get_eda_service
+from app.services import auth_deps, auth_service as auth
 
-router = APIRouter(prefix="/api/eda", tags=["EDA"])
+router = APIRouter(prefix="/api/eda", tags=["EDA"],
+                   dependencies=[Depends(auth_deps.require_perm(auth.PERM_INSIGHT_VIEW))])
 
 
 @router.get("/comprehensive")

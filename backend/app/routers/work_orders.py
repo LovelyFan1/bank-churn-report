@@ -12,7 +12,7 @@ from app.models.work_order import WorkOrder
 from app.services import auth_deps
 from app.services import auth_service as auth
 from app.services import privacy
-from app.services import risk_scoring
+from app.services import risk_scoring, assignee_identity
 from app.schemas.work_order import (
     WorkOrderCreate,
     WorkOrderUpdate,
@@ -38,21 +38,7 @@ def _is_manager_level(user: User) -> bool:
     return auth.has_perm(user.role or "", auth.PERM_ORDER_WRITE)
 
 
-def _own_identifiers(user: User) -> set[str]:
-    """本人在工单里可能出现的 assignee 取值。
-
-    ⚠ 必须同时匹配**工号与姓名**：改造前建的历史工单里存的是姓名
-      （如"王晓芸"），改造后存工号（如"wangxiaoyun"）。只认一种的话，
-      专员登录后会看不到自己名下的历史工单 —— 表现为"我的工单是空的"。
-    """
-    s = {user.username or ""}
-    if user.display_name:
-        s.add(user.display_name)
-    s.discard("")
-    return s
-
-
-def _assert_can_touch(user: User, order: WorkOrder) -> None:
+def _assert_can_touch(user: User, order: WorkOrder, db: Session) -> None:
     """数据级授权：能否操作这张工单。
 
     经理及以上：任意工单。
@@ -66,8 +52,7 @@ def _assert_can_touch(user: User, order: WorkOrder) -> None:
             status_code=403,
             detail=f"当前角色（{auth.ROLE_LABELS.get(user.role, user.role)}）无权操作工单",
         )
-    mine = _own_identifiers(user)
-    if (order.assignee or "") not in mine:
+    if not assignee_identity.matches(order, user, db):
         raise HTTPException(
             status_code=403,
             detail="该工单未指派给你，无法操作（仅可处理指派给自己的工单）",
@@ -83,30 +68,16 @@ def _visible_orders_query(db: Session, user: User):
     if _is_manager_level(user):
         return q
     if auth.has_perm(user.role or "", auth.PERM_ORDER_ASSIGNED):
-        return q.filter(WorkOrder.assignee.in_(list(_own_identifiers(user))))
+        return q.filter(assignee_identity.predicate(db, user.username))
     return q
 
 
-def _valid_assignee_values(db: Session) -> set[str]:
-    """可被指派的有效取值集合：所有启用账号的**工号 + 姓名**。
-
-    ⚠ 为什么同时收姓名：历史工单里存的是姓名（如"王晓芸"）。
-      PUT 一张老工单时会带上原 assignee，若只认工号就会被自己的校验拒掉。
-      这是向后兼容，不是"允许乱填" —— 只有真实存在的账号姓名才在集合里。
-    """
-    vals: set[str] = set()
-    for username, display_name in db.query(User.username, User.display_name) \
-            .filter(User.is_active == 1).all():
-        if username:
-            vals.add(username)
-        if display_name:
-            vals.add(display_name)
-    return vals
-
-
 def _is_valid_assignee(db: Session, value: str) -> bool:
-    """负责人取值是否有效（是某个启用账号的工号或姓名）。"""
-    return value in _valid_assignee_values(db)
+    try:
+        assignee_identity.resolve(db, value)
+        return True
+    except HTTPException:
+        return False
 
 
 # ── 辅助函数 ───────────────────────────────────────────
@@ -125,10 +96,23 @@ def _order_to_response(order: WorkOrder) -> dict:
         "strategy": order.strategy,
         "status": order.status,
         "result": order.result,
+        "result_source": order.result_source,
+        "result_recorded_by": order.result_recorded_by,
+        "verification_state": order.verification_state,
+        "verified_by": order.verified_by,
+        "verified_at": order.verified_at,
+        "observation_start": order.observation_start,
+        "observation_end": order.observation_end,
+        "result_evidence": order.result_evidence,
+        "actual_cost": order.actual_cost,
+        "actual_benefit": order.actual_benefit,
+
         # 建单人（行员号）+ 负责人（行员号）。前端用 /api/users/assignable
         # 的映射把工号显示成姓名；解析不到则原样显示（历史数据）。
         "created_by": order.created_by,
         "assignee": order.assignee,
+        "assignee_username": order.assignee_username,
+        "assignee_name_snapshot": order.assignee_name_snapshot,
         "note": order.note,
         # 分级依据快照（可能为空 —— 快照功能上线前建的工单没有）
         "thresholds_snapshot": _parse_json(order.thresholds_snapshot, None),
@@ -179,16 +163,20 @@ async def get_stats(user: User = Depends(auth_deps.current_user),
     stats = {row[0]: row[1] for row in rows}
     # 负责人清单 —— 供工单页的「按人筛选」下拉。只列实际指派过的（去重、去空）。
     assignees = [
-        r[0] for r in visible.with_entities(WorkOrder.assignee)
+        r[0] for r in visible.with_entities(func.coalesce(WorkOrder.assignee_username, WorkOrder.assignee))
         .filter(WorkOrder.assignee.isnot(None), WorkOrder.assignee != "")
         .distinct().all()
     ]
+    mapped = {entry['original']: entry['username'] for entry in assignee_identity.preview(db)
+              if entry['status'] == 'unique'}
+    assignees = list(dict.fromkeys(mapped.get(value, value) for value in assignees))
     return {
         "total": sum(stats.values()),
         "pending": stats.get("pending", 0),
         "in_progress": stats.get("in_progress", 0),
         "completed": stats.get("completed", 0),
         "lost": stats.get("lost", 0),
+        "cancelled": stats.get("cancelled", 0),
         "assignees": sorted(assignees),
         # 便于前端说明"为什么只看到这些"（专员视角）
         "scoped_to_me": not _is_manager_level(user)
@@ -197,6 +185,13 @@ async def get_stats(user: User = Depends(auth_deps.current_user),
 
 
 # ── 列表查询 ───────────────────────────────────────────
+@router.get('/assignee-migration-preview')
+def assignee_migration_preview(user: User = Depends(auth_deps.require_perm(auth.PERM_AUDIT_VIEW)),
+                               db: Session = Depends(get_db)):
+    plan = assignee_identity.preview(db)
+    return {'dry_run': True, 'entries': plan, 'counts': {
+        status: sum(entry['count'] for entry in plan if entry['status'] == status)
+        for status in ('unique', 'ambiguous', 'unmatched')}}
 
 @router.get("")
 async def list_work_orders(
@@ -204,6 +199,7 @@ async def list_work_orders(
     risk_level: str | None = Query(default=None, description="按风险等级筛选"),
     assignee: str | None = Query(default=None, description="按负责人筛选"),
     search: str | None = Query(default=None, description="搜索客户姓名 / 编号"),
+    customer_id: str | None = Query(default=None, pattern=r"^C\d{4,}$", description="精确客户编号"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     user: User = Depends(auth_deps.current_user),
@@ -224,12 +220,16 @@ async def list_work_orders(
     """
     q = _visible_orders_query(db, user)
 
+    if customer_id:
+        q = q.filter(WorkOrder.customer_id == customer_id)
     if status:
+        if status not in {"pending", "in_progress", "completed", "lost", "cancelled"}:
+            raise HTTPException(status_code=422, detail="无效工单状态")
         q = q.filter(WorkOrder.status == status)
     if risk_level:
         q = q.filter(WorkOrder.risk_level == risk_level.upper())
     if assignee:
-        q = q.filter(WorkOrder.assignee.ilike(f"%{assignee}%"))
+        q = q.filter(assignee_identity.predicate(db, assignee))
     if search:
         # ⚠ 搜索同样受可见范围约束（q 已过滤），不会因搜索越权看到别人的单。
         q = q.filter(
@@ -309,20 +309,18 @@ async def create_work_order(body: WorkOrderCreate,
       中间件只保证"必须登录"，不区分"能读"与"能写"。
     """
     # 互斥检查：同一客户已有进行中的工单则拒绝
-    existing = (
-        db.query(WorkOrder)
-        .filter(
-            WorkOrder.customer_id == body.customer_id,
-            WorkOrder.status.in_(["pending", "in_progress"]),
-        )
-        .first()
-    )
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"客户 {body.customer_name} 已有进行中的工单（#{existing.id}），请先处理完毕再创建新工单",
-        )
-
+    from app.services.customer_service import get_retention_customer
+    detail = get_retention_customer(db, body.customer_id)
+    info = risk_scoring.get_risk_info()
+    body = body.model_copy(update={
+        "customer_name": detail["surname"], "geography": detail["geography"],
+        "risk_level": detail["risk_level"], "probability": detail["probability"],
+        "balance": detail["balance"], "risk_factors": detail.get("risk_factors", []),
+        "strategy": detail.get("action") or detail.get("strategy") or "",
+        "model_used": info.get("model"), "thresholds_snapshot": info.get("thresholds"),
+        "value_tier_snapshot": detail["value_tier"],
+        "expected_value_snapshot": detail["expected_value"],
+    })
     now = datetime.now(timezone.utc)
 
     # ── 负责人校验 ──────────────────────────────────────
@@ -345,6 +343,8 @@ async def create_work_order(body: WorkOrderCreate,
             status_code=422,
             detail=f"负责人「{assignee}」不是有效行员（请从列表中选择）",
         )
+    owner = assignee_identity.resolve(db, assignee)
+    assignee = owner.username
 
     # 分级依据快照 —— 前端未传时由后端补齐。
     # 必须用「当前引擎」的阈值，因为它就是判定 body.risk_level 的那套口径
@@ -402,6 +402,8 @@ async def create_work_order(body: WorkOrderCreate,
         #   客户端声称的"操作者"可伪造，与审计同一原则。
         created_by=user.username,
         assignee=assignee,
+        assignee_username=owner.username,
+        assignee_name_snapshot=owner.display_name,
         note=body.note,
         thresholds_snapshot=json.dumps(thresholds, ensure_ascii=False) if thresholds else None,
         model_used=model_used,
@@ -414,7 +416,14 @@ async def create_work_order(body: WorkOrderCreate,
         updated_at=now,
     )
     db.add(order)
-    db.flush()                    # 拿到自增 id 供审计引用
+    from sqlalchemy.exc import IntegrityError
+    try:
+        db.flush()
+    except IntegrityError as e:
+        db.rollback()
+        if "work_orders.customer_id" in str(e.orig) or "uq_active_customer_work_order" in str(e.orig):
+            raise HTTPException(409, "该客户已有在途工单，请刷新后重试")
+        raise
     # 审计：页面直接建单此前**没有**留痕（只有 Agent 路径写了）。
     # 引入派单后"谁把哪个客户派给了谁"是必须可查的，故一并补上。
     auth_deps.write_audit(
@@ -425,7 +434,10 @@ async def create_work_order(body: WorkOrderCreate,
         source="ui", ip=auth_deps._client_ip(request),
         message=f"为客户 {body.customer_id} 创建挽留工单，负责人 {assignee}",
     )
-    db.commit()
+    if db.info.get("agent_transaction"):
+        db.flush()
+    else:
+        db.commit()
     db.refresh(order)
     return _order_to_response(order)
 
@@ -537,8 +549,10 @@ async def create_work_orders_batch(body: WorkOrderBatchCreate,
                 "assignee": created.get("assignee"),
             })
         except HTTPException as e:
+            db.rollback()
             failed.append({"customer_id": cid, "reason": str(e.detail)})
         except Exception as e:
+            db.rollback()
             failed.append({"customer_id": cid,
                            "reason": f"{type(e).__name__}: {e}"})
 
@@ -584,7 +598,7 @@ async def get_work_order(order_id: int,
     # ⚠ 返回 404 而不是 403：403 等于确认"这张单存在但你不能看"，
     #   会把别人的工单 id 变成可探测的信息。列表已过滤，这里保持一致。
     if not _is_manager_level(user) \
-            and (order.assignee or "") not in _own_identifiers(user):
+            and not assignee_identity.matches(order, user, db):
         raise HTTPException(status_code=404, detail="工单不存在")
     data = _order_to_response(order)
     if not privacy.can_identify(user):
@@ -626,13 +640,13 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate,
         raise HTTPException(status_code=404, detail="工单不存在")
 
     # 数据级授权：专员只能碰自己的单
-    _assert_can_touch(user, order)
+    _assert_can_touch(user, order, db)
 
     update_data = body.model_dump(exclude_unset=True)
 
     # ── 字段级授权：专员只能改执行结果相关字段 ────────────
     if not _is_manager_level(user):
-        STAFF_WRITABLE = {"status", "result", "note"}
+        STAFF_WRITABLE = {"status", "result", "note", "observation_start", "observation_end", "result_evidence", "actual_cost", "actual_benefit"}
         illegal = sorted(set(update_data) - STAFF_WRITABLE)
         if illegal:
             raise HTTPException(
@@ -660,10 +674,18 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate,
     if "status" in update_data:
         new_status = update_data["status"]
 
+        if new_status == "cancelled" and order.status not in ("pending", "in_progress"):
+            raise HTTPException(status_code=409, detail="只能取消待处理或处理中的工单")
+        if new_status in ("pending", "in_progress"):
+            from app.services.customer_service import assert_retention_eligible
+            assert_retention_eligible(db, order.customer_id, exclude_order_id=order.id)
+
         if new_status in ("completed", "lost"):
-            # 结案：result 缺省时按状态补（completed→retained，lost→lost）
-            if not update_data.get("result"):
-                update_data["result"] = "retained" if new_status == "completed" else "lost"
+            # 完成需要显式结果；已流失状态只允许 lost。
+            if new_status == "completed" and not update_data.get("result"):
+                raise HTTPException(422, "完成工单必须明确填写挽留结果，不能默认视为成功")
+            if new_status == "lost":
+                update_data["result"] = "lost"
             update_data["completed_at"] = datetime.now(timezone.utc)
         else:
             # 非结案态（pending / in_progress）：清除结案痕迹
@@ -671,28 +693,41 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate,
                 update_data["result"] = None
             update_data["completed_at"] = None
 
-    # 人工调整 risk_level 时，同步刷新分级依据快照与**动作** ——
-    # 否则会出现「等级是新的、依据是旧的」这种更隐蔽的不一致。
-    if "risk_level" in update_data:
-        info = risk_scoring.get_risk_info()
-        if info.get("thresholds"):
-            update_data["thresholds_snapshot"] = json.dumps(
-                info["thresholds"], ensure_ascii=False
-            )
-        if info.get("model"):
-            update_data["model_used"] = info["model"]
+    if update_data.get("status", order.status) == "cancelled":
+        update_data["result"] = None
+        update_data["completed_at"] = None
 
-        # 动作同样依赖等级（动作 = f(价值层, 等级)），等级改了动作必须重算，
-        # 否则会出现「等级=极高、动作还是中等档的」——与上面同理的不一致。
-        # 价值层取工单自身余额（余额建单即冻结，PUT 不改它）。
-        # 仅当调用方没有显式指定 strategy 时才自动重算，保留人工微调的余地。
-        if not update_data.get("strategy"):
-            tier = order.value_tier_snapshot or risk_scoring.value_tier(order.balance)
-            # 渠道可能被人工覆盖过，按其实际渠道取动作，避免与渠道再次打架
-            ch = order.channel or risk_scoring.CHANNEL_BY_TIER[tier]
-            recalc = risk_scoring.action_for_channel(ch, update_data["risk_level"])
-            if recalc:
-                update_data["strategy"] = recalc
+    # 模型事实是建单时的不可变快照，人工调整只能记在策略与备注中。
+    for field in ("risk_level", "probability"):
+        if field in update_data:
+            if update_data[field] != getattr(order, field):
+                raise HTTPException(422, "不能修改建单时的模型快照，请在策略或备注中记录人工判断")
+            update_data.pop(field)
+
+    final_status = update_data.get("status", order.status)
+    final_result = update_data.get("result", order.result)
+    if final_status in ("pending", "in_progress", "cancelled") and final_result is not None:
+        raise HTTPException(422, "未结案工单不能填写挽留结果")
+    if final_status == "lost" and final_result != "lost":
+        raise HTTPException(422, "已流失状态必须对应流失结果")
+    if final_status == "completed" and final_result not in ("retained", "lost"):
+        raise HTTPException(422, "完成工单必须明确填写实际挽留结果")
+
+    start = update_data.get('observation_start', order.observation_start)
+    end = update_data.get('observation_end', order.observation_end)
+    as_utc = lambda value: value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
+    if start and end and as_utc(end) <= as_utc(start):
+        raise HTTPException(422, '观察截止必须晚于开始时间')
+    evidence_fields = {'result','status','observation_start','observation_end','result_evidence','actual_cost','actual_benefit'}
+    if evidence_fields.intersection(update_data):
+        update_data.update(verification_state='unverified', verified_by=None, verified_at=None)
+        if final_result is not None:
+            update_data['result_recorded_by'] = user.username
+            if {'status','result'}.intersection(update_data) and order.result_source != 'demo':
+                update_data['result_source'] = 'manual'
+        if final_status in ('pending', 'in_progress', 'cancelled'):
+            for field in ('observation_start','observation_end','result_evidence','actual_cost','actual_benefit','result_recorded_by'):
+                update_data[field] = None
 
     # 改派负责人时校验取值有效（经理才可能走到这里 —— 专员被字段白名单挡住）
     if "assignee" in update_data:
@@ -704,12 +739,23 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate,
                 status_code=422,
                 detail=f"负责人「{new_a}」不是有效行员（请从列表中选择）",
             )
-        update_data["assignee"] = new_a
+        owner = assignee_identity.resolve(db, new_a)
+        update_data.update(assignee=owner.username, assignee_username=owner.username,
+                           assignee_name_snapshot=owner.display_name)
 
     for field, value in update_data.items():
         setattr(order, field, value)
 
     order.updated_at = datetime.now(timezone.utc)
+    # 与创建相同：并发重开仍由数据库唯一约束兜底，并返回可处理的冲突。
+    from sqlalchemy.exc import IntegrityError
+    try:
+        db.flush()
+    except IntegrityError as e:
+        db.rollback()
+        if "work_orders.customer_id" in str(e.orig) or "uq_active_customer_work_order" in str(e.orig):
+            raise HTTPException(409, "该客户已有在途工单，请刷新后重试")
+        raise
     # 审计：状态流转与改派必须留痕（"谁把这张单改成了什么"）
     auth_deps.write_audit(
         db, user=user, action="update_work_order",
@@ -722,7 +768,10 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate,
         source="ui", ip=auth_deps._client_ip(request),
         message=f"更新工单 #{order_id}（{', '.join(sorted(update_data.keys()))}）",
     )
-    db.commit()
+    if db.info.get("agent_transaction"):
+        db.flush()
+    else:
+        db.commit()
     db.refresh(order)
 
     # GET 详情 / PUT 更新 都返回工单本身，不是响应契约，不需要 Pydantic 校验；
@@ -758,5 +807,29 @@ async def delete_work_order(order_id: int,
         message=f"删除工单 #{order_id}（客户 {order.customer_id}）",
     )
     db.delete(order)
-    db.commit()
+    if db.info.get("agent_transaction"):
+        db.flush()
+    else:
+        db.commit()
     return None
+
+
+@router.post('/{order_id}/verify')
+async def verify_order_result(order_id: int, user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE)), db: Session = Depends(get_db)):
+    """复核显式观察记录；不认定干预因果或银行利润。"""
+    order = db.get(WorkOrder, order_id)
+    if order is None:
+        raise HTTPException(404, '工单不存在')
+    if order.result_source != 'manual' or order.status not in ('completed','lost') or order.result not in ('retained','lost'):
+        raise HTTPException(409, '仅可复核已结案的人工观察记录')
+    if user.username in (order.result_recorded_by, order.assignee_username) or assignee_identity.matches(order,user,db):
+        raise HTTPException(403, '记录人或负责人不能自行复核')
+    if not order.observation_start or not order.observation_end or not (order.result_evidence or '').strip():
+        raise HTTPException(422, '复核需要观察开始、截止和证据来源')
+    end = order.observation_end.replace(tzinfo=timezone.utc) if order.observation_end.tzinfo is None else order.observation_end
+    if end > datetime.now(timezone.utc):
+        raise HTTPException(422, '观察窗口尚未结束')
+    order.verification_state = 'verified'; order.verified_by = user.username; order.verified_at = datetime.now(timezone.utc)
+    auth_deps.write_audit(db,user=user,action='verify_work_order',target=f'#{order.id}',detail={'observation_start':str(order.observation_start),'observation_end':str(order.observation_end),'result':order.result})
+    db.commit(); db.refresh(order)
+    return _order_to_response(order)

@@ -1,12 +1,25 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import Dialog from '../components/Dialog.vue'
+import { createSessionActivity } from '../utils/sessionActivity'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
-const collapsed = ref(false)
+const mobile = ref(window.innerWidth < 768)
+const desktopCollapsed = ref(localStorage.getItem('nav-collapsed') === '1')
+const mobileOpen = ref(false)
+const collapsed = computed(() => !mobile.value && desktopCollapsed.value)
+function resizeLayout() { mobile.value = window.innerWidth < 768; mobileOpen.value = false }
+function toggleNav() {
+  if (mobile.value) mobileOpen.value = !mobileOpen.value
+  else { desktopCollapsed.value = !desktopCollapsed.value; localStorage.setItem('nav-collapsed', desktopCollapsed.value ? '1' : '0') }
+}
+watch(() => route.path, () => { mobileOpen.value = false })
+onMounted(() => window.addEventListener('resize', resizeLayout))
+onBeforeUnmount(() => window.removeEventListener('resize', resizeLayout))
 const idleWarn = ref(false)         // 即将因无操作退出
 
 // ── 一级导航：业务工作流（看大盘 → 找客户 → 办工单 → 定策略 → 智能助手）──
@@ -60,10 +73,6 @@ const visibleAdmin = computed(() =>
 // 否则点进详情后侧边栏「客户名单」失去选中态，像是离开了这个模块。
 const isActive = (path) => route.path === path || route.path.startsWith(path + '/')
 
-const navigateTo = (path) => {
-  router.push(path)
-}
-
 /**
  * 面包屑 —— 仅二级页（如 /customers/:id）显示两级。
  *
@@ -106,34 +115,39 @@ const breadcrumb = computed(() => {
 //   只在令牌到期才失效，意味着最长 2 小时无人看管的会话仍是活的。
 //
 // ⚠ 到期前 60 秒提示一次，避免用户正在填表时被直接踢出。
-const IDLE_MS = 30 * 60 * 1000       // 与后端 AUTH_IDLE_MINUTES 对齐
-const WARN_MS = 60 * 1000
-let idleTimer = null
-let warnTimer = null
-
-function resetIdle() {
-  idleWarn.value = false
-  clearTimeout(idleTimer)
-  clearTimeout(warnTimer)
-  warnTimer = setTimeout(() => { idleWarn.value = true }, IDLE_MS - WARN_MS)
-  idleTimer = setTimeout(() => {
+let disposed = false
+const sessionActivity = createSessionActivity({
+  reportActivity: () => auth.reportActivity(),
+  onWarning: value => { idleWarn.value = value },
+  onExpired: () => {
     auth.clear()
     router.replace({ path: '/login', query: { idle: '1' } })
-  }, IDLE_MS)
+  },
+})
+
+// scroll可由图表/对话自动滚动触发，使用实际输入事件；隐藏页面不续期。
+const EVENTS = ['pointermove', 'pointerdown', 'keydown', 'wheel', 'touchstart']
+function onUserActivity(event) {
+  if (event.isTrusted && !document.hidden) sessionActivity.activity()
 }
 
-const EVENTS = ['mousemove', 'keydown', 'click', 'scroll', 'touchstart']
-
-onMounted(() => {
-  resetIdle()
-  // ⚠ 用 passive 监听且不做节流：事件本身极轻，节流反而带来复杂度
-  EVENTS.forEach(e => window.addEventListener(e, resetIdle, { passive: true }))
+onMounted(async () => {
+  try {
+    const data = await auth.fetchMe()
+    if (disposed) return
+    sessionActivity.start(data)
+    EVENTS.forEach(e => window.addEventListener(e, onUserActivity, { passive: true }))
+  } catch (error) {
+    if (disposed || error.code === 'ERR_CANCELED') return
+    auth.clear()
+    router.replace({ path: '/login', query: { expired: '1', msg: '无法确认会话，请重新登录' } })
+  }
 })
 
 onBeforeUnmount(() => {
-  clearTimeout(idleTimer)
-  clearTimeout(warnTimer)
-  EVENTS.forEach(e => window.removeEventListener(e, resetIdle))
+  disposed = true
+  sessionActivity.stop()
+  EVENTS.forEach(e => window.removeEventListener(e, onUserActivity))
 })
 
 async function doLogout() {
@@ -142,14 +156,15 @@ async function doLogout() {
 }
 
 function stayActive() {
-  resetIdle()
+  sessionActivity.activity(true)
 }
 </script>
 
 <template>
   <div class="flex min-h-screen">
+    <button v-if="mobileOpen" class="nav-backdrop" aria-label="关闭导航" @click="mobileOpen = false"></button>
     <!-- Sidebar -->
-    <aside
+    <aside v-if="!mobile || mobileOpen"
       :class="[
         'fixed left-0 top-0 h-full z-50 flex flex-col transition-all duration-300',
         collapsed ? 'w-[68px]' : 'w-[220px]'
@@ -176,10 +191,12 @@ function stayActive() {
       <!-- Nav Items -->
       <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
         <!-- 一级：业务工作流 -->
-        <div
+        <RouterLink
           v-for="item in visibleNav"
           :key="item.path"
-          @click="navigateTo(item.path)"
+          :to="item.path"
+          :aria-label="item.title"
+          :aria-current="isActive(item.path) ? 'page' : undefined"
           :class="[
             'sidebar-link cursor-pointer',
             isActive(item.path) ? 'active' : ''
@@ -194,7 +211,7 @@ function stayActive() {
           <transition name="fade">
             <span v-if="!collapsed && item.badge" class="nav-badge">{{ item.badge }}</span>
           </transition>
-        </div>
+        </RouterLink>
 
         <!-- 分隔线 + 二级：系统管理
              ⚠ 整组都要 v-if="visibleAdmin.length"：客户专员（staff）在这组
@@ -207,10 +224,12 @@ function stayActive() {
           <div v-else class="nav-divider-collapsed"></div>
         </template>
 
-        <div
+        <RouterLink
           v-for="item in visibleAdmin"
           :key="item.path"
-          @click="navigateTo(item.path)"
+          :to="item.path"
+          :aria-label="item.title"
+          :aria-current="isActive(item.path) ? 'page' : undefined"
           :class="[
             'sidebar-link sidebar-link-admin cursor-pointer',
             isActive(item.path) ? 'active' : ''
@@ -222,12 +241,14 @@ function stayActive() {
           <transition name="fade">
             <span v-if="!collapsed" class="whitespace-nowrap flex-1">{{ item.title }}</span>
           </transition>
-        </div>
+        </RouterLink>
       </nav>
 
       <!-- Collapse Toggle -->
       <button
-        @click="collapsed = !collapsed"
+        @click="toggleNav"
+        :aria-label="collapsed ? '展开导航' : '收起导航'"
+        :aria-expanded="!collapsed"
         class="mx-3 mb-4 p-2 rounded-lg text-[#7c8aa5] hover:text-[#1d4ed8] hover:bg-[#eef3fb] transition-colors flex items-center justify-center"
       >
         <svg class="w-4 h-4 transition-transform" :class="collapsed ? 'rotate-180' : ''"
@@ -241,13 +262,14 @@ function stayActive() {
     <!-- Main Content -->
     <main
       :class="[
-        'flex-1 transition-all duration-300 min-h-screen',
-        collapsed ? 'ml-[68px]' : 'ml-[220px]'
+        'flex-1 min-w-0 transition-all duration-300 min-h-screen',
+        mobile ? 'ml-0' : collapsed ? 'ml-[68px]' : 'ml-[220px]'
       ]"
       style="background: #f4f6fa;"
     >
       <!-- 顶栏：登录人 + 角色 + 登出 -->
       <header class="topbar">
+        <button v-if="mobile" class="btn-logout nav-menu" @click="toggleNav" aria-label="打开导航" :aria-expanded="mobileOpen">☰ 导航</button>
         <div class="topbar-right">
           <span class="role-chip">{{ auth.roleLabel || '未登录' }}</span>
           <span class="user-name">{{ auth.displayName }}</span>
@@ -257,12 +279,12 @@ function stayActive() {
         </div>
       </header>
 
-      <div class="p-6">
+      <div class="p-3 md:p-6">
         <!-- 面包屑 —— 仅二级页出现（见 breadcrumb 的说明） -->
         <nav v-if="breadcrumb.length" class="breadcrumb">
           <template v-for="(b, i) in breadcrumb" :key="i">
-            <span v-if="i > 0" class="bc-sep">/</span>
-            <a v-if="b.path" class="bc-link" @click="navigateTo(b.path)">{{ b.title }}</a>
+            <span v-if="i > 0" class="bc-sep" aria-hidden="true">/</span>
+            <RouterLink v-if="b.path" class="bc-link" :to="b.path">{{ b.title }}</RouterLink>
             <span v-else class="bc-cur">{{ b.title }}</span>
           </template>
         </nav>
@@ -271,13 +293,13 @@ function stayActive() {
     </main>
 
     <!-- 无操作超时提示（到期前 60 秒） -->
-    <div v-if="idleWarn" class="idle-mask">
+    <Dialog :open="idleWarn" title="会话即将超时" @close="stayActive">
       <div class="idle-box">
         <h4>会话即将超时</h4>
-        <p>您已有一段时间没有操作。为保障账户安全，系统将在 1 分钟后自动退出登录。</p>
+        <p>会话即将到期。为保障账户安全，若不继续操作，系统将自动退出登录。</p>
         <button class="btn-stay" @click="stayActive">继续使用</button>
       </div>
-    </div>
+    </Dialog>
   </div>
 </template>
 
@@ -285,12 +307,12 @@ function stayActive() {
 /* ── 面包屑（仅二级页）── */
 .breadcrumb {
   display: flex; align-items: center; gap: 7px;
-  font-size: 12.5px; color: #9aa7bd;
+  font-size: 12.5px; color: #5b6b83;
   margin-bottom: 12px;
 }
 .bc-sep { color: #cbd5e1; }
 .bc-link {
-  color: #7c8aa5; cursor: pointer; transition: color .15s;
+  color: #5b6b83; cursor: pointer; transition: color .15s;
 }
 .bc-link:hover { color: #1d4ed8; }
 .bc-cur { color: #17335c; font-weight: 600; }
@@ -300,13 +322,15 @@ function stayActive() {
      1) 表格表头吸顶到 top:56px，若顶栏不吸顶，滚动后表头会浮在
         一片空白上（顶栏已经滚走了），看起来像"表头漂在半空"。
      2) 顶栏 z-index 必须 > 表头，否则页面滚动时表头会从顶栏**前面**穿过。 */
+.nav-backdrop { position:fixed; inset:0; z-index:40; background:#17335c66; border:0; }
+.nav-menu { margin-right:auto; }
 .topbar {
   position: sticky;
   top: 0;
   z-index: 20;
   height: 56px;
   display: flex; align-items: center; justify-content: flex-end;
-  padding: 0 24px;
+  padding: 0 12px; flex-wrap:wrap; gap:8px; min-height:56px; height:auto;
   background: #fff;
   border-bottom: 1px solid #e5e9f0;
 }
@@ -362,7 +386,7 @@ function stayActive() {
 }
 .nav-divider-text {
   font-size: 11px;
-  color: #9aa7bd;
+  color: #5b6b83;
   font-weight: 600;
   letter-spacing: 0.5px;
 }
@@ -374,7 +398,7 @@ function stayActive() {
 /* 二级导航项：字号略小、颜色略淡，与一级形成层级 */
 .sidebar-link-admin {
   font-size: 13px;
-  color: #8a97ad;
+  color: #5b6b83;
 }
 .sidebar-link-admin:hover {
   color: #5b6b83;

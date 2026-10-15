@@ -37,6 +37,7 @@ export const me = ref({ username: '', display_name: '' })
 
 let _inflight = null
 let _loaded = false
+let _generation = 0
 
 /**
  * 拉取行员列表。并发调用只会发一次请求。
@@ -46,21 +47,24 @@ let _loaded = false
 export async function loadAssignees({ force = false } = {}) {
   if (_loaded && !force) return assignees.value
   if (_inflight) return _inflight
+  const generation = _generation
 
   _inflight = (async () => {
     try {
       const { data } = await api.get('/users/assignable')
+      if (generation !== _generation) return assignees.value
       assignees.value = data.items || []
       canAssign.value = !!data.can_assign
       me.value = data.me || { username: '', display_name: '' }
       _loaded = true
     } catch (e) {
+      if (generation !== _generation) return assignees.value
       // 静默降级：不阻断建单，但保持 canAssign=false（界面退化为只读）
       console.warn('[assignees] 行员列表获取失败：', e?.response?.status, e?.message)
       assignees.value = []
       canAssign.value = false
     } finally {
-      _inflight = null
+      if (generation === _generation) _inflight = null
     }
     return assignees.value
   })()
@@ -70,6 +74,7 @@ export async function loadAssignees({ force = false } = {}) {
 
 /** 登出时清掉，避免换账号后仍是上一个人的名单 */
 export function resetAssignees() {
+  _generation += 1
   assignees.value = []
   canAssign.value = false
   me.value = { username: '', display_name: '' }
@@ -88,7 +93,7 @@ export function resetAssignees() {
 export function assigneeName(value) {
   if (!value) return ''
   const hit = assignees.value.find((a) => a.username === value)
-  return hit ? (hit.display_name || hit.username) : value
+  return hit ? `${hit.display_name || hit.username}（${hit.username}·${hit.department || '部门未记录'}）` : value
 }
 
 /**
@@ -101,10 +106,11 @@ export function assigneeName(value) {
 export function displayAssignee(value) {
   if (!value) return { text: '未指派', legacy: false }
   const hit = assignees.value.find((a) => a.username === value)
-  if (hit) return { text: hit.display_name || hit.username, legacy: false }
+  if (hit) return { text: assigneeName(value), legacy: false }
   // 姓名反查：历史工单存的是姓名，能对上某个账号就不算历史脏数据
-  const byName = assignees.value.find((a) => a.display_name === value)
-  if (byName) return { text: value, legacy: false }
+  const byName = assignees.value.filter((a) => a.display_name === value)
+  if (byName.length === 1) return { text: assigneeName(byName[0].username), legacy: false }
+  if (byName.length > 1) return { text: `${value}（历史同名待核对）`, legacy: true }
   return { text: value, legacy: true }
 }
 

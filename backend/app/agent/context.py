@@ -12,15 +12,11 @@
     滚动摘要         ~300 token/轮，且**会丢编号**（对本系统是致命的）
     本模块           ~100 token/轮，**恒定**，不随轮次增长
 
-**为什么由前端回传，而不是服务端存**
+**服务端共享任务状态**
 
-生产用 `uvicorn --workers 4`。若把会话放**进程内存**，4 个 worker 各自为政，
-追问会随机命中"没有记忆"的那个 —— 表现为"有时记得有时不记得"，
-是最难排查的一类故障。故后端保持**无状态**，上下文随请求回传。
-
-SQLite/Redis 持久化（LangGraph checkpointer）是更"正确"的做法，
-但 MVP 阶段引入会同时带来 TTL 设计、并发写、清理策略三件新问题，
-收益不抵成本。故明确**不做**。
+Router 将实体指针、筛选、排序与游标存入数据库，以用户名和 session_id 隔离。
+版本号拒绝过期请求，短期处理租约拒绝同一会话并发；多个 worker 共享同一状态。
+前端只负责展示和恢复版本，客户端数值不进入事实校验。
 
 **为什么注入在 user message，而不是 system prompt 开头**
 
@@ -40,7 +36,7 @@ DeepSeek 的上下文缓存是自动的（前缀命中即折扣）。system prom
 名单外的编号一律拦在工具执行之前 —— 这样即便模型幻觉出一个
 `C999999`，也进不了工具层。这是"边界内"的机械保证，不靠提示词自觉。
 
-⚠ 本模块的输入来自**前端**，属不可信数据，必须逐字段校验（见 `normalize`），
+⚠ 本模块仍逐字段校验输入（见 `normalize`）；首次兼容的前端实体指针不携带可信数值，
   否则等于给用户开了一个提示词注入入口。
 """
 
@@ -52,6 +48,7 @@ from typing import Any
 # 实体栈上限 —— 溢出淘汰最旧。20 条约 360 token，恒定。
 # 取舍：用"无限回溯"换"成本恒定"。真需要回溯更早的对象，就得重新查。
 MAX_ENTITIES = 20
+MAX_DISPLAYED = 50
 
 # 注入时最多渲染几条明细。超出只给条数提示。
 # 分界线取 10，与 tools.list_customers 的默认 limit 对齐（不拍脑袋）。
@@ -64,11 +61,11 @@ MAX_INPUT_ITEMS = 40
 _CID_RE = re.compile(r"^C\d{4,}$", re.IGNORECASE)
 
 # 从问句里找用户**显式写出**的编号（这些永远放行，是新话题的信号）
-_ID_RE = re.compile(r"\bC\d{4,}\b", re.IGNORECASE)
+_ID_RE = re.compile(r"(?<![A-Za-z0-9])C\d{4,}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def empty() -> dict:
-    return {"customers": [], "orders": []}
+    return {"customers": [], "orders": [], "displayed_customer_ids": []}
 
 
 def explicit_ids(text: str) -> list[str]:
@@ -131,7 +128,26 @@ def normalize(raw: Any) -> dict:
             "status": _str(o.get("status"), 20),
         })
 
-    return {"customers": customers[-MAX_ENTITIES:], "orders": orders[-MAX_ENTITIES:]}
+    focus = _str(raw.get("focus_customer_id"), 20).upper()
+    result = {"customers": customers[-MAX_ENTITIES:], "orders": orders[-MAX_ENTITIES:],
+              "focus_customer_id": focus if _CID_RE.fullmatch(focus) else None}
+    displayed = raw.get("displayed_customer_ids")
+    if not isinstance(displayed, list):
+        displayed = [c["id"] for c in customers]
+    result["displayed_customer_ids"] = list(dict.fromkeys(
+        str(cid).strip().upper() for cid in displayed[:MAX_DISPLAYED]
+        if isinstance(cid, str) and _CID_RE.fullmatch(cid.strip())))
+    query = raw.get("list_query")
+    if isinstance(query, dict):
+        keys = {"risk_level", "value_tier", "min_balance", "max_balance", "sort_by",
+                "limit", "offset", "next_offset", "exited", "has_order", "worth_only",
+                "geography", "model_version", "seen_customer_ids"}
+        result["list_query"] = {k: v for k, v in query.items() if k in keys}
+        seen_ids = query.get("seen_customer_ids") or []
+        result["list_query"]["seen_customer_ids"] = list(dict.fromkeys(
+            cid.upper() for cid in seen_ids[:500]
+            if isinstance(cid, str) and _CID_RE.fullmatch(cid)))
+    return result
 
 
 def _cust(d: dict) -> dict | None:
@@ -164,6 +180,8 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
     orders: list[dict] = []
     replace_customers = False
     replace_orders = False
+    focus_customer_id = None
+    focus_changed = False
 
     for tr in tool_results or []:
         if not tr.get("ok"):
@@ -173,6 +191,9 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
 
         if tool == "list_customers":
             replace_customers = True
+            replace_orders = True
+            focus_changed = True
+            focus_customer_id = None
             for it in data.get("items") or []:
                 if isinstance(it, dict):
                     c = _cust(it)
@@ -184,9 +205,15 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
             c = _cust(data)
             if c:
                 customers.append(c)
+                focus_customer_id = c["id"]
+                focus_changed = True
+                replace_orders = True
+                orders = []
 
         elif tool == "list_work_orders":
             replace_orders = True
+            focus_changed = True
+            focus_customer_id = data.get("filter_customer_id") or None
             for it in data.get("items") or []:
                 if not isinstance(it, dict):
                     continue
@@ -211,6 +238,15 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
         })
         if c:
             customers.append(c)
+    elif pa.get("action") == "create_work_order_batch":
+        replace_customers = True
+        replace_orders = True
+        focus_changed = True
+        focus_customer_id = None
+        for item in pa.get("items") or []:
+            c = _cust({**item, "surname": item.get("customer_name")})
+            if c:
+                customers.append(c)
     elif pa.get("action") in ("delete_work_order", "update_work_order"):
         oid = p.get("order_id")
         if isinstance(oid, int) and not isinstance(oid, bool):
@@ -222,12 +258,28 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
                 "status": cur.get("status") or "",
             })
             replace_orders = True
+            focus_changed = True
+            focus_customer_id = str(cur.get("customer_id") or "") or None
 
     return {
         "customers": customers,
         "orders": orders,
         "replace_customers": replace_customers,
         "replace_orders": replace_orders,
+        "focus_changed": focus_changed,
+        "focus_customer_id": focus_customer_id,
+        "displayed_customer_ids": (pa.get("requested_customer_ids") or [c["id"] for c in customers[:MAX_DISPLAYED]])
+            if replace_customers else None,
+        "list_query": next(({
+            **(tr.get("args") or {}),
+            "next_offset": (tr.get("data") or {}).get("next_offset", 0),
+            "model_version": (tr.get("data") or {}).get("model_version"),
+            "seen_customer_ids": list(dict.fromkeys(
+                ((tr.get("args") or {}).get("exclude_ids") or []) +
+                [it["customer_id"] for it in (tr.get("data") or {}).get("items", [])
+                 if it.get("customer_id")]))
+        } for tr in reversed(tool_results or [])
+            if tr.get("ok") and tr.get("tool") == "list_customers"), None),
     }
 
 
@@ -262,7 +314,13 @@ def merge(prev: dict, cur: dict) -> dict:
         ords = list(cur.get("orders") or []) + list(prev.get("orders") or [])
     ords = _dedup(ords, "order_id")[:MAX_ENTITIES]
 
-    return {"customers": cus, "orders": ords}
+    return {"customers": cus, "orders": ords,
+            "displayed_customer_ids": cur.get("displayed_customer_ids")
+                if cur.get("displayed_customer_ids") is not None
+                else prev.get("displayed_customer_ids", [c["id"] for c in cus]),
+            "list_query": cur.get("list_query") or prev.get("list_query"),
+            "focus_customer_id": cur.get("focus_customer_id") if cur.get("focus_changed")
+            else prev.get("focus_customer_id")}
 
 
 def render(ctx: dict | None) -> str:
@@ -280,8 +338,16 @@ def render(ctx: dict | None) -> str:
 
     lines = ["[会话上下文]",
              "以下是你在本次会话中已经查询到的对象，供理解指代使用："]
+    if ctx.get("list_query"):
+        import json
+        lines.append("上次名单筛选与分页：" + json.dumps(ctx["list_query"], ensure_ascii=False))
+    if ctx.get("focus_customer_id"):
+        lines.append(f"当前焦点客户：{ctx['focus_customer_id']}。‘他/该工单’只指此客户，不得使用其他客户的工单。")
 
     if customers:
+        displayed = ctx.get("displayed_customer_ids") or [c["id"] for c in customers]
+        lines.append("当前展示名单完整编号（序号用于指代，最多50位）：")
+        lines.extend(f"   {i}. {cid}" for i, cid in enumerate(displayed, 1))
         lines.append("客户（按顺序，与界面展示顺序一致）：")
         for i, c in enumerate(customers[:RENDER_CAP], 1):
             bits = [f"{i}. {c.get('id')}"]
@@ -357,6 +423,7 @@ def allowed_customer_ids(ctx: dict | None,
     ⚠ 第 3 条容易被漏掉：只放行 1、2 会导致"模型查完列表再查详情"被自己拦住。
     """
     allowed: set[str] = set()
+    allowed.update((ctx or {}).get("displayed_customer_ids") or [])
 
     for c in (ctx or {}).get("customers") or []:
         if c.get("id"):
@@ -450,4 +517,3 @@ def out_of_scope_order_msg(oid: Any, allowed: set[int]) -> str:
         f"工单号 {oid} 不在本次会话已查到的工单范围内（可用：{sample}{more}）。"
         f"请先调用 list_work_orders 确认目标工单，再用返回的 order_id 操作。"
     )
-

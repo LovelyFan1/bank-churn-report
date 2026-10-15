@@ -43,67 +43,26 @@ class CostBenefitService:
         self.db = db
 
     def _load_best_model(self):
-        """从磁盘加载最佳模型, 返回 (model, model_name, meta)。
-
-        ⚠ 两处修复：
-        1) **不再每次请求都重新加载**。此前本方法没有缓存，而实例由
-           `get_cost_benefit_service(db)` 每请求新建，所以每个请求都要
-           重新读 meta.json 并 joblib.load 模型。干预策略页一次并发 5 个请求
-           （summary/thresholds/retention/matrix/risk-info），其中 2 个走这里，
-           等于每次翻页都把模型反序列化两遍。
-        2) **读取失败降级而非抛异常**。训练任务写文件期间（旧实现非原子），
-           json.load / joblib.load 会抛 —— 上层接口直接 500 或静默空数据。
-           现在统一返回 (None, None, None)，由调用方给出"模型未就绪"。
-        """
-        meta = self._read_meta()
-        if meta is None:
-            return None, None, None
-
+        from app.services.model_manifest import resolve
         try:
-            best_name = max(meta["results"].keys(), key=lambda x: meta["results"][x]["auc"])
-        except (KeyError, ValueError):
+            manifest = resolve(MODEL_DIR)
+            if MODEL_DIR == risk_scoring.MODEL_DIR:
+                model, name = risk_scoring._load_best_model()
+                if model is None or risk_scoring._best_model_cache['version'] != manifest.revision:
+                    return None, None, None
+                return model, name, risk_scoring._best_model_cache['meta']
+            return joblib.load(manifest.path), manifest.best_model, manifest.meta
+        except Exception as error:
+            logger.warning('收益分析模型不可用：%s', error)
             return None, None, None
-
-        # 复用 risk_scoring 的进程级模型缓存（避免同一进程内重复反序列化）
-        cached_name = risk_scoring._best_model_cache["name"]
-        cached_model = risk_scoring._best_model_cache["model"]
-        if cached_model is not None and cached_name == best_name \
-                and not risk_scoring._cache_expired():
-            return cached_model, best_name, meta
-
-        model_path = MODEL_DIR / (best_name.lower().replace(" ", "_") + ".joblib")
-        if not model_path.exists():
-            return None, None, None
-
-        try:
-            model = joblib.load(model_path)
-        except Exception as e:
-            logger.warning("cost_benefit: 加载模型 %s 失败: %s: %s",
-                           model_path, type(e).__name__, e)
-            # 退回 risk_scoring 缓存（可能已持有可用模型），避免整页失效
-            if cached_model is not None:
-                return cached_model, cached_name, meta
-            return None, None, None
-
-        return model, best_name, meta
 
     def _read_meta(self):
-        """读取 meta.json，失败时短重试并返回 None（不抛异常）。"""
-        meta_path = MODEL_DIR / "meta.json"
-        if not meta_path.exists():
+        from app.services.model_manifest import resolve
+        try:
+            return resolve(MODEL_DIR).meta
+        except Exception as error:
+            logger.warning('收益分析清单不可用：%s', error)
             return None
-        last_err = None
-        for attempt in range(3):
-            try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, ValueError, OSError) as e:
-                last_err = e
-                if attempt < 2:
-                    time.sleep(0.15 * (attempt + 1))
-        logger.warning("cost_benefit: 读取 %s 失败（已重试）: %s: %s",
-                       meta_path, type(last_err).__name__, last_err)
-        return None
 
     def analyze_thresholds(self, cost_ratio: float | None = None) -> Dict[str, Any]:
         """分析不同阈值下的成本收益。
@@ -115,6 +74,10 @@ class CostBenefitService:
         本方法只负责遍历阈值、统计混淆矩阵、做**同一阈值下**的指标对比，
         **不负责挑选「最优阈值」** —— 见下方注释。
         """
+        engine_status = risk_scoring._ensure_engine(self.db)
+        if engine_status is not None and not engine_status.get('training_dataset_matches', True):
+            return {'error': '当前为滚动推理客户集，不能冒充训练时独立测试集；请查看发布评估记录', 'basis':'unavailable_for_current_cohort'}
+
         cost_ratio = settings.COST_RATIO if cost_ratio is None else cost_ratio
         model, best_name, _ = self._load_best_model()
         if model is None:
@@ -275,7 +238,7 @@ class CostBenefitService:
         }
 
     def get_business_summary(self) -> Dict[str, Any]:
-        """业务摘要 — 年化成本收益（**推算值**，非实测结果）。
+        """业务摘要 — 静态样本情景测算（**推算值**，非实测结果）。
 
         口径：模型测试集指标 × 假设客单价 × **假设挽留成功率**。
 
@@ -297,6 +260,10 @@ class CostBenefitService:
                                           （即已乘 s），使尚未更新的旧页面
                                           显示的数字自动变正确
         """
+        engine_status = risk_scoring._ensure_engine(self.db)
+        if engine_status is not None and not engine_status.get('training_dataset_matches', True):
+            return {'error': '当前为滚动推理客户集，不能冒充训练时独立测试集；请查看发布评估记录', 'basis':'unavailable_for_current_cohort'}
+
         analysis = self.analyze_thresholds()
         if "error" in analysis:
             return analysis
@@ -366,8 +333,12 @@ class CostBenefitService:
             "retained_customers": expected_retained,
             "reduced_loss": expected_reduced_loss,
             "roi": round(roi, 2),
+            "roi_definition": "benefit / cost",
+            "net_roi": round(roi - 1, 4) if intervention_cost > 0 else None,
+            "analysis_period": "snapshot",
             "basis": "estimate",  # 标记口径：推算值
             "note": (
+                "当前为静态样本的情景测算，缺少年度观察窗口；余额不是利润，收益未经因果验证。"
                 f"基于模型测试集指标、假设客单价 ¥{avg_customer_value:,.0f}、"
                 f"假设挽留成功率 {s:.0%} 推算，非实际业务结果。"
                 f"「期望挽留人数」= 判对人数(TP) × 挽留成功率；"
@@ -399,14 +370,18 @@ class CostBenefitService:
           （其 result 来自一张硬编码的比例表，非真实客户反馈）。
           因此 `success_rate` 在未接入真实回访结果前**不具备统计意义**，
           它只是演示流程用的占位值。返回值中 basis 标为
-          "actual_but_seeded" 以如实反映这一点。
+          "manual_observations" 以如实反映这一点。
 
         工单表为空时返回 has_data=False，前端据此显示空态 ——
         不得用推算值顶替，否则会把「模型理论上能省钱」说成「实际挽回了客户」。
         """
+        excluded_demo = self.db.query(WorkOrder).filter(WorkOrder.result_source == 'demo').count()
+        historical_unknown = self.db.query(WorkOrder).filter((WorkOrder.result_source == 'unknown') | WorkOrder.result_source.is_(None)).count()
         completed = (
             self.db.query(WorkOrder)
+            .filter(WorkOrder.result_source == "manual")
             .filter(WorkOrder.result.in_(["retained", "lost"]))
+            .filter(WorkOrder.status.in_(["completed", "lost"]))
             .all()
         )
 
@@ -420,10 +395,15 @@ class CostBenefitService:
                 "roi_executed": 0.0,
                 "by_strategy": [],
                 "by_assignee": [],
-                "basis": "actual_but_seeded",
+                "basis": "manual_observations",
+                "excluded_demo": excluded_demo, "historical_unknown": historical_unknown,
+                "is_causal_effect": False,
                 "roi_basis": "executed_orders_only",
             }
 
+        verified = [o for o in completed if o.verification_state == 'verified']
+        costs = [o.actual_cost for o in completed if o.actual_cost is not None]
+        benefits = [o.actual_benefit for o in completed if o.actual_benefit is not None]
         total = len(completed)
         retained = sum(1 for o in completed if o.result == "retained")
         success_rate = retained / total if total else 0.0
@@ -480,6 +460,11 @@ class CostBenefitService:
 
         return {
             "has_data": True,
+            "verified_count": len(verified), "unverified_count": total - len(verified),
+            "actual_cost": round(sum(costs),2) if len(costs)==total else None,
+            "actual_benefit": round(sum(benefits),2) if len(benefits)==total else None,
+            "actual_cost_coverage": len(costs), "actual_benefit_coverage": len(benefits),
+            "roi_is_scenario": True,
             "total_completed": total,
             "retained": retained,
             "lost": total - retained,
@@ -496,14 +481,10 @@ class CostBenefitService:
             "by_strategy": _group(lambda o: o.strategy, "strategy", "未填写策略"),
             "by_assignee": _group(lambda o: o.assignee, "assignee", "未指派"),
             # 如实标注：数据来自工单表，而该表初始内容是播种的演示记录
-            "basis": "actual_but_seeded",
-            "note": (
-                "本组数字来自 work_orders 表，其初始内容为 seed_work_orders.py "
-                "播种的演示工单（result 取自硬编码比例表，非真实客户回访结果），"
-                "故 success_rate 在接入真实反馈前不具备统计意义。"
-                "另：roi_executed 的分母仅含已建单完成的工单，"
-                "与成本收益页的推算 ROI 分母口径不同（相差数百倍），两者不可直接比较。"
-            ),
+            "basis": "manual_observations",
+                "excluded_demo": excluded_demo, "historical_unknown": historical_unknown,
+                "is_causal_effect": False,
+            "note": "仅统计人工声明的观察结果，默认排除演示与来源未知的历史工单；复核数量独立列出。ROI为假设客单价和成本的情景折算，不能视为实际利润或干预增量效果。实际费用/收益仅在逐单完整录入时提供合计。",
         }
 
     # ── 价值层 × 风险等级 矩阵 ─────────────────────────────
@@ -528,6 +509,10 @@ class CostBenefitService:
         - 测试集仅用于统计「该格历史上真实流失了多少」，即描述性统计。
         因此 basis="descriptive"：描述历史分布，不外推未来收益。
         """
+        engine_status = risk_scoring._ensure_engine(self.db)
+        if engine_status is not None and not engine_status.get('training_dataset_matches', True):
+            return {'error':'当前滚动推理集不等于模型测试集，矩阵不可用','basis':'unavailable_for_current_cohort'}
+
         model, best_name, _ = self._load_best_model()
         if model is None:
             return {"error": "模型尚未训练，请先调用 POST /api/model/train"}
@@ -587,6 +572,8 @@ class CostBenefitService:
         # 合计行：按等级与按价值层各一组，供前端核对总账
         return {
             "basis": "descriptive",
+            "cohort": "held_out_test",
+            "model_version": engine.get('model_version'),
             "model": best_name,
             "test_size": len(y_test),
             "thresholds": {k: round(v, 4) for k, v in thr.items()},

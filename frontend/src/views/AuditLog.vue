@@ -10,7 +10,9 @@
  *   同样限权。前端守卫只是体验，真正的边界在后端。
  */
 import { ref, onMounted, computed } from 'vue'
-import api from '../api'
+import { useRequestScope } from '../api/useRequestScope'
+const scope = useRequestScope()
+let loadVersion = 0
 
 const items = ref([])
 const total = ref(0)
@@ -18,6 +20,8 @@ const loading = ref(true)
 const error = ref('')
 const filterAction = ref('')
 const filterUser = ref('')
+const filterMethod = ref('')
+const filterSuccess = ref('')
 
 // 动作 → 中文（与后端 action 名对应）
 const ACTION_CN = {
@@ -29,6 +33,7 @@ const ACTION_CN = {
   update_work_order: '修改工单',
   delete_work_order: '删除工单',
   create_work_order_batch: '批量建单',
+  verify_work_order: '复核工单观察',
 }
 const actionCn = (a) => ACTION_CN[a] || a
 
@@ -39,19 +44,25 @@ function sourceTag(s) {
 }
 
 async function load() {
+  const version = ++loadVersion
   loading.value = true
   error.value = ''
   try {
     const params = { limit: 100 }
     if (filterAction.value) params.action = filterAction.value
     if (filterUser.value) params.username = filterUser.value
-    const { data } = await api.get('/auth/audit', { params })
+    if (filterMethod.value) params.auth_method = filterMethod.value
+    if (filterSuccess.value !== '') params.success = filterSuccess.value
+    const { data } = await scope.get('/auth/audit', { params })
+    if (version !== loadVersion || !scope.isActive()) return
     items.value = data.items || []
     total.value = data.total || 0
   } catch (e) {
+    if (version !== loadVersion || !scope.isActive()) return
+    items.value = []
     error.value = e.response?.data?.detail || e.message
   } finally {
-    loading.value = false
+    if (version === loadVersion && scope.isActive()) loading.value = false
   }
 }
 
@@ -126,12 +137,15 @@ onMounted(load)
         <span>行员号</span>
         <input v-model="filterUser" placeholder="如 liming" @keyup.enter="load" />
       </label>
+      <label class="fl"><span>认证方式</span><select v-model="filterMethod" @change="load"><option value="">全部</option><option value="password">密码</option><option value="totp">双因素</option></select></label>
+      <label class="fl"><span>结果</span><select v-model="filterSuccess" @change="load"><option value="">全部</option><option value="true">成功</option><option value="false">失败</option></select></label>
       <button class="btn-apply" @click="load">查询</button>
     </div>
 
     <p v-if="error" class="err">{{ error }}</p>
 
-    <div class="card">
+    <p v-if="loading" role="status">正在加载审计记录…</p>
+    <div class="card table-scroll">
       <table class="tbl">
         <thead>
           <tr>
@@ -153,7 +167,7 @@ onMounted(load)
               <span class="uid">{{ r.username }}</span>
             </td>
             <td class="dim">{{ r.role_label }}</td>
-            <td>{{ actionCn(r.action) }}</td>
+            <td>{{ actionCn(r.action) }}<span class="uid">{{ r.auth_method === 'totp' ? '双因素' : r.auth_method === 'password' ? '密码' : r.auth_method === 'historical_unknown' ? '历史方式未记录' : '' }}</span></td>
             <td class="mono">{{ r.target || '—' }}</td>
             <td>
               <span class="src" :class="sourceTag(r.source).cls">
@@ -167,7 +181,7 @@ onMounted(load)
               </span>
             </td>
           </tr>
-          <tr v-if="!loading && !items.length">
+          <tr v-if="!loading && !error && !items.length">
             <td colspan="8" class="empty">暂无记录</td>
           </tr>
         </tbody>
@@ -182,7 +196,7 @@ onMounted(load)
   margin-bottom: 16px;
 }
 .page-title { font-size: 18px; font-weight: 700; color: #17335c; margin: 0; }
-.page-sub { font-size: 12.5px; color: #8a97ad; margin: 4px 0 0; }
+.page-sub { font-size: 12.5px; color: #5b6b83; margin: 4px 0 0; }
 
 .btn-refresh, .btn-apply {
   height: 32px; padding: 0 14px;
@@ -224,10 +238,10 @@ onMounted(load)
 .tbl tbody tr:hover { background: #fafbfe; }
 
 .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #4a5b73; }
-.dim { color: #8a97ad; }
+.dim { color: #5b6b83; }
 .who { display: block; font-weight: 600; }
 .uid {
-  display: block; font-size: 11px; color: #9aa7bd;
+  display: block; font-size: 11px; color: #5b6b83;
   font-family: ui-monospace, Menlo, monospace;
 }
 .msg { color: #5b6b83; line-height: 1.5; }
@@ -237,13 +251,13 @@ onMounted(load)
   font-size: 11px; font-weight: 600;
 }
 .src-agent { background: #eef2ff; color: #4338ca; }
-.src-ui { background: #f1f4f9; color: #6b7a91; }
+.src-ui { background: #f1f4f9; color: #5b6b83; }
 
 .res { font-weight: 600; }
 .res.ok { color: #15803d; }
 .res.bad { color: #b91c1c; }
 
-.empty { text-align: center; color: #9aa7bd; padding: 26px 0; }
+.empty { text-align: center; color: #5b6b83; padding: 26px 0; }
 
 .err {
   padding: 9px 12px; margin-bottom: 12px;

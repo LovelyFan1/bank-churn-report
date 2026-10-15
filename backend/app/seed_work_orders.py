@@ -22,11 +22,13 @@ from datetime import datetime, timedelta, timezone
 
 from app.database import Base, SessionLocal, engine
 from app.models.work_order import WorkOrder
+from app.models.customer import Customer
+from app.models.user import User
 from app.services import risk_scoring
+from app.services import auth_service as auth
 
 # 播种规模与结构（业务假设，可按演示需要调整）
 NUM_ORDERS = 60
-ASSIGNEES = ["王晓芸", "李铭", "张思远", "陈立群", "赵敏"]
 
 # 状态分布（合计 72 条槽位，按 i % len 循环取用，60 条工单的落点见末尾统计）：
 #   completed+retained 33 / completed+lost 12 / lost 9 / in_progress 11 / pending 7
@@ -67,14 +69,24 @@ def main() -> int:
             return 1
 
         # 候选池：期望价值 Top 200（演示时复盘页能对应上高危客户）
-        pool = sorted(scored, key=lambda x: x["expected_value"], reverse=True)[:200]
+        eligible_ids = {row[0] for row in db.query(Customer.customer_id).filter(Customer.exited == 0)}
+        active_ids = {row[0] for row in db.query(WorkOrder.customer_id).filter(
+            WorkOrder.status.in_(("pending", "in_progress")))}
+        pool = sorted((c for c in scored if c["customer_id"] in eligible_ids - active_ids),
+                      key=lambda x: x["expected_value"], reverse=True)[:200]
         rng.shuffle(pool)
         picked = pool[:NUM_ORDERS]
 
         info = risk_scoring.get_risk_info()
+        owners = [user for user in db.query(User).filter(User.is_active == 1).order_by(User.username).all()
+                  if auth.has_perm(user.role, auth.PERM_ORDER_ASSIGNED) or auth.has_perm(user.role, auth.PERM_ORDER_WRITE)]
+        if not owners:
+            print('[seed-orders] 没有可处理工单的启用账号，不生成无效负责人记录')
+            return 1
         now = datetime.now(timezone.utc)
         orders = []
         for i, c in enumerate(picked):
+            owner = rng.choice(owners)
             status, result = STATUS_PLAN[i % len(STATUS_PLAN)]
             # 创建时间分散在过去 60 天内，完成时间在创建后 1~5 天
             created = now - timedelta(days=rng.randint(1, 60), hours=rng.randint(0, 23))
@@ -84,6 +96,7 @@ def main() -> int:
                 else None
             )
             orders.append(WorkOrder(
+            result_source='demo', verification_state='unverified',
                 customer_id=c["customer_id"],
                 customer_name=c["surname"],
                 geography=c["geography"],
@@ -94,7 +107,9 @@ def main() -> int:
                 strategy=c["action"],
                 status=status,
                 result=result,
-                assignee=rng.choice(ASSIGNEES),
+                assignee=owner.username,
+                assignee_username=owner.username,
+                assignee_name_snapshot=owner.display_name,
                 note=None,
                 thresholds_snapshot=json.dumps(info["thresholds"], ensure_ascii=False),
                 model_used=info.get("model"),

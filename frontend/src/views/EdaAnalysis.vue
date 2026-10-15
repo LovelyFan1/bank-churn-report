@@ -21,7 +21,7 @@
  *   3) 展示层：每张图各自显示错误与「重试」，不再有整体空窗。
  */
 import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '../utils/charts'
 import { useRequestScope } from '../api/useRequestScope'
 
 const loading = ref(true)
@@ -127,13 +127,13 @@ function optionCorrelation(data) {
     xAxis: {
       type: 'category',
       data: features.map(fmtLabel),
-      axisLabel: { color: '#7c8aa5', fontSize: 10, rotate: 45 },
+      axisLabel: { color: '#5b6b83', fontSize: 10, rotate: 45 },
       axisLine: { lineStyle: { color: '#d5dce8' } },
     },
     yAxis: {
       type: 'category',
       data: features.map(fmtLabel),
-      axisLabel: { color: '#7c8aa5', fontSize: 10 },
+      axisLabel: { color: '#5b6b83', fontSize: 10 },
       axisLine: { lineStyle: { color: '#d5dce8' } },
     },
     visualMap: {
@@ -143,7 +143,7 @@ function optionCorrelation(data) {
       left: 'center',
       bottom: 0,
       inRange: { color: ['#3b82f6', '#1e1b4b', '#ef4444'] },
-      textStyle: { color: '#7c8aa5' },
+      textStyle: { color: '#5b6b83' },
     },
     series: [{
       type: 'heatmap',
@@ -160,8 +160,8 @@ function optionChurnByGender(data) {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => item.gender), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
+    xAxis: { type: 'category', data: d.map((item) => item.gender), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
     series: [
       { name: '留存', type: 'bar', stack: 'total', data: d.map((item) => item.total - item.churned), itemStyle: { color: '#22c55e', borderRadius: [0, 0, 0, 0] } },
       { name: '流失', type: 'bar', stack: 'total', data: d.map((item) => item.churned), itemStyle: { color: '#ef4444', borderRadius: [4, 4, 0, 0] } },
@@ -175,8 +175,8 @@ function optionChurnByGeo(data) {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => item.geography), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
+    xAxis: { type: 'category', data: d.map((item) => item.geography), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
     series: [
       { name: '留存', type: 'bar', stack: 'total', data: d.map((item) => item.total - item.churned), itemStyle: { color: '#6366f1' } },
       { name: '流失', type: 'bar', stack: 'total', data: d.map((item) => item.churned), itemStyle: { color: '#f59e0b' } },
@@ -189,7 +189,7 @@ function optionProductOverload(data) {
   return {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     grid: { left: 12, right: 12, top: 30, bottom: 24, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => item.num_products + '个产品'), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
+    xAxis: { type: 'category', data: d.map((item) => item.num_products + '个产品'), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
     yAxis: { type: 'value', axisLabel: { color: '#9ca3af', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#eef1f6' } } },
     series: [{
       type: 'bar',
@@ -210,8 +210,8 @@ function optionSatisfaction(data) {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
-    xAxis: { type: 'category', data: d.map((item) => '评分' + item.satisfaction_score), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#7c8aa5' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
+    xAxis: { type: 'category', data: d.map((item) => '评分' + item.satisfaction_score), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
     series: [
       { name: '留存', type: 'bar', stack: 't', data: d.map((item) => item.total - item.churned), itemStyle: { color: '#22c55e' } },
       { name: '流失', type: 'bar', stack: 't', data: d.map((item) => item.churned), itemStyle: { color: '#ef4444', borderRadius: [4, 4, 0, 0] } },

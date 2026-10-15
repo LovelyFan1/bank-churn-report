@@ -13,7 +13,9 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
+from app.models.customer import Customer
 from app.services import auth_deps
+from app.services import auth_service as auth
 from app.services import privacy
 from app.services.customer_service import (
     _filtered_customers,
@@ -23,7 +25,8 @@ from app.services.customer_service import (
 from app.services import risk_scoring
 from app.services import note_service
 
-router = APIRouter(prefix="/api/customers", tags=["Customers"])
+router = APIRouter(prefix="/api/customers", tags=["Customers"],
+                   dependencies=[Depends(auth_deps.require_perm(auth.PERM_INSIGHT_VIEW))])
 
 # 导出列 —— 面向"拿去打电话"的场景，只保留执行时真正用得到的字段。
 # 内部字段（id/exited）不导出，避免把训练标签泄露给一线。
@@ -58,6 +61,11 @@ async def get_customers(
     has_order: bool | None = Query(default=None, description="是否已有进行中工单"),
     sort_by: str = Query(default="probability", description="probability / expected_value / balance / age / credit_score"),
     sort_order: str = Query(default="desc", description="asc / desc"),
+    min_balance: float | None = Query(default=None, ge=0),
+    max_balance: float | None = Query(default=None, ge=0),
+    offset: int | None = Query(default=None, ge=0),
+    worth_only: bool = Query(default=False),
+    exclude_ids: list[str] = Query(default=[], max_length=500),
     user: User = Depends(auth_deps.current_user),
     db: Session = Depends(get_db),
 ):
@@ -82,6 +90,9 @@ async def get_customers(
         has_order=has_order,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_balance=min_balance, max_balance=max_balance, offset=offset,
+        worth_only=worth_only,
+        exclude_ids=exclude_ids,
     )
 
     if not privacy.can_identify(user):
@@ -169,6 +180,26 @@ async def export_customers(
     )
 
 
+def _require_detail(db, customer_id):
+    if not db.query(Customer.id).filter(Customer.customer_id == customer_id).first():
+        raise HTTPException(404, f"客户 {customer_id} 不存在")
+    detail = get_customer_detail(db, customer_id)
+    if detail is None:
+        raise HTTPException(503, "客户评分暂不可用，请检查模型与数据版本后重试")
+    return detail
+
+
+@router.get("/{customer_id}/explanation")
+def customer_explanation(customer_id: str,
+                         user: User = Depends(auth_deps.current_user),
+                         db: Session = Depends(get_db)):
+    if not privacy.can_identify(user):
+        raise HTTPException(403, "无权查看客户模型解释")
+    detail = _require_detail(db, customer_id)
+    from app.services.model_service import get_model_service
+    return get_model_service(db).get_shap_single(detail)
+
+
 @router.get("/{customer_id}")
 async def get_customer(customer_id: str,
                        user: User = Depends(auth_deps.current_user),
@@ -185,9 +216,7 @@ async def get_customer(customer_id: str,
             status_code=403,
             detail=privacy.MASK_NOTICE + "（详情页需要客户身份权限）",
         )
-    detail = get_customer_detail(db, customer_id)
-    if detail is None:
-        raise HTTPException(status_code=404, detail=f"客户 {customer_id} 不存在或模型未训练")
+    detail = _require_detail(db, customer_id)
     return detail
 
 
@@ -223,9 +252,7 @@ async def get_suggested_note(customer_id: str,
             status_code=403,
             detail="当前角色无权查看客户建单理由（其中含姓名、余额与风险因素）",
         )
-    detail = get_customer_detail(db, customer_id)
-    if detail is None:
-        raise HTTPException(status_code=404, detail=f"客户 {customer_id} 不存在或模型未训练")
+    detail = _require_detail(db, customer_id)
 
     result = note_service.build_reason(
         prob=detail.get("probability", 0.0),

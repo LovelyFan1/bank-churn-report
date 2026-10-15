@@ -56,9 +56,9 @@ def _build(temperature: float = 0.0):
         api_key=settings.AGENT_LLM_API_KEY,
         base_url=settings.AGENT_LLM_BASE_URL,
         temperature=temperature,
-        timeout=settings.AGENT_TIMEOUT,
+        timeout=min(settings.AGENT_TIMEOUT, 15),
         # 失败重试交给框架：网络抖动是常态（本项目实测过 Docker 转发链路重置）
-        max_retries=2,
+        max_retries=0,
     )
 
 

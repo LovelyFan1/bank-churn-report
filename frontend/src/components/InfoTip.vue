@@ -119,7 +119,7 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   border: 1px solid #b9c4d4;
   background: #fff;
-  color: #7c8aa5;
+  color: #5b6b83;
   font-family: inherit;
   font-size: 10px;
   font-weight: 700;

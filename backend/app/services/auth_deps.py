@@ -70,6 +70,9 @@ def current_user(
         u.role = cached.get("role") or ""
         u.is_active = 1
         u.totp_enabled = 1 if cached.get("totp_enabled") else 0
+        u.department = cached.get("department")
+        u.must_change_password = cached.get("must_change_password") or 0
+        u.last_login_at = cached.get("last_login_at")
         u.totp_secret = None
         u.failed_attempts = 0
         # ⚠ 不查库即返回，因此 **不能**把该对象用于写操作（改口令/计数）。
@@ -84,20 +87,8 @@ def current_user(
     except auth.TokenError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    # ⚠ 只有 scope=full 的令牌才能访问业务接口。登录第一步签发的
-    #   `pre_totp` 临时票据若被接受，等于第二因子形同虚设。
-    if payload.get("scope") != "full":
-        raise HTTPException(status_code=401, detail="令牌不可用于该操作，请完成登录")
-
-    username = payload.get("sub")
-    if not username:
-        raise HTTPException(status_code=401, detail="令牌缺少用户标识")
-
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        raise HTTPException(status_code=401, detail="用户不存在，请重新登录")
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="账号已停用，请联系管理员")
+    user = auth.validate_session(db, payload)
+    request.state.auth_payload = payload
     return user
 
 
@@ -168,20 +159,10 @@ def require_any_perm(*perms: str):
 def write_audit(db: Session, *, user: User | None, action: str,
                 target: str = "", detail: Any = None, source: str = "ui",
                 success: bool = True, message: str = "",
-                ip: str = "", commit: bool = False) -> None:
-    """写一条审计记录。
+                ip: str = "", commit: bool = False, auth_method: str | None = None) -> None:
+    """业务审计随同一事务提交，写入失败向调用方抛出并回滚业务。
 
-    ⚠ 审计写入**不得**导致业务操作失败：若审计表出问题（如磁盘满），
-      让一次已经成功的建单回滚是难以接受的 —— 用户看到"操作失败"，
-      但底层可能已经发过通知。故此处吞掉异常并记日志。
-
-    ⚠ 为什么用 **savepoint（begin_nested）** 而不是直接 rollback：
-      直接 `db.rollback()` 会回滚**整个事务** —— 包括同一 session 里
-      刚执行的业务写入（建单）。那样"审计失败"会静默毁掉业务结果，
-      是最坏的一类副作用。savepoint 只回滚审计这一条，业务不受影响。
-
-    ⚠ `commit=False` 是默认：让审计随业务事务一起提交，
-      保证"操作成功但审计丢失"不会发生（原子性）。
+    commit=True 用于独立的登录等审计，失败记日志；不得用于已开始的业务事务。
     """
     try:
         row = AuditLog(
@@ -189,6 +170,7 @@ def write_audit(db: Session, *, user: User | None, action: str,
             display_name=(user.display_name if user else "") or "",
             role=(user.role if user else "") or "",
             action=action,
+            auth_method=auth_method,
             target=(target or "")[:128],
             detail=(json.dumps(detail, ensure_ascii=False, default=str)
                     if detail is not None else None),
@@ -200,6 +182,8 @@ def write_audit(db: Session, *, user: User | None, action: str,
         if db is None:
             # 无 session（理论上不该发生）—— 明确告警，不静默丢
             logger.warning("audit: 未提供 db session，记录被丢弃 action=%s", action)
+            if not commit:
+                raise RuntimeError("业务操作必须提供审计 session")
             return
         with db.begin_nested():          # savepoint：失败只回滚这一条
             db.add(row)
@@ -208,3 +192,5 @@ def write_audit(db: Session, *, user: User | None, action: str,
     except Exception as e:
         # 这里**不能** rollback 整个 session（会毁掉业务写入）
         logger.warning("audit: 写入失败 action=%s err=%s", action, e)
+        if not commit:
+            raise

@@ -1,6 +1,7 @@
 <script setup>
+import Dialog from '../components/Dialog.vue'
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '../utils/charts'
 import api, { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import InfoTip from '../components/InfoTip.vue'
@@ -31,7 +32,12 @@ const maskNotice = ref('')
 const activeCustomerIds = ref(new Set())
 // 风险分级口径 + 最优模型指标 —— 均由后端给出，不在前端写死
 const riskInfo = ref(null)
+const modelWarning = computed(() => (riskInfo.value?.probability_note || '')
+  + (riskInfo.value?.threshold_basis === 'legacy_in_sample_requires_retraining'
+    ? ' 当前模型仍使用旧阈值口径，需要重新训练。' : ''))
 const modelMetrics = ref(null)
+const modelMetricsLoading = ref(true)
+const modelMetricsError = ref('')
 
 // Chart refs
 const riskChart = shallowRef(null)
@@ -45,6 +51,8 @@ const insights = ref([])
 // Top10 列表的错误态 —— 后端在模型未就绪时返回 200 + {"items":[], "error":...}，
 // 必须显式区分「没有数据」与「模型没就绪」，否则只会看到一个空表
 const topError = ref('')
+const pageError = ref('')
+const secondaryErrors = ref([])
 
 // Computed
 const churnRate = ref(0)
@@ -79,7 +87,7 @@ onMounted(async () => {
   //
   // 「数值消失」的连锁根因：并发排队 → 超时 → 连接被重置 →
   // axios Network Error → 对应 ref 未赋值 → 界面显示空/0。
-  const withFallback = (p, fallback) => p.catch(() => ({ data: fallback }))
+  const withFallback = (p, fallback) => p.catch(e => { if (scope.isActive() && !isCanceled(e)) secondaryErrors.value.push(e.response?.data?.detail || e.message); return { data: fallback } })
 
   // ── 第一批：首屏聚合接口（1 请求替代原 4 并发，绕开 Docker 转发瓶颈）──
   try {
@@ -132,7 +140,7 @@ onMounted(async () => {
     initCharts()
   } catch (e) {
     if (isCanceled(e) || !scope.isActive()) return
-    console.error('Dashboard core load error:', e)
+    pageError.value = e.response?.data?.detail || e.message
     loading.value = false
     return
   }
@@ -165,6 +173,8 @@ onMounted(async () => {
     //   阈值的权威），故这里优先采用它的 decision_metrics；取不到才回退
     //   meta.json（例如模型刚重训、引擎尚未预热时）。
     const comparison = comparisonRes.data
+    modelMetricsLoading.value = false
+    modelMetricsError.value = comparison?.error || (!comparison ? '模型指标请求失败，请刷新重试。' : '')
     const dm = riskInfo.value?.decision_metrics
     if (comparison?.best_model && comparison.models?.length) {
       const best = comparison.models.find(m => m.model_name === comparison.best_model)
@@ -192,7 +202,9 @@ onMounted(async () => {
  * 等待某个 ref 对应的元素真正挂载且具有非零尺寸。
  *
  * ⚠ 这修的是「图表有概率画不出来」的竞态：
- *   图表容器写在 <template v-else> 里，由 v-if="loading" 控制。
+ *   图表容器写在 <div v-else-if="pageError" role="alert" class="glass-card p-6 text-red-700">工作台加载失败：{{ pageError }}。请刷新重试。</div>
+    <template v-else>
+      <p v-if="secondaryErrors.length" role="alert" class="text-red-700">部分区块加载失败：{{ secondaryErrors.join('；') }}</p> 里，由 v-if="loading" 控制。
  *   旧代码是 loading=false 后 `await nextTick()` 一次就 echarts.init()，
  *   但 Vue 的 DOM 补丁不保证一次 tick 就完成，且 ECharts 在尺寸为 0 的
  *   容器上初始化会得到一张空白画布（且不会自己恢复）。
@@ -414,13 +426,16 @@ function showOrderToast(msg) {
     </div>
 
     <template v-else>
+      <p v-if="modelWarning" class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+        {{ modelWarning }}
+      </p>
       <!-- Hero Summary -->
       <div class="hero-banner">
         <div class="hero-label">客户流失概览</div>
         <div class="hero-text">
           当前在管客户 <span class="hl-white">{{ overview?.total_customers?.toLocaleString() }}</span> 人，
           其中历史上已流失 <span class="hl-red">{{ overview?.churned_customers?.toLocaleString() }} 人</span>，
-          按此历史流失率折算年损失约 <span class="hl-red">¥{{ lossAmount }}万</span>（推算）。<br>
+          按当前样本与假设价值测算损失约 <span class="hl-red">¥{{ lossAmount }}万</span>（推算）。<br>
           <!-- ⚠ 这句话此前把两个不同口径的数字连在一起说，是误导：
                「高风险 28,926 人」是**分位数分级**(P95+P70)的结果；
                「预计可挽回 ¥8115万」却是按**决策线**(成本最优，覆盖率 6.83%，
@@ -431,26 +446,26 @@ function showOrderToast(msg) {
           <span class="hl-orange">{{ (riskDist.CRITICAL + riskDist.HIGH).toLocaleString() }} 人</span>；
           按成本最优决策线（挽留成功率 {{ successRatePct }}% 假设）实际应触达
           <span class="hl-orange">{{ flaggedCount.toLocaleString() }} 人</span>，
-          建议优先跟进其中期望价值最高的前
+          建议优先跟进其中风险资产评分最高的前
           <span class="hl-orange">{{ topCustomers.length }} 人</span>，
           期望可挽回 <span class="hl-green">¥{{ recoverable }}万</span>。
         </div>
         <div class="hero-grid">
           <div class="hero-card">
-            <div class="hero-card-label">年流失损失（历史口径推算）</div>
+            <div class="hero-card-label">样本损失测算（非利润）</div>
             <div class="hero-card-value hl-red">¥{{ lossAmount }}万</div>
             <div class="hero-card-sub">历史流失人数 × 平均客单价</div>
           </div>
           <div class="hero-card">
-            <!-- ⚠ 标签由「模型可挽回金额」改为「期望可挽回金额」：
+            <!-- ⚠ 标签由「模型可挽回金额」改为「情景可留存资产估计」：
                  该值已按挽留成功率折算（= TP × 成功率 × 客单价），
                  原标签让人以为这是"模型算出来一定能挽回的钱"。 -->
-            <div class="hero-card-label">期望可挽回金额</div>
+            <div class="hero-card-label">情景可留存资产估计</div>
             <div class="hero-card-value hl-green">¥{{ recoverable }}万</div>
             <!-- ROI 必须带上成功率与公式，否则读者无法判断它依赖哪些假设。
                  ROI = 成本比 × 精准率 × 挽留成功率，三项里有两项是假设值。 -->
             <div class="hero-card-sub">
-              ROI {{ roi }} 倍 = 成本比 5 × 精准率
+              投入产出比 {{ roi }} 倍 = 成本比 {{ riskInfo?.cost_ratio ?? '—' }} × 精准率
               {{ precisionPct }}% × 挽留成功率 {{ successRatePct }}%
             </div>
           </div>
@@ -466,7 +481,7 @@ function showOrderToast(msg) {
           </div>
           <div class="hero-card">
             <div class="hero-card-label">流失率</div>
-            <div class="hero-card-value" style="color:#a5b4fc">{{ churnRate }}%</div>
+            <div class="hero-card-value" style="color:#6d28d9">{{ churnRate }}%</div>
             <div class="hero-card-sub">{{ overview?.total_customers?.toLocaleString() }} 客户</div>
           </div>
         </div>
@@ -479,15 +494,14 @@ function showOrderToast(msg) {
              但该表初始内容是播种的演示记录（见下方说明），
              称"实测"会让人以为这是真实客户反馈。 -->
         <div class="retention-title">
-          挽留战报 <span class="badge">工单记录（含演示数据）</span>
+          挽留战报 <span class="badge">人工观察记录 · 已复核 {{ retention.verified_count || 0 }} 条</span>
           <InfoTip>
             <b class="tip-hd">口径说明</b>
-            以上来自 <code>work_orders</code> 表，其初始内容为<b>播种的演示工单</b>
-            （<code>seed_work_orders.py</code> 生成，处理结果取自硬编码比例表，
-            <b>非真实客户回访结果</b>），故成功率在接入真实反馈前不具备统计意义。
+            以上只统计来源明确的人工结案观察；演示记录和来源未明的历史记录排除。
+            已复核不代表证实干预因果效果；成功率仅描述已结案工单。
             <span class="tip-row">
-              本处「已执行 ROI」的分母只含<b>实际已建单完成</b>的工单；
-              上方「期望可挽回金额」旁的 ROI 分母是<b>模型决策线覆盖的全量人群</b>
+              本处「情景折算 ROI」的分母只含<b>实际已建单完成</b>的工单；
+              上方「情景可留存资产估计」旁的 ROI 分母是<b>模型决策线覆盖的全量人群</b>
               —— 两者分母相差数百倍，<b>不可直接比较</b>。
             </span>
           </InfoTip>
@@ -507,15 +521,15 @@ function showOrderToast(msg) {
           </div>
           <div class="retention-item">
             <div class="retention-num" style="color:#0f766e">¥{{ Math.round(retention.benefit / 10000) }}万</div>
-            <div class="retention-label">已执行挽回金额</div>
+            <div class="retention-label">情景留存资产折算（非实际收益）</div>
           </div>
           <div class="retention-item">
             <!-- ⚠ 改名：这是「已执行工单口径」的 ROI（分母 = 实际建单数），
                  与上方 hero-card 的推算 ROI（分母 = 决策线覆盖全量）不可比。
                  实测两者分母相差数百倍，并列显示会让人误以为"实际比预期好"。
-                 故此处明确写成「已执行 ROI」并加口径说明。 -->
+                 故此处明确写成「情景折算 ROI」并加口径说明。 -->
             <div class="retention-num">{{ retention.roi_executed }}x</div>
-            <div class="retention-label">已执行 ROI</div>
+            <div class="retention-label">情景折算 ROI</div>
           </div>
         </div>
       </div>
@@ -541,8 +555,8 @@ function showOrderToast(msg) {
         <div class="lg:col-span-7 glass-card p-5">
           <div class="section-title">
             <span>
-              优先干预 Top 10 <span class="badge">按期望价值排序</span>
-              <span class="info-tip" title="期望价值 = 流失概率 × 余额。高风险客户概率趋同，此时余额决定干预优先级。">ⓘ</span>
+              优先干预 Top 10 <span class="badge">按风险资产评分排序</span>
+              <span class="info-tip" title="风险资产评分 = 流失概率 × 余额。高风险客户概率趋同，此时余额决定干预优先级。">ⓘ</span>
             </span>
             <!-- ⚠ 「查看全部」指向客户名单页，而该页要求 insight:view。
                  客户专员（staff）也能看到本页（脱敏版），若留着这个链接，
@@ -572,7 +586,7 @@ function showOrderToast(msg) {
                   <th>风险</th>
                   <th v-if="!masked">流失概率</th>
                   <th v-if="!masked">余额</th>
-                  <th v-if="!masked">期望价值</th>
+                  <th v-if="!masked">风险资产评分</th>
                   <th v-if="!masked">风险因素</th>
                   <th v-if="!masked">操作</th>
                 </tr>
@@ -643,7 +657,7 @@ function showOrderToast(msg) {
             模型可信度
             <span v-if="modelMetrics" class="badge">{{ modelMetrics.model_name }}</span>
           </div>
-          <div class="text-xs mb-1" style="color:#7c8aa5">模型预测 vs 实际流失（测试集验证）</div>
+          <div class="text-xs mb-1" style="color:#5b6b83">模型预测 vs 实际流失（测试集验证）</div>
           <!-- 阈值口径必须显式标注：召回率/精确率完全取决于在哪条判定线上统计 -->
           <div v-if="metricBasis" class="metric-basis">口径：{{ metricBasis }}</div>
 
@@ -656,10 +670,11 @@ function showOrderToast(msg) {
               <div class="conf-val" style="color:#1d4ed8">{{ item.val.toFixed(1) }}%</div>
             </div>
           </template>
-          <div v-else class="text-xs py-4" style="color:#9aa7bd">模型指标不可用（尚未训练）</div>
+          <div v-else-if="modelMetricsLoading" role="status" class="text-xs py-4" style="color:#5b6b83">正在加载模型指标…</div>
+          <div v-else class="text-xs py-4" style="color:#5b6b83">{{ modelMetricsError || '暂无可用模型指标' }}</div>
 
           <div class="model-status">
-            <span v-if="modelMetrics" class="text-xs" style="color:#7c8aa5">
+            <span v-if="modelMetrics" class="text-xs" style="color:#5b6b83">
               AUC {{ modelMetrics.auc?.toFixed(4) }} · 5 折 CV {{ modelMetrics.cv_auc_mean?.toFixed(4) }} ± {{ modelMetrics.cv_auc_std?.toFixed(4) }}
               <InfoTip>
                 <b class="tip-hd">口径说明</b>
@@ -667,7 +682,7 @@ function showOrderToast(msg) {
                 属<b>推算值</b>而非预测。
               </InfoTip>
             </span>
-            <span v-else class="text-xs" style="color:#9aa7bd">暂无指标</span>
+            <span v-else class="text-xs" style="color:#5b6b83">{{ modelMetricsLoading ? '加载中…' : '暂无指标' }}</span>
           </div>
         </div>
       </div>
@@ -675,7 +690,7 @@ function showOrderToast(msg) {
   </div>
 
   <!-- 创建工单 Modal -->
-  <div v-if="orderModalOpen" class="modal-overlay" @click.self="orderModalOpen = false">
+  <Dialog :open="orderModalOpen" title="创建工单" @close="orderModalOpen = false">
     <div class="modal-card">
       <div class="modal-header">
         <h2>创建工单</h2>
@@ -781,7 +796,7 @@ function showOrderToast(msg) {
         <button class="modal-btn-submit" @click="submitOrder">确认创建</button>
       </div>
     </div>
-  </div>
+  </Dialog>
 
   <!-- Toast -->
   <div v-if="orderToast" class="dash-toast">{{ orderToast }}</div>
@@ -811,8 +826,8 @@ function showOrderToast(msg) {
   transition: .15s; white-space: nowrap;
 }
 .note-assist-btn:hover:not(:disabled) { background: #eef3fb; }
-.note-assist-btn:disabled { color: #9aa7bd; border-color: #e5e9f0; cursor: default; }
-.note-assist-hint { font-size: 11.5px; color: #7c8aa5; line-height: 1.7; margin: 0; }
+.note-assist-btn:disabled { color: #5b6b83; border-color: #e5e9f0; cursor: default; }
+.note-assist-hint { font-size: 11.5px; color: #5b6b83; line-height: 1.7; margin: 0; }
 .note-assist-err { color: #b45309; }
 /* 四档经济性判定色（非风险等级，故不复用 .risk-* 类名） */
 .v-worth    { color: #0f766e; }
@@ -840,9 +855,9 @@ function showOrderToast(msg) {
   background: #f8fafc; border: 1px solid #e5e9f0;
   border-radius: 8px; padding: 14px 16px;
 }
-.hero-card-label { font-size: 11px; color: #7c8aa5; margin-bottom: 6px; }
+.hero-card-label { font-size: 11px; color: #5b6b83; margin-bottom: 6px; }
 .hero-card-value { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; color: #17335c; }
-.hero-card-sub { font-size: 11px; color: #9aa7bd; margin-top: 2px; }
+.hero-card-sub { font-size: 11px; color: #5b6b83; margin-top: 2px; }
 
 /* 挽留战报横条 */
 .retention-strip {
@@ -855,7 +870,7 @@ function showOrderToast(msg) {
 .retention-items { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
 .retention-item { text-align: center; }
 .retention-num { font-size: 22px; font-weight: 700; color: #17335c; }
-.retention-label { font-size: 11px; color: #7c8aa5; margin-top: 3px; }
+.retention-label { font-size: 11px; color: #5b6b83; margin-top: 3px; }
 
 /* Section Title */
 .section-title {
@@ -867,7 +882,7 @@ function showOrderToast(msg) {
   background: #e8f0fe; color: #1d4ed8;
 }
 .info-tip {
-  font-size: 12px; color: #9aa7bd; cursor: help; margin-left: 4px;
+  font-size: 12px; color: #5b6b83; cursor: help; margin-left: 4px;
 }
 .view-all-link {
   font-size: 11px; color: #1d4ed8; text-decoration: none;
@@ -898,7 +913,7 @@ function showOrderToast(msg) {
 }
 .dash-error-link:hover { background: #e0ebfb; }
 .dash-empty {
-  padding: 24px 16px; text-align: center; font-size: 12.5px; color: #9aa7bd;
+  padding: 24px 16px; text-align: center; font-size: 12.5px; color: #5b6b83;
   border: 1px dashed #e5e9f0; border-radius: 10px;
   background: #f8fafc;
 }
@@ -918,13 +933,13 @@ function showOrderToast(msg) {
 .insight-title { font-size: 13px; color: #374151; font-weight: 600; margin-bottom: 2px; }
 .insight-body { flex: 1; }
 .insight-value { font-size: 20px; font-weight: 700; color: #17335c; margin-bottom: 2px; }
-.insight-sub { font-size: 11px; color: #7c8aa5; }
-.insight-desc { font-size: 11px; color: #9aa7bd; line-height: 1.5; }
+.insight-sub { font-size: 11px; color: #5b6b83; }
+.insight-desc { font-size: 11px; color: #5b6b83; line-height: 1.5; }
 
 /* Action Table */
 .action-table { width: 100%; border-collapse: collapse; }
 .action-table th {
-  text-align: left; padding: 8px 10px; font-size: 11px; color: #7c8aa5;
+  text-align: left; padding: 8px 10px; font-size: 11px; color: #5b6b83;
   font-weight: 600; border-bottom: 1px solid #e5e9f0;
 }
 .action-table td {
@@ -933,7 +948,7 @@ function showOrderToast(msg) {
 }
 .action-table tr:hover { background: #f8fafc; }
 .cust-name { color: #17335c; font-weight: 600; font-size: 13px; }
-.cust-id { color: #9aa7bd; font-size: 11px; }
+.cust-id { color: #5b6b83; font-size: 11px; }
 
 /* .risk-badge / .risk-* 已移至 style.css（全局）。 */
 
@@ -964,7 +979,7 @@ function showOrderToast(msg) {
 
 /* Model Confidence */
 .conf-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.conf-label { font-size: 12px; color: #7c8aa5; width: 120px; flex-shrink: 0; }
+.conf-label { font-size: 12px; color: #5b6b83; width: 120px; flex-shrink: 0; }
 /* 阈值口径标注 —— 召回率/精确率随判定线变化，必须让读者看到是哪条线 */
 .metric-basis {
   font-size: 11px; color: #1d4ed8; margin-bottom: 14px;
@@ -1009,7 +1024,7 @@ function showOrderToast(msg) {
 .modal-header h2 { font-size: 16px; font-weight: 700; color: #17335c; }
 .modal-close {
   width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9;
-  border: none; color: #7c8aa5; cursor: pointer; font-size: 14px; transition: .2s;
+  border: none; color: #5b6b83; cursor: pointer; font-size: 14px; transition: .2s;
 }
 .modal-close:hover { background: #e5e9f0; color: #374151; }
 .modal-body { padding: 20px 24px; }
@@ -1019,7 +1034,7 @@ function showOrderToast(msg) {
 }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form-group { display: flex; flex-direction: column; gap: 5px; }
-.form-group label { font-size: 12px; color: #7c8aa5; font-weight: 600; }
+.form-group label { font-size: 12px; color: #5b6b83; font-weight: 600; }
 .form-group input, .form-group select, .form-group textarea {
   background: #ffffff; border: 1px solid #d5dce8;
   border-radius: 8px; padding: 9px 12px; color: #1f2937; font-size: 13px;
@@ -1032,7 +1047,7 @@ function showOrderToast(msg) {
 .form-group textarea { resize: vertical; min-height: 60px; }
 .form-group select { cursor: pointer; }
 .form-group select option { background: #ffffff; color: #1f2937; }
-.form-group .readonly { background: #f8fafc; border-style: dashed; cursor: default; color: #7c8aa5; }
+.form-group .readonly { background: #f8fafc; border-style: dashed; cursor: default; color: #5b6b83; }
 .modal-btn-cancel {
   padding: 9px 20px; border-radius: 8px; border: 1px solid #d5dce8;
   background: #ffffff; color: #5b6b83; font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s;

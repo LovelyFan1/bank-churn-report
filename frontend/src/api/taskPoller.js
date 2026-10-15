@@ -65,7 +65,7 @@ export async function pollTask(taskId, options = {}) {
       //   （页面只是显示"尚未执行聚类"，像是没点按钮）。
       //   这里把 result.status === 'failed' 提升为真正的异常。
       const result = data.result
-      if (result && typeof result === 'object' && result.status === 'failed') {
+      if (result && typeof result === 'object' && ['failed', 'timeout'].includes(result.status)) {
         throw new Error(`任务失败: ${result.error || '未知错误'}`)
       }
       return result
@@ -85,10 +85,22 @@ export async function pollTask(taskId, options = {}) {
       onProgress(data.result)
     }
 
-    await sleep(interval)
+    await sleep(interval, signal)
   }
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const finish = () => { signal?.removeEventListener('abort', abort); resolve() }
+    const timer = setTimeout(finish, ms)
+    const abort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      const error = new Error('轮询已取消')
+      error.code = 'ERR_CANCELED'
+      reject(error)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) abort()
+  })
 }

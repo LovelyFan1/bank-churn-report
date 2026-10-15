@@ -67,9 +67,7 @@ const routes = [
     meta: { title: '工单管理', icon: 'work-orders' }
   },
   {
-    // 智能助手 —— 后端 /api/agent/* 上线前的占位页。
-    // 页面自带「即将上线」态，不做任何接口调用，
-    // 后端就绪后替换为真正的对话界面即可。
+    // 智能助手：读取数据、恢复服务端任务状态，并显式确认写操作。
     path: '/assistant',
     name: 'Assistant',
     component: () => import('../views/Assistant.vue'),

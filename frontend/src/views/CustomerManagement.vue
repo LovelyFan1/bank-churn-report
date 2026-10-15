@@ -6,12 +6,19 @@
       <p class="text-gray-400 text-sm mt-1">全量客户浏览 · 风险排序 · 一键创建干预工单</p>
     </div>
 
+    <p v-if="route.query.source === 'test_matrix'" class="text-sm text-slate-700 bg-blue-50 p-3 rounded-lg">
+      来源为模型测试集矩阵（原格 {{ route.query.source_count || '—' }} 位）。此页查询当前客户快照，
+      默认筛选未流失且无在途工单，可调整筛选；当前符合 {{ total }} 位，人数与历史测试格不同。
+      <span v-if="riskInfo?.model_version && route.query.source_model_version !== riskInfo.model_version">来源模型已变化，当前名单以本页响应为准。</span>
+    </p>
     <!-- Loading -->
     <div v-if="loading" class="flex items-center justify-center py-20">
       <div class="animate-spin rounded-full h-10 w-10 border-2 border-indigo-400 border-t-transparent"></div>
     </div>
 
-    <template v-else>
+<template v-else>
+      <p v-if="listError" role="alert" class="text-red-700">客户名单加载失败：{{ listError }} <button @click="fetchCustomers">重试</button></p>
+      <p v-if="listLoading" role="status">正在刷新客户名单…</p>
       <!-- Stats Cards -->
       <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div class="glass-card p-5">
@@ -38,14 +45,14 @@
 
       <!-- 风险分级标准 -->
       <!-- 口径说明：后端 risk_scoring 用的是**原始概率的分位数边界**（P95/P70/P35），
-           不是固定阈值、也没有做概率校准（树模型校准会失真，见 risk_scoring.py 顶部注释）。
+           不是固定阈值；当前评分未校准，不能当作经验证的真实概率。
            riskInfo.calibrated 只是「引擎已就绪」的标记，不代表概率经过校准。 -->
       <div v-if="riskInfo?.calibrated && riskInfo.thresholds" class="risk-banner">
         <span>🎯 风险分级口径：按概率分位数 P95 / P70 / P35 划四级（{{ riskInfo.model }} · 漏检/误报成本比 1:{{ riskInfo.cost_ratio }}）：</span>
-        <span class="risk-banner-item" style="color:#f87171">极高 ≥ {{ fmtPercent(riskInfo.thresholds.critical) }}</span>
-        <span class="risk-banner-item" style="color:#fb923c">高危 ≥ {{ fmtPercent(riskInfo.thresholds.high) }}</span>
-        <span class="risk-banner-item" style="color:#facc15">中等 ≥ {{ fmtPercent(riskInfo.thresholds.medium) }}</span>
-        <span class="risk-banner-item" style="color:#22d3ee">其余低风险</span>
+        <span class="risk-banner-item" :style="{ color: riskColor('CRITICAL') }">极高 ≥ {{ fmtPercent(riskInfo.thresholds.critical) }}</span>
+        <span class="risk-banner-item" :style="{ color: riskColor('HIGH') }">高危 ≥ {{ fmtPercent(riskInfo.thresholds.high) }}</span>
+        <span class="risk-banner-item" :style="{ color: riskColor('MEDIUM') }">中等 ≥ {{ fmtPercent(riskInfo.thresholds.medium) }}</span>
+        <span class="risk-banner-item" :style="{ color: riskColor('LOW') }">其余低风险</span>
       </div>
 
       <!-- Toolbar -->
@@ -84,7 +91,7 @@
         <button v-if="!masked" class="btn btn-outline btn-sm" @click="exportCsv">⬇ 导出</button>
         <span class="flex-1"></span>
         <select v-model="sortBy" class="select" @change="onFilter">
-          <option value="expected_value">按期望价值 ↓</option>
+          <option value="expected_value">按风险资产评分 ↓</option>
           <option value="probability">按流失概率 ↓</option>
           <option value="balance">按余额 ↓</option>
           <option value="age">按年龄 ↑</option>
@@ -171,7 +178,7 @@
               <td v-if="!masked" @click.stop>
                 <!-- 已建单的客户不可再选（后端也会 409 拒掉） -->
                 <input type="checkbox" :checked="selected.has(c.customer_id)"
-                       :disabled="c.has_active_order" @change="toggleRow(c.customer_id)" />
+                       :disabled="c.has_active_order || c.exited !== 0" @change="toggleRow(c.customer_id)" />
               </td>
               <td>
                 <!-- 脱敏：只显示序号，不显示姓名/编号/地区 -->
@@ -218,7 +225,8 @@
                 <span v-else class="text-gray-600">—</span>
               </td>
               <td v-if="!masked" class="text-right">
-                <button v-if="c.has_active_order" class="btn-disabled" disabled>已建单</button>
+                <button v-if="c.exited !== 0" class="btn-disabled" disabled>已流失</button>
+                <button v-else-if="c.has_active_order" class="btn-disabled" disabled>已建单</button>
                 <button v-else class="btn btn-primary btn-sm" @click.stop="openCreate(c)">＋ 创建工单</button>
               </td>
             </tr>
@@ -243,7 +251,7 @@
          高价值要上门），且负责人常需分别指派 —— 一套参数打天下
          必然出现"给零余额客户派了客户经理"这类错误。
     -->
-    <div v-if="dispatchOpen" class="modal-overlay" @click.self="dispatchOpen = false">
+    <Dialog :open="!!dispatchOpen" title="批量派单" :busy="batchRunning" @close="dispatchOpen = false">
       <div class="dispatch-card">
         <div class="modal-header">
           <h2>
@@ -311,7 +319,7 @@
                     @change="updateCurrent('assignee', $event.target.value)">
               <option value="" disabled>请选择负责人</option>
               <option v-for="a in assignees" :key="a.username" :value="a.username">
-                {{ a.display_name }}（{{ a.role_label }}·{{ a.department }}）
+                {{ a.display_name }}（{{ a.username }}·{{ a.department }}）
               </option>
             </select>
           </div>
@@ -365,10 +373,10 @@
           </button>
         </div>
       </div>
-    </div>
+    </Dialog>
 
     <!-- Modal -->
-    <div v-if="modalOpen" class="modal-overlay" @click.self="closeModal">
+    <Dialog :open="!!modalOpen" title="创建工单" :busy="submitting" @close="closeModal">
       <div class="modal">
         <div class="modal-header">
           <h2>创建工单 · {{ form.customer_id }}</h2>
@@ -445,7 +453,7 @@
               <select v-if="canAssign && assignees.length" v-model="form.assignee">
                 <option value="" disabled>请选择负责人</option>
                 <option v-for="a in assignees" :key="a.username" :value="a.username">
-                  {{ a.display_name }}（{{ a.role_label }}·{{ a.department }}）
+                  {{ a.display_name }}（{{ a.username }}·{{ a.department }}）
                 </option>
               </select>
               <input v-else :value="assigneeName(form.assignee)" readonly class="readonly"
@@ -492,10 +500,10 @@
         </div>
         <div class="modal-footer">
           <button class="btn btn-outline" @click="closeModal">取消</button>
-          <button class="btn btn-primary" @click="submitOrder">确认创建</button>
+          <p v-if="submitError" role="alert" class="text-red-700">{{ submitError }}</p><button class="btn btn-primary" :disabled="submitting || !form.customer_name || !form.assignee" @click="submitOrder">确认创建</button>
         </div>
       </div>
-    </div>
+    </Dialog>
 
     <!-- Toast -->
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
@@ -503,11 +511,12 @@
 </template>
 
 <script setup>
+import Dialog from '../components/Dialog.vue'
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
 import { useRequestScope } from '../api/useRequestScope'
-import { riskLabel, riskBadgeClass, probColor, fmtPercent, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
+import { riskLabel, riskColor, riskBadgeClass, probColor, fmtPercent, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
 import {
   assignees, canAssign, loadAssignees, defaultAssignee, assigneeName,
 } from '../utils/assignees'
@@ -525,6 +534,10 @@ const scope = useRequestScope()
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
+const listLoading = ref(false)
+const listError = ref('')
+const submitting = ref(false)
+const submitError = ref('')
 const customers = ref([])
 const summary = reactive({ total_customers: 0, high_risk: 0, exited: 0, active_orders: 0 })
 const modelUsed = ref('')
@@ -543,7 +556,8 @@ const router = useRouter()
 const currentTier = ref('')
 const searchText = ref('')
 const geoFilter = ref('')
-const exitedFilter = ref('')
+const exitedFilter = ref('0')
+const hasOrderFilter = ref('')
 // 默认按期望价值排序 —— 与 Dashboard「优先干预 Top10」、干预策略页矩阵同源。
 // 按纯概率排会把 44 个零余额客户排进首页（他们概率高但无可挽回资产）。
 const sortBy = ref('expected_value')
@@ -632,7 +646,7 @@ function verdictClass(v) {
   }[v] || ''
 }
 function avatarColor(name) {
-  const palette = ['#6366f1', '#8b5cf6', '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#14b8a6']
+  const palette = ['#4338ca', '#7e22ce', '#0369a1', '#047857', '#b45309', '#b91c1c', '#be185d', '#0f766e']
   let h = 0
   for (const ch of name || '') h = (h * 31 + ch.charCodeAt(0)) % 997
   return palette[h % palette.length]
@@ -733,7 +747,7 @@ const restCount = computed(() => {
 })
 
 
-const selectableRows = computed(() => customers.value.filter((c) => !c.has_active_order))
+const selectableRows = computed(() => customers.value.filter((c) => c.exited === 0 && !c.has_active_order))
 const allSelected = computed(
   () => selectableRows.value.length > 0
     && selectableRows.value.every((c) => selected.value.has(c.customer_id)),
@@ -965,10 +979,14 @@ function clearSelectionOnly() {
  */
 function syncUrl() {
   const q = {}
+  for (const key of ['source', 'source_model_version', 'source_count']) {
+    if (route.query[key]) q[key] = route.query[key]
+  }
   if (currentRisk.value !== 'all') q.risk_level = currentRisk.value
   if (currentTier.value) q.value_tier = currentTier.value
   if (geoFilter.value) q.geography = geoFilter.value
   if (exitedFilter.value !== '') q.exited = exitedFilter.value
+  if (hasOrderFilter.value !== '') q.has_order = hasOrderFilter.value
   if (searchText.value.trim()) q.search = searchText.value.trim()
   if (sortBy.value !== 'expected_value') q.sort_by = sortBy.value
   if (page.value > 1) q.page = String(page.value)
@@ -982,7 +1000,8 @@ function readUrl() {
   currentRisk.value = q.risk_level || 'all'
   currentTier.value = q.value_tier || ''
   geoFilter.value = q.geography || ''
-  exitedFilter.value = q.exited ?? ''
+  exitedFilter.value = q.exited ?? '0'
+  hasOrderFilter.value = q.has_order ?? ''
   searchText.value = q.search || ''
   sortBy.value = q.sort_by || 'expected_value'
   page.value = q.page ? parseInt(q.page, 10) || 1 : 1
@@ -997,6 +1016,7 @@ async function exportCsv() {
     if (currentTier.value) params.value_tier = currentTier.value
     if (geoFilter.value) params.geography = geoFilter.value
     if (exitedFilter.value !== '') params.exited = exitedFilter.value
+    if (hasOrderFilter.value !== '') params.has_order = hasOrderFilter.value
     if (searchText.value.trim()) params.search = searchText.value.trim()
     params.sort_by = sortBy.value
     params.sort_order = sortBy.value === 'age' ? 'asc' : 'desc'
@@ -1031,6 +1051,7 @@ let loadToken = 0
 
 async function fetchCustomers() {
   const token = ++loadToken
+  listLoading.value = true; listError.value = ''
   try {
     const params = { page: page.value, page_size: pageSize.value }
     if (currentRisk.value !== 'all') params.risk_level = currentRisk.value
@@ -1038,12 +1059,13 @@ async function fetchCustomers() {
     if (searchText.value.trim()) params.search = searchText.value.trim()
     if (geoFilter.value) params.geography = geoFilter.value
     if (exitedFilter.value !== '') params.exited = exitedFilter.value
+    if (hasOrderFilter.value !== '') params.has_order = hasOrderFilter.value
     params.sort_by = sortBy.value
     params.sort_order = sortBy.value === 'age' ? 'asc' : 'desc'
 
     const { data } = await scope.get('/customers', { params })
     // 过期响应直接丢弃：不写任何 state，否则会用旧筛选条件的结果覆盖新结果
-    if (token !== loadToken) return
+    if (token !== loadToken || !scope.isActive()) return
     customers.value = data.items || []
     total.value = data.total || 0
     totalPages.value = data.total_pages || 1
@@ -1053,10 +1075,10 @@ async function fetchCustomers() {
     maskNotice.value = data.mask_notice || ''
     if (data.summary) Object.assign(summary, data.summary)
   } catch (e) {
-    if (token !== loadToken) return   // 过期请求的报错同样不该弹给用户
+    if (token !== loadToken || !scope.isActive()) return   // 过期请求的报错同样不该弹给用户
     customers.value = []
-    showToast('加载失败: ' + (e.response?.data?.detail || e.message))
-  }
+    listError.value = e.response?.data?.detail || e.message
+  } finally { if (token === loadToken && scope.isActive()) listLoading.value = false }
 }
 
 function openCreate(c) {
@@ -1135,6 +1157,7 @@ async function regenerateNote() {
 }
 
 function closeModal() {
+  if (submitting.value) return
   modalOpen.value = false
   // 作废在途请求并清空生成态 —— 否则下次打开会先闪出上一客户的理由
   noteToken++
@@ -1144,6 +1167,8 @@ function closeModal() {
 }
 
 async function submitOrder() {
+  if (submitting.value) return
+  submitError.value = ''
   if (!form.customer_id || !form.customer_name) {
     showToast('请填写客户信息')
     return
@@ -1159,13 +1184,15 @@ async function submitOrder() {
     return
   }
   try {
+    submitting.value = true
     await api.post('/work-orders', { ...form })
     showToast('工单创建成功 · ' + form.customer_id + ' ' + form.customer_name)
+    submitting.value = false
     closeModal()
     fetchCustomers()
   } catch (e) {
-    showToast('创建失败: ' + (e.response?.data?.detail || e.message))
-  }
+    submitError.value = e.response?.data?.detail || e.message
+  } finally { submitting.value = false }
 }
 
 function showToast(msg) {
@@ -1235,8 +1262,8 @@ watch(() => route.query, () => {
   transition: .15s; white-space: nowrap;
 }
 .note-assist-btn:hover:not(:disabled) { background: #eef3fb; }
-.note-assist-btn:disabled { color: #9aa7bd; border-color: #e5e9f0; cursor: default; }
-.note-assist-hint { font-size: 11.5px; color: #7c8aa5; line-height: 1.6; margin: 0; }
+.note-assist-btn:disabled { color: #5b6b83; border-color: #e5e9f0; cursor: default; }
+.note-assist-hint { font-size: 11.5px; color: #5b6b83; line-height: 1.6; margin: 0; }
 .note-assist-err { color: #b45309; }
 .note-assist-link {
   background: none; border: none; padding: 0; cursor: pointer;
@@ -1259,7 +1286,7 @@ watch(() => route.query, () => {
 .tabs { display: flex; gap: 4px; background: #f1f5f9; padding: 4px; border-radius: 8px; }
 .tab {
   padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600;
-  color: #7c8aa5; cursor: pointer; transition: .15s; border: none; background: transparent;
+  color: #5b6b83; cursor: pointer; transition: .15s; border: none; background: transparent;
   white-space: nowrap;
 }
 .tab:hover { color: #1d4ed8; }
@@ -1269,7 +1296,7 @@ watch(() => route.query, () => {
 table { width: 100%; border-collapse: collapse; }
 thead th {
   text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 600;
-  color: #7c8aa5; text-transform: uppercase; letter-spacing: .5px;
+  color: #5b6b83; text-transform: uppercase; letter-spacing: .5px;
   border-bottom: 1px solid #e5e9f0; background: #f8fafc;
   white-space: nowrap;
 }
@@ -1311,7 +1338,7 @@ tbody tr:hover { background: #f8fafc; }
 
 /* ── 批量派单卡片 ───────────────────────────────────── */
 .dispatch-card {
-  width: 100%; max-width: 560px; max-height: 90vh; overflow-y: auto;
+  width: 100%; max-width: 560px; max-width: calc(100vw - 32px); max-height: 90vh; overflow-y: auto;
   background: #fff; border-radius: 14px;
   box-shadow: 0 18px 48px rgba(23, 51, 92, .18);
   display: flex; flex-direction: column;
@@ -1338,7 +1365,7 @@ tbody tr:hover { background: #f8fafc; }
 }
 .dispatch-cid {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px; color: #7c8aa5;
+  font-size: 12px; color: #5b6b83;
 }
 .dispatch-name { font-size: 14px; font-weight: 600; color: #17335c; }
 .dispatch-tag {
@@ -1348,13 +1375,13 @@ tbody tr:hover { background: #f8fafc; }
 .dispatch-cust-body {
   display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px;
 }
-.dispatch-cust-body .k { font-size: 11px; color: #9aa7bd; margin-right: 6px; }
+.dispatch-cust-body .k { font-size: 11px; color: #5b6b83; margin-right: 6px; }
 .dispatch-cust-body .v { font-size: 12.5px; color: #374151; font-weight: 500; }
 .dispatch-warn {
   margin-top: 10px; font-size: 11.5px; color: #b45309;
   background: #fdf6e3; padding: 6px 10px; border-radius: 6px;
 }
-.dispatch-hint { font-size: 11px; color: #9aa7bd; font-weight: 400; margin-left: 6px; }
+.dispatch-hint { font-size: 11px; color: #5b6b83; font-weight: 400; margin-left: 6px; }
 /* 已跳过的卡：视觉上"退到后面"，但仍完整可读（画像不丢） */
 .dispatch-cust.is-skipped { background: #f1f5f9; border-style: dashed; opacity: .78; }
 .dispatch-tag.skip { background: #f1f5f9; color: #64748b; }
@@ -1382,7 +1409,7 @@ tbody tr:hover { background: #f8fafc; }
 /* ── Mini tags ── */
 .tag-mini { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 11px; }
 .tag-active   { background: #e0f2f1; color: #0f766e; }
-.tag-inactive { background: #f1f5f9; color: #64748b; }
+.tag-inactive { background: #f1f5f9; color: #5b6b83; }
 .tag-order    { background: #e8f0fe; color: #1d4ed8; }
 
 /* ── Buttons ── */
@@ -1393,16 +1420,16 @@ tbody tr:hover { background: #f8fafc; }
 .btn-outline:hover { border-color: #a8bcd9; background: #f8fafc; }
 .btn-outline:disabled { opacity: .35; cursor: not-allowed; }
 .btn-sm { padding: 6px 14px; font-size: 12px; border-radius: 7px; }
-.btn-disabled { padding: 6px 14px; font-size: 12px; border-radius: 7px; background: #f1f5f9; color: #9aa7bd; cursor: not-allowed; border: none; }
+.btn-disabled { padding: 6px 14px; font-size: 12px; border-radius: 7px; background: #f1f5f9; color: #5b6b83; cursor: not-allowed; border: none; }
 
 /* ── Modal ── */
 .modal-overlay { position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn .2s ease; }
-.modal { background: #ffffff; border: 1px solid #e5e9f0; border-radius: 12px; width: 560px; max-height: 88vh; overflow-y: auto; animation: slideUp .25s ease; box-shadow: 0 20px 60px rgba(15,23,42,.18); }
+.modal { background: #ffffff; border: 1px solid #e5e9f0; border-radius: 12px; width: 560px; max-width: calc(100vw - 32px); max-height: 88vh; overflow-y: auto; animation: slideUp .25s ease; box-shadow: 0 20px 60px rgba(15,23,42,.18); }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 .modal-header { padding: 18px 24px; border-bottom: 1px solid #e5e9f0; display: flex; align-items: center; justify-content: space-between; }
 .modal-header h2 { font-size: 16px; font-weight: 700; color: #17335c; }
-.modal-close { width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9; border: none; color: #7c8aa5; cursor: pointer; font-size: 14px; transition: .2s; }
+.modal-close { width: 30px; height: 30px; border-radius: 8px; background: #f1f5f9; border: none; color: #5b6b83; cursor: pointer; font-size: 14px; transition: .2s; }
 .modal-close:hover { background: #e5e9f0; color: #374151; }
 .modal-body { padding: 20px 24px; }
 .modal-footer { padding: 14px 24px; border-top: 1px solid #e5e9f0; display: flex; justify-content: flex-end; gap: 10px; }
@@ -1411,7 +1438,7 @@ tbody tr:hover { background: #f8fafc; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form-group { display: flex; flex-direction: column; gap: 5px; }
 .form-group.full { grid-column: 1 / -1; }
-.form-group label { font-size: 12px; color: #7c8aa5; font-weight: 600; }
+.form-group label { font-size: 12px; color: #5b6b83; font-weight: 600; }
 .form-group input, .form-group select, .form-group textarea {
   background: #ffffff; border: 1px solid #d5dce8;
   border-radius: 8px; padding: 9px 12px; color: #1f2937; font-size: 13px;
@@ -1423,7 +1450,7 @@ tbody tr:hover { background: #f8fafc; }
 }
 .form-group textarea { resize: vertical; min-height: 60px; }
 .form-group select option { background: #ffffff; color: #1f2937; }
-.readonly { background: #f8fafc; border-style: dashed; cursor: default; color: #7c8aa5; }
+.readonly { background: #f8fafc; border-style: dashed; cursor: default; color: #5b6b83; }
 
 /* ── Toast ── */
 .toast {

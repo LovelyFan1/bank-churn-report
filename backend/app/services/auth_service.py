@@ -15,7 +15,7 @@ review 过（见 requirements.txt 里 LangGraph 那段的说明）—— 认证�
     AD/LDAP 为身份源，HR 驱动生命周期  本地 users 表 + 播种脚本
     UKey / 数字证书（国密 SM2）        TOTP 动态口令（同为密码技术）
     CAS / OIDC 单点登录               自签 JWT
-    集中会话管理、单点登出             无状态 JWT + 前端超时
+    集中会话管理、单点登出             JWT + 数据库共享会话/撤销 + 前端提示
 
 这是**刻意简化**：真 4A 是几十人年工程（含 CA 采购、目录服务、UKey 发放），
 比赛环境无法落地。结构对齐、合规点可演示，是本项目的目标。
@@ -145,15 +145,8 @@ def totp_uri(secret_b32: str, username: str) -> str:
 # JWT（HS256）—— 会话票据
 # ══════════════════════════════════════════════════════════
 #
-# ⚠ 为什么用 JWT 而不是服务端 session：
-#   生产是 `uvicorn --workers 4`。服务端 session 存进程内存会有和
-#   Agent 上下文同样的问题（4 个 worker 各自为政）；存 Redis 则引入
-#   新的有状态依赖。JWT 自包含且无状态，多 worker 天然一致。
-#
-# ⚠ JWT 的**已知代价**（不隐瞒）：签发后无法单方吊销，只能等过期。
-#   真银行用短有效期 + 集中会话管理解决。本项目有效期取得较短
-#   （见 settings.AUTH_TOKEN_TTL_MINUTES），并在审计里留痕，
-#   但**没有**实现吊销列表 —— 这是简化，答辩时应如实说明。
+# JWT负责签名和绝对有效期；auth_sessions/用户认证版本/撤销表负责
+# 闲置、改密和登出失效。共享数据库是权威来源，不缓存跨请求的有效性。
 
 def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
@@ -295,9 +288,91 @@ def decode_token(token: str) -> dict:
         payload = json.loads(_b64u_dec(seg.split(".", 1)[1]))
     except Exception:
         raise TokenError("令牌内容无法解析")
-    if int(payload.get("exp", 0)) < int(time.time()):
+    if int(payload.get("exp", 0)) <= time.time():
         raise TokenError("令牌已过期，请重新登录")
     return payload
+
+
+def make_session_token(db, user) -> str:
+    """签发并登记正式会话；登录路由将会话与审计一起提交。"""
+    from app.models.user import AuthSession
+    token = make_token({"sub": user.username, "role": user.role, "scope": "full",
+                        "name": user.display_name or "", "auth_version": user.auth_version or 0})
+    payload = decode_token(token)
+    ts = time.time()
+    db.query(AuthSession).filter(AuthSession.expires_at <= ts).delete(synchronize_session=False)
+    db.add(AuthSession(jti=payload["jti"], user_id=user.id,
+                       auth_version=payload["auth_version"], issued_at=payload["iat"],
+                       expires_at=payload["exp"], last_activity_at=ts))
+    return token
+
+
+def validate_session(db, payload: dict):
+    """中间件与依赖共用，所有读取均不延长会话。"""
+    from fastapi import HTTPException
+    from app.models.user import AuthSession, RevokedToken, User
+    if payload.get("scope") != "full":
+        raise HTTPException(401, "令牌不可用于该操作，请完成登录")
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(401, "令牌缺少用户标识")
+    user = db.query(User).filter(User.username == username).populate_existing().first()
+    if user is None:
+        raise HTTPException(401, "用户不存在，请重新登录")
+    if not user.is_active:
+        raise HTTPException(403, "账号已停用，请联系管理员")
+    jti = payload.get("jti") or ""
+    if db.get(RevokedToken, jti):
+        raise HTTPException(401, "令牌已登出，请重新登录")
+    session = db.get(AuthSession, jti)
+    version = user.auth_version or 0
+    if session is None or session.user_id != user.id:
+        raise HTTPException(401, "会话不存在或已失效，请重新登录")
+    if payload.get("auth_version") != version or session.auth_version != version:
+        raise HTTPException(401, "口令已修改，请重新登录")
+    ts = time.time()
+    if session.expires_at <= ts:
+        raise HTTPException(401, "令牌已过期，请重新登录")
+    if session.last_activity_at + settings.AUTH_IDLE_MINUTES * 60 <= ts:
+        raise HTTPException(401, "会话闲置超时，请重新登录")
+    return user
+
+
+def session_policy(db, payload: dict | None = None) -> dict:
+    """前端使用服务端策略与剩余时间，刷新页面不能重新开始完整倒计时。"""
+    import math
+    from app.models.user import AuthSession
+    idle = settings.AUTH_IDLE_MINUTES * 60
+    remaining = idle
+    if payload:
+        session = db.get(AuthSession, payload.get("jti") or "")
+        if session:
+            remaining = max(0, math.ceil(min(session.last_activity_at + idle,
+                                             session.expires_at) - time.time()))
+    return {"idle_timeout": idle, "idle_remaining": remaining}
+
+
+def record_activity(db, payload: dict) -> dict:
+    """只由实际用户操作触发；原子条件更新不能复活过期/撤销/改密会话。"""
+    from fastapi import HTTPException
+    from sqlalchemy import case, exists
+    from app.models.user import AuthSession, RevokedToken, User
+    user = validate_session(db, payload)
+    ts = time.time()
+    count = db.query(AuthSession).filter(
+        AuthSession.jti == payload["jti"], AuthSession.user_id == user.id,
+        AuthSession.auth_version == payload["auth_version"],
+        AuthSession.expires_at > ts,
+        AuthSession.last_activity_at > ts - settings.AUTH_IDLE_MINUTES * 60,
+        ~exists().where(RevokedToken.jti == AuthSession.jti),
+        exists().where(User.id == AuthSession.user_id, User.is_active == 1,
+                       User.auth_version == AuthSession.auth_version),
+    ).update({"last_activity_at": case((AuthSession.last_activity_at < ts, ts),
+                                      else_=AuthSession.last_activity_at)}, synchronize_session=False)
+    if count != 1:
+        raise HTTPException(401, "会话已失效，请重新登录")
+    db.expire_all()
+    return session_policy(db, payload)
 
 
 # ══════════════════════════════════════════════════════════

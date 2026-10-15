@@ -13,13 +13,18 @@
 """
 
 import logging
+import json
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
-from app.agent import guard_rules, llm
+from app.agent import guard_rules, llm, order_safety
+from app.agent import context as ctx_mod
+SESSION_TTL_SECONDS = 3600
 from app.database import get_db
 from app.models.user import User
 from app.services import auth_deps
@@ -34,20 +39,11 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=800,
                           description="用户的自然语言问题")
     session_id: str = Field(default="default", max_length=64,
-                            description="会话标识（MVP 未持久化，仅回显）")
-    # 会话上下文（短期记忆）——由**前端回传**，见下。
-    #
-    # ⚠ 为什么是前端回传而不是服务端保存：
-    #   生产用 `uvicorn --workers 4`，若放进程内存则 4 个 worker 各自为政，
-    #   追问会随机命中"没有记忆"的那个，表现为"有时记得有时不记得"——
-    #   最难排查的一类故障。回传方式让后端保持**无状态**，多 worker 天然一致。
-    #
-    # ⚠ 它是**不可信输入**（用户能改 localStorage），故 graph 侧会逐字段
-    #   校验（见 context.normalize），且编号还要过输出侧白名单。
-    #
-    # ⚠ 类型刻意用 Any 而不是 dict：若声明为 dict，Pydantic 会在进 graph
-    #   之前就抛 422，**整轮对话直接挂掉** —— 而上下文坏了不该让用户
-    #   问不了问题。用 Any 把校验权交给 context.normalize。
+                            description="按登录用户隔离的服务端会话标识")
+    session_version: int | None = Field(default=None, ge=0)
+    # 数据库保存按用户隔离的权威任务状态，跨worker共享版本和短期租约。
+    # 仅首次兼容旧前端实体指针；客户端数值不作为事实证据。
+    # Any允许normalize裁剪损坏的旧上下文，避免兼容输入使整轮对话422。
     context: Any = Field(default=None,
                          description="上一轮返回的会话上下文，原样回传")
 
@@ -61,6 +57,8 @@ async def agent_health():
     """
     ok, reason = llm.is_available()
     return {
+        "session_policy": {"context_ttl_seconds": SESSION_TTL_SECONDS,
+                           "confirmation_ttl_seconds": 600, "batch_limit": 20, "query_limit": 50},
         "available": ok,
         "reason": reason,
         "model": llm.settings.AGENT_LLM_MODEL if ok else None,
@@ -97,7 +95,8 @@ async def agent_capabilities():
         #   拦截逻辑本身不受影响：guard_rules 仍在调用模型前拦下这三类问题。
         "blocked": guard_rules.known_topics(),
         "basis_meaning": {
-            "llm_verified": "模型作答，且其中每个数字都已通过溯源校验",
+            "llm_verified": "卡片来自系统数据，模型解读通过数值核对，语义仍需复核",
+            "system_data": "服务端依据会话任务执行的确定性查询",
             "llm_partial_dropped": "模型解读含无法溯源的数字，已丢弃该段；数据卡片不受影响",
             "system_meta": "系统信息类问题，由确定性模板回答（不经过模型）",
             "no_data": "模型未查询任何系统数据即作答，未经数据核对",
@@ -109,7 +108,7 @@ async def agent_capabilities():
 
 
 @router.post("/ask")
-async def agent_ask(body: AskRequest, request: Request,
+def agent_ask(body: AskRequest, request: Request,
                     user: User = Depends(
                         auth_deps.require_perm(auth.PERM_AGENT_USE)),
                     db: Session = Depends(get_db)):
@@ -121,9 +120,8 @@ async def agent_ask(body: AskRequest, request: Request,
       verify_failed   被丢弃的、无法溯源的数字（非空说明模型编过数字）
       context         更新后的会话上下文 —— 前端存下，下一轮原样回传
 
-    ⚠ `context` 是**短期记忆的全部载体**：只存编号等指针，不存对话原文、
-      也不存工具原始结果。故追问次数不限、每轮成本恒定（约 100 token），
-      且指针不会"记错"。详见 app/agent/context.py。
+    context返回有限实体指针与名单游标。服务端状态默认一小时有效，
+    已展示名单最多50位、累计排除最多500位；不保存无限对话原文。
     """
     ok, reason = llm.is_available()
     if not ok:
@@ -139,21 +137,212 @@ async def agent_ask(body: AskRequest, request: Request,
     if not q:
         raise HTTPException(status_code=422, detail="问题不能为空")
 
+    ctx, version = _start_session(db, user, body)
+    result = {}
+    completed = False
+    explicit = ctx_mod.explicit_ids(q)
+    if len(explicit) == 1:
+        # 即使查无工单，也不能让下一句“该工单”回到更早的其他客户。
+        ctx["focus_customer_id"] = explicit[0].upper()
+        ctx["orders"] = [o for o in ctx["orders"]
+                         if o.get("customer_id") == ctx["focus_customer_id"]]
     try:
-        result = graph_mod.run(q, session_id=body.session_id,
-                               context=body.context)
+        op = order_safety.operation(q)
+        if op:
+            if not auth.has_perm(user.role or "", auth.PERM_ORDER_WRITE):
+                raise HTTPException(403, "无工单写入权限")
+            order = order_safety.resolve(db, user, q, ctx, cancel=op == "cancel")
+            pending = order_safety.proposal(order, delete=op == "delete")
+            result = _pending_reply(pending, ctx)
+        else:
+            result = graph_mod.run(q, session_id=body.session_id,
+                                   context=ctx)
+        pending = result.get("pending_action")
+        if pending:
+            action = pending.get("action")
+            kind = ("create" if action in ("create_work_order", "create_work_order_batch")
+                    else "delete" if action == "delete_work_order"
+                    else "cancel" if (pending.get("payload") or {}).get("status") == "cancelled" else "update")
+            ids = ([it.get("customer_id") for it in pending.get("items", [])]
+                   if action == "create_work_order_batch" else (pending.get("payload") or {}).get("customer_id"))
+            error = guard_rules.write_action_error(q, kind, ids)
+            if error:
+                raise ValueError(error)
+        if pending and pending.get("action") == "create_work_order_batch":
+            plan = pending
+            pending = _prepare_create(db, user,
+                [it["customer_id"] for it in pending.get("items", [])],
+                (pending.get("items") or [{}])[0].get("assignee", ""))
+            pending["failed"] += plan.get("failed") or []
+            for key in ("requested_customer_ids", "remaining_customer_ids", "batch_limit"):
+                if key in plan:
+                    pending[key] = plan[key]
+            if not pending["items"] and not pending.get("remaining_customer_ids"):
+                raise ValueError("；".join(it["reason"] for it in pending["failed"]))
+            result = _pending_reply(pending, ctx)
+        if pending and pending.get("action") in (*order_safety.ORDER_ACTIONS, "create_work_order"):
+            if not auth.has_perm(user.role or "", auth.PERM_ORDER_WRITE):
+                raise HTTPException(403, "无工单写入权限")
+            if pending["action"] in order_safety.ORDER_ACTIONS:
+                p = pending["payload"]
+                if pending["action"] == "delete_work_order" and op != "delete":
+                    raise ValueError("永久删除必须明确提出；取消工单只会改为已取消并保留记录。")
+                if p.get("status") == "cancelled" and op != "cancel":
+                    raise ValueError("请明确指定要取消的客户或工单。")
+                order = order_safety.resolve(db, user, q, ctx,
+                                             cancel=p.get("status") == "cancelled")
+                if order.id != p.get("order_id"):
+                    raise ValueError("模型提出的工单与当前目标不一致，已拦截，请指定工单编号重新操作。")
+                p["customer_id"] = order.customer_id
+            order_safety.issue(db, user, pending)
+            result = _pending_reply(pending, ctx)
+        completed = True
+    except ValueError as e:
+        result = {"text": str(e), "answer": {"kind": "text", "headline": str(e),
+                  "entities": [], "facts": [], "actions": [], "insights": [], "text": str(e)},
+                  "basis": "system_meta", "pending_action": None,
+                   "context": ctx, "citations": [], "tool_calls": []}
+        completed = True
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("agent: 执行失败")
         raise HTTPException(
             status_code=500,
-            detail=f"智能体执行失败：{type(e).__name__}: {e}",
+            detail=f"智能体执行失败：{type(e).__name__}: {e}" if llm.settings.DEBUG
+                   else "智能体执行失败，请稍后重试或联系管理员。",
         )
+    finally:
+        db.rollback()
+        session = db.get(order_safety.AgentSession, (user.username, body.session_id))
+        if session:
+            if completed:
+                session.context = json.dumps(result.get("context") or ctx, ensure_ascii=False)
+                session.version += 1
+                version = session.version
+            session.busy_until = 0
+            session.expires_at = time.time() + SESSION_TTL_SECONDS
+            db.commit()
 
     return {
         "question": q,
         "session_id": body.session_id,
+        "session_version": version,
         **result,
     }
+
+
+def _start_session(db, user, body):
+    model = order_safety.AgentSession
+    now = time.time()
+    row = db.get(model, (user.username, body.session_id))
+    if row is None:
+        row = model(username=user.username, session_id=body.session_id, context="{}",
+                    version=0, expires_at=now + SESSION_TTL_SECONDS, busy_until=0)
+        db.add(row)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(409, "会话正在初始化，请稍后重试")
+    expired = row.expires_at <= now
+    if not expired and body.session_version is not None and body.session_version != row.version:
+        raise HTTPException(409, "会话已在其他窗口更新，请刷新会话后重试")
+    ctx = ctx_mod.normalize(json.loads(row.context)) if not expired else ctx_mod.empty()
+    if row.version == 0:
+        # 兼容旧前端的实体指针；客户端数值与筛选任务不作为可信事实。
+        ctx = ctx_mod.normalize(body.context)
+        ctx.pop("list_query", None)
+        for c in ctx["customers"]:
+            c["prob"], c["balance"] = None, None
+    version = row.version
+    claimed = db.query(model).filter(model.username == user.username,
+        model.session_id == body.session_id, model.version == version,
+        model.busy_until <= now).update({"busy_until": now + 180}, synchronize_session=False)
+    if claimed != 1:
+        db.rollback()
+        raise HTTPException(409, "当前会话正在处理上一条请求，请等待完成")
+    db.query(model).filter(model.expires_at < now, model.busy_until <= now).delete(synchronize_session=False)
+    db.commit()
+    return ctx, version
+
+
+def _pending_reply(pending, context):
+    from app.agent.graph import node_verify
+    out = node_verify({"pending_action": pending, "tool_results": []})
+    return {"answer": out["answer"], "text": out["final"],
+            "basis": out["answer_basis"], "pending_action": pending,
+            "context": ctx_mod.merge(ctx_mod.normalize(context), ctx_mod.extract([], pending)),
+            "citations": [], "tool_calls": [], "verify_failed": []}
+
+
+@router.get("/session/{session_id}")
+def read_session(session_id: str,
+                 user: User = Depends(auth_deps.require_perm(auth.PERM_AGENT_USE)),
+                 db: Session = Depends(get_db)):
+    row = db.get(order_safety.AgentSession, (user.username, session_id))
+    if row is None or row.expires_at <= time.time():
+        return {"context": ctx_mod.empty(), "session_version": 0, "expired": True,
+                "context_ttl_seconds": SESSION_TTL_SECONDS, "expires_at": None}
+    return {"context": json.loads(row.context), "session_version": row.version, "expired": False,
+            "context_ttl_seconds": SESSION_TTL_SECONDS, "expires_at": row.expires_at}
+
+
+class RevokeRequest(BaseModel):
+    confirmation_tokens: list[str] = Field(default_factory=list, max_length=1000)
+
+
+def _revoke_tokens(db, user, tokens):
+    import hashlib
+    hashes = [hashlib.sha256(token.encode()).hexdigest() for token in tokens]
+    if hashes:
+        db.query(order_safety.PendingAgentAction).filter(
+            order_safety.PendingAgentAction.username == user.username,
+            order_safety.PendingAgentAction.token_hash.in_(hashes)).update(
+                {"consumed": 1}, synchronize_session=False)
+
+
+@router.post("/retract")
+def retract_action(body: RevokeRequest,
+                   user: User = Depends(auth_deps.require_perm(auth.PERM_AGENT_USE)),
+                   db: Session = Depends(get_db)):
+    _revoke_tokens(db, user, body.confirmation_tokens)
+    db.commit()
+    return {"retracted": True}
+
+
+@router.post("/session/{session_id}/clear")
+def clear_session(session_id: str, body: RevokeRequest,
+                  user: User = Depends(auth_deps.require_perm(auth.PERM_AGENT_USE)),
+                  db: Session = Depends(get_db)):
+    row = db.get(order_safety.AgentSession, (user.username, session_id))
+    if row and row.busy_until > time.time():
+        raise HTTPException(409, "会话请求尚在处理，完成后再清空")
+    if row:
+        row.context = "{}"
+        row.version += 1
+        row.expires_at = 0
+    _revoke_tokens(db, user, body.confirmation_tokens)
+    db.commit()
+    return {"cleared": True}
+
+
+class PrepareCancelRequest(BaseModel):
+    order_id: int = Field(gt=0)
+    customer_id: str = Field(pattern=r"^C\d{4,}$")
+
+
+@router.post("/prepare-order-cancel")
+async def prepare_order_cancel(body: PrepareCancelRequest,
+                               user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
+                               db: Session = Depends(get_db)):
+    """列表选择的单子也必须先准备并展示快照，再由用户确认。"""
+    try:
+        order = order_safety.resolve(db, user, f"取消 {body.customer_id} 工单 #{body.order_id}",
+                                     None, cancel=True)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return order_safety.issue(db, user, order_safety.proposal(order))
 
 
 @router.post("/confirm")
@@ -171,7 +360,8 @@ async def agent_confirm(payload: dict, request: Request,
       此前 `session_id` 硬编码为 'ui'，Agent 建的工单**追不到是谁让建的**；
       现在每次写操作都留审计（4A 的 Audit 环节）。
 
-    当前支持 action=create_work_order。
+    单条建单/改单/删除都须使用 /ask 返回的十分钟一次性确认凭据。
+    凭据占用、业务写入与审计在同一事务内提交；取消是 cancelled 状态而非删除。
     """
     from app.database import SessionLocal
     from app.routers.work_orders import (
@@ -189,6 +379,8 @@ async def agent_confirm(payload: dict, request: Request,
 
     db = SessionLocal()
     try:
+        action, body = order_safety.claim(db, user, payload)
+        db.info["agent_transaction"] = True
         if action == "create_work_order":
             # ── 负责人兜底：Agent 抽出的人未必有效 ──────────────
             #
@@ -236,9 +428,10 @@ async def agent_confirm(payload: dict, request: Request,
                 db, user=user, action="update_work_order",
                 target=f"#{oid}",
                 detail={"order_id": oid, "fields": sorted(fields.keys()),
+                        "customer_id": updated.get("customer_id"), "status": updated.get("status"),
                         "via": "agent"},
                 source="agent", ip=auth_deps._client_ip(request),
-                message=f"通过智能助手修改工单 #{oid}")
+                message=f"通过智能助手{'取消（保留记录）' if updated.get('status') == 'cancelled' else '修改'}工单 #{oid}")
             db.commit()
             return {"created": False, "action": action, "order": updated}
 
@@ -264,6 +457,7 @@ async def agent_confirm(payload: dict, request: Request,
                 "order_id": oid, "deleted_order": before}
 
     except HTTPException as e:
+        db.rollback()
         # 失败也要留痕 —— 审计要能回答"谁尝试过什么但没成功"
         try:
             auth_deps.write_audit(
@@ -278,161 +472,71 @@ async def agent_confirm(payload: dict, request: Request,
             db.rollback()
         raise
     except (TypeError, ValueError) as e:
+        db.rollback()
         raise HTTPException(status_code=422, detail=f"参数错误：{e}")
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500,
                             detail=f"操作失败：{type(e).__name__}: {e}")
     finally:
         db.close()
 
 
+class PrepareCreateRequest(BaseModel):
+    customer_ids: list[str] = Field(min_length=1, max_length=20)
+    assignee: str = Field(default="", max_length=64)
+
+
+def _prepare_create(db, user, ids, assignee=""):
+    if not auth.has_perm(user.role or "", auth.PERM_ORDER_WRITE):
+        raise HTTPException(403, "无工单写入权限")
+    from app.services.customer_service import get_retention_customer
+    from app.services import note_service
+    items, failed = [], []
+    for cid in dict.fromkeys(c.strip().upper() for c in ids):
+        try:
+            d = get_retention_customer(db, cid)
+            note = note_service.build_reason(prob=d["probability"], balance=d["balance"],
+                risk_level=d["risk_level"], value_tier=d["value_tier"],
+                risk_factors=d.get("risk_factors", []), expected_value=d["expected_value"],
+                action=d.get("action"), channel=d.get("channel"))["note"]
+            proposal = {"action": "create_work_order", "payload": {
+                "customer_id": cid, "assignee": assignee, "note": note}}
+            order_safety.issue(db, user, proposal)
+            items.append({**proposal["payload"], "confirmation_token": proposal["confirmation_token"]})
+        except HTTPException as e:
+            db.rollback()
+            failed.append({"customer_id": cid, "reason": str(e.detail)})
+    return {"action": "create_work_order_batch", "items": items, "failed": failed,
+            "summary": f"为 {len(items)} 位客户准备挽留工单", "requires_confirmation": True}
+
+
+@router.post("/prepare-create")
+def prepare_create(body: PrepareCreateRequest,
+                   user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
+                   db: Session = Depends(get_db)):
+    return _prepare_create(db, user, body.customer_ids, body.assignee)
+
+
 class BatchConfirmRequest(BaseModel):
-    customer_ids: list[str] = Field(min_length=1, max_length=20,
-                                    description="要建单的客户编号列表")
-    assignee: str = Field(default="", max_length=64,
-                          description="统一负责人，留空则不指派")
+    proposals: list[dict] = Field(min_length=1, max_length=20)
 
 
 @router.post("/confirm-batch")
 async def agent_confirm_batch(body: BatchConfirmRequest, request: Request,
-                              user: User = Depends(
-                                  auth_deps.require_perm(auth.PERM_ORDER_WRITE))):
-    """批量确认建单 —— 方案 A（弹确认面板后一次性提交）。
-
-    ⚠ 为什么需要独立端点而不是前端循环调 /confirm：
-      1) **部分失败要能被结构化汇报**。实测（diag112）三人里可能有一人
-         已有进行中工单 → 409。前端若自己循环，就得自己拼错误信息，
-         容易出现"两条成功一条失败但提示含糊"。
-      2) **互斥检查要在服务端统一做**。这里先查一遍
-         /work-orders/active-customers，把已有工单的人**提前标出**，
-         而不是等 409 再回头解释。
-      3) 失败**不中断**后续 —— 一条失败不应让其余全部回滚，
-         否则用户要重来一遍。
-
-    返回：
-      ok            成功建单的客户编号
-      failed        失败列表 [{customer_id, reason}]
-      skipped       因已有进行中工单而跳过的客户编号
-      created       新建工单的摘要（id / customer_id / assignee）
-    """
-    from app.database import SessionLocal
-    from app.routers.work_orders import create_work_order
-    from app.schemas.work_order import WorkOrderCreate
-    from app.services.customer_service import get_customer_detail
-
-    ids = [c.strip() for c in body.customer_ids if c and c.strip()]
-    if not ids:
-        raise HTTPException(status_code=422, detail="customer_ids 不能为空")
-
-    # 去重但保序 —— 用户可能重复勾选
-    seen = set()
-    uniq = [c for c in ids if not (c in seen or seen.add(c))]
-
-    db = SessionLocal()
-    ok_list: list[dict] = []
-    failed: list[dict] = []
-    skipped: list[str] = []
-
-    try:
-        # 预先查一次"已有进行中工单"的客户，提前归类
-        from app.models.work_order import WorkOrder
-        active = {
-            r[0] for r in db.query(WorkOrder.customer_id)
-            .filter(WorkOrder.status.in_(["pending", "in_progress"])).all()
-        }
-
-        for cid in uniq:
-            if cid in active:
-                skipped.append(cid)
-                continue
-
-            detail = get_customer_detail(db, cid)
-            if detail is None:
-                failed.append({"customer_id": cid, "reason": "客户不存在或模型未训练"})
-                continue
-
-            # 组装建单体 —— 与 propose_create_work_order 工具同源字段，
-            # 保证 Agent 建的工单与页面建的完全一致
-            suggested = ""
-            try:
-                from app.services import note_service
-                suggested = note_service.build_reason(
-                    prob=detail.get("probability", 0.0),
-                    balance=detail.get("balance", 0.0),
-                    risk_level=detail.get("risk_level", "MEDIUM"),
-                    value_tier=detail.get("value_tier", "LOW"),
-                    risk_factors=detail.get("risk_factors", []),
-                    expected_value=detail.get("expected_value"),
-                    action=detail.get("action") or detail.get("strategy"),
-                    channel=detail.get("channel"),
-                )["note"]
-            except Exception:
-                pass   # 理由生成失败不阻断建单，note 留空即可
-
-            payload = {
-                "customer_id": detail.get("customer_id"),
-                "customer_name": detail.get("surname"),
-                "geography": detail.get("geography"),
-                "risk_level": detail.get("risk_level"),
-                "probability": detail.get("probability"),
-                "balance": detail.get("balance"),
-                "risk_factors": detail.get("risk_factors") or [],
-                "strategy": detail.get("action") or detail.get("strategy") or "",
-                # ⚠ 与单建路径同一兜底：用户没指定负责人时默认派给**发起人**。
-                #   不这样做的后果（实测逻辑推演）：assignee="" 会被
-                #   create_work_order 的必填校验拒掉，整批全部失败 ——
-                #   而用户在对话里只说"帮这几个人建单"是很自然的表达。
-                "assignee": (body.assignee or "").strip() or user.username,
-                "note": suggested,
-                "channel": detail.get("channel"),
-                "value_tier_snapshot": detail.get("value_tier"),
-                "expected_value_snapshot": detail.get("expected_value"),
-            }
-            try:
-                # ⚠ 必须与 create_work_order 的签名一致（body, request, user, db）。
-                #   漏掉 request/user 时 Python **导入阶段不报错**，
-                #   只在真正调用时抛 TypeError —— 表现为 Agent 批量建单整条崩掉，
-                #   而静态检查与模块导入都看不出问题（本缺陷即由签名一致性
-                #   检查脚本发现，非人工阅读）。
-                created = await create_work_order(
-                    WorkOrderCreate(**payload), request, user=user, db=db)
-                ok_list.append({
-                    "id": created.get("id"),
-                    "customer_id": created.get("customer_id"),
-                    "customer_name": created.get("customer_name"),
-                    "assignee": created.get("assignee"),
-                })
-                # 立刻加入 active，防止同一批里重复建（理论上已去重，双保险）
-                active.add(cid)
-            except HTTPException as e:
-                failed.append({"customer_id": cid, "reason": str(e.detail)})
-            except Exception as e:
-                failed.append({"customer_id": cid,
-                               "reason": f"{type(e).__name__}: {e}"})
-
-        return {
-            "requested": len(uniq),
-            "succeeded": len(ok_list),
-            "failed_count": len(failed),
-            "skipped_count": len(skipped),
-            "created": ok_list,
-            "failed": failed,
-            "skipped": skipped,
-        }
-    finally:
-        # ── 批量操作审计（无论成败都留痕）────────────────────
-        # 放在 finally 里：即使中途抛异常，"谁尝试批量建过单"也必须可查。
+                             user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE))):
+    """逐项消费已审阅的一次性凭据；失败单独汇报，不重建未批准的快照。"""
+    created, failed = [], []
+    for proposal in body.proposals:
+        if proposal.get("action") != "create_work_order":
+            raise HTTPException(422, "批量建单只接受 create_work_order 提议")
+    for proposal in body.proposals:
+        cid = (proposal.get("payload") or {}).get("customer_id")
         try:
-            auth_deps.write_audit(
-                db, user=user, action="create_work_order_batch",
-                target=f"{len(ok_list)}/{len(uniq)}",
-                detail={"requested": uniq, "succeeded": [o["customer_id"] for o in ok_list],
-                        "failed": failed, "skipped": skipped, "via": "agent"},
-                source="agent", success=not failed and bool(ok_list),
-                message=(f"通过智能助手批量建单：成功 {len(ok_list)}、"
-                         f"失败 {len(failed)}、跳过 {len(skipped)}"),
-                ip=auth_deps._client_ip(request))
-            db.commit()
-        except Exception:
-            db.rollback()
-        db.close()
+            result = await agent_confirm(proposal, request, user=user)
+            created.append(result["order"])
+        except HTTPException as e:
+            failed.append({"customer_id": cid, "reason": str(e.detail)})
+    return {"requested": len(body.proposals), "succeeded": len(created),
+            "failed_count": len(failed), "skipped_count": 0,
+            "created": created, "failed": failed, "skipped": []}

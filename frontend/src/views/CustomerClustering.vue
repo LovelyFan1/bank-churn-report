@@ -1,7 +1,11 @@
 <script setup>
+import Dialog from '../components/Dialog.vue'
 import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick, computed } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '../utils/charts'
 import api from '../api'
+import { useAuthStore } from '../stores/auth'
+const auth = useAuthStore()
+const canTrain = computed(() => auth.can('model:train'))
 import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
 
@@ -32,7 +36,7 @@ const clusterMsg = ref('')
 // 「重新聚类」的二次确认弹窗（覆盖全量标签，见 askRecluster 的说明）
 const clusterConfirm = ref(false)
 
-const COLORS = ['#6366f1', '#ef4444', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899']
+const COLORS = ['#4338ca', '#b91c1c', '#15803d', '#b45309', '#7e22ce', '#0e7490', '#be185d']
 
 const totalCustomers = computed(() => profiles.value?.clusters?.reduce((s, c) => s + c.count, 0) || 0)
 const avgChurn = computed(() => {
@@ -359,11 +363,11 @@ async function initCompare(profilesData) {
     xAxis: {
       type: 'category', data: names,
       axisLine: { lineStyle: { color: '#d5dce8' } },
-      axisLabel: { color: '#7c8aa5', ...categoryLabelStyle(el, names.length) },
+      axisLabel: { color: '#5b6b83', ...categoryLabelStyle(el, names.length) },
     },
     yAxis: [
       { type: 'value', name: '金额(万)', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#9ca3af', formatter: v => (v/10000).toFixed(0) } },
-      { type: 'value', name: '数量/%', splitLine: { show: false }, axisLabel: { color: '#7c8aa5' } },
+      { type: 'value', name: '数量/%', splitLine: { show: false }, axisLabel: { color: '#5b6b83' } },
     ],
     series: [
       {
@@ -410,7 +414,7 @@ async function initChurnDist(profilesData) {
         ...categoryLabelStyle(el, clusters.length),
       },
     },
-    yAxis: { type: 'value', name: '人数', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
+    yAxis: { type: 'value', name: '人数', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
     series: [
       {
         type: 'bar', barWidth: 36,
@@ -461,11 +465,11 @@ async function initRadar(profilesData) {
 
   chart.setOption({
     tooltip: { backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-    legend: { bottom: 0, textStyle: { color: '#7c8aa5' }, data: clusters.map(c => c.name || `聚类 ${c.cluster_id}`) },
+    legend: { bottom: 0, textStyle: { color: '#5b6b83' }, data: clusters.map(c => c.name || `聚类 ${c.cluster_id}`) },
     radar: {
       indicator: features.map(f => ({ name: f.label, max: 100, min: 0 })),
-      shape: 'polygon', splitNumber: 4, radius: '65%',
-      axisName: { color: '#9ca3af', fontSize: 11 },
+      shape: 'polygon', splitNumber: 5, radius: '65%',
+      axisName: { color: '#5b6b83', fontSize: 11 },
       splitLine: { lineStyle: { color: '#eef1f6' } },
       splitArea: { areaStyle: { color: ['rgba(29,78,216,0.02)', 'rgba(29,78,216,0.04)'] } },
       axisLine: { lineStyle: { color: 'rgba(75,85,99,0.3)' } }
@@ -520,11 +524,12 @@ function onColorByChange(val) {
  *   给无损失的操作加确认只是仪式感 —— 与"批量建单不加确认"同一判断。
  */
 function askRecluster() {
-  if (loading.value) return
+  if (loading.value || !canTrain.value) return
   clusterConfirm.value = true
 }
 
 async function runClustering() {
+  if (!canTrain.value || loading.value) return
   clusterConfirm.value = false
   loading.value = true
   clusterMsg.value = '正在提交聚类任务…'
@@ -629,9 +634,9 @@ onBeforeUnmount(() => {
       </div>
       <div class="flex items-center gap-3">
         <label class="text-sm text-gray-400">K值:</label>
-        <input v-model.number="k" type="number" min="2" max="10"
+        <input v-model.number="k" :disabled="!canTrain || loading" type="number" min="2" max="10"
                class="w-16 px-3 py-2 rounded-lg bg-white border border-[#d5dce8] text-[#1f2937] text-sm focus:border-[#1d4ed8] focus:outline-none" />
-        <button @click="askRecluster" :disabled="loading"
+        <button @click="askRecluster" :disabled="loading || !canTrain"
                 class="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors"
                 style="background: #1d4ed8;">
           {{ loading ? '计算中...' : '重新聚类' }}
@@ -639,14 +644,15 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <p v-if="!canTrain" class="text-sm text-slate-700 mb-3">已有结果可查看；生成或更新聚类需系统管理员权限。</p>
     <!-- 重新聚类二次确认 —— 会覆盖全部客户的分群标签 -->
-    <div v-if="clusterConfirm" class="cc-overlay" @click.self="clusterConfirm = false">
+    <Dialog :open="!!clusterConfirm" title="重新聚类" :danger="true" @close="clusterConfirm = false">
       <div class="cc-confirm">
         <h3>重新聚类？</h3>
         <div class="cc-confirm-body">
           <p>将以 K = <b>{{ k }}</b> 重新执行 K-Means，并写入数据库。</p>
           <p class="cc-warn">
-            ⚠ 这会<b>覆盖全部客户的现有分群标签</b>（96,418 人）。
+            ⚠ 这会<b>覆盖全部客户的现有分群标签</b>（{{ totalCustomers || '全量客户' }}）。
             客群画像、3D 散点图与"客群洞察"页的分组都随之改变。
           </p>
           <p class="cc-dim">任务为异步执行，耗时数十秒；期间请勿反复提交。</p>
@@ -656,13 +662,13 @@ onBeforeUnmount(() => {
           <button class="btn btn-primary" @click="runClustering">确认重新聚类</button>
         </div>
       </div>
-    </div>
+    </Dialog>
 
     <div v-if="loading" class="flex flex-col items-center justify-center h-64 gap-3">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
       <!-- 显示 Celery 返回的进度文案（此前进度回调被丢弃，用户只看到转圈，
            不知道是在加载数据、聚类、还是写库） -->
-      <p v-if="clusterMsg" class="text-sm text-[#7c8aa5]">{{ clusterMsg }}</p>
+      <p v-if="clusterMsg" class="text-sm text-[#5b6b83]">{{ clusterMsg }}</p>
     </div>
 
     <!-- 加载失败：明确列出原因 + 重试，不留「结构在、内容空」的哑页面 -->
@@ -672,7 +678,7 @@ onBeforeUnmount(() => {
       <ul class="text-sm text-[#c81e1e] mb-5 space-y-1">
         <li v-for="(e, i) in errors" :key="i">{{ e }}</li>
       </ul>
-      <p class="text-xs text-[#7c8aa5] mb-5 max-w-lg mx-auto">
+      <p class="text-xs text-[#5b6b83] mb-5 max-w-lg mx-auto">
         该页需要一次性读取全量客户数据（约 3 秒）。若网络不稳定导致连接中断，
         可点击下方重试；后端已启用进程级缓存，重试会快得多。
       </p>
@@ -694,7 +700,7 @@ onBeforeUnmount(() => {
       </p>
       <!-- ⚠ 这里是**首次生成**（库里还没有标签），不存在覆盖，
            故刻意不加二次确认（见 askRecluster 的说明） -->
-      <button @click="runClustering" :disabled="loading"
+      <button @click="runClustering" :disabled="loading || !canTrain"
               class="px-6 py-3 rounded-lg text-sm font-medium text-white transition-colors"
               style="background: #1d4ed8;">
         {{ loading ? '计算中...' : '开始聚类分析' }}
@@ -751,10 +757,10 @@ onBeforeUnmount(() => {
         <div class="glass-card p-5 lg:col-span-2">
           <div class="flex items-center justify-between mb-3">
             <div>
-              <h3 class="text-sm font-medium text-[#7c8aa5]">
+              <h3 class="text-sm font-medium text-[#5b6b83]">
                 {{ scatterMethod === 'tsne' ? 't-SNE 降维散点图' : 'PCA 降维散点图' }}
               </h3>
-              <p class="text-xs text-[#9aa7bd] mt-1">
+              <p class="text-xs text-[#5b6b83] mt-1">
                 <template v-if="scatterMeta && scatterMeta.total_points > scatterMeta.plotted_points">
                   {{ scatterMeta.plotted_points.toLocaleString() }} 客户（从 {{ scatterMeta.total_points.toLocaleString() }} 中分层抽样）
                 </template>
@@ -773,12 +779,12 @@ onBeforeUnmount(() => {
             <div class="flex gap-2">
               <button @click="onColorByChange('cluster')"
                       class="text-xs px-3 py-1 rounded-lg transition-colors"
-                      :class="scatterColorBy === 'cluster' ? 'bg-[#e8f0fe] text-[#1d4ed8]' : 'bg-[#f1f5f9] text-[#7c8aa5] hover:text-[#374151]'">
+                      :class="scatterColorBy === 'cluster' ? 'bg-[#e8f0fe] text-[#1d4ed8]' : 'bg-[#f1f5f9] text-[#5b6b83] hover:text-[#374151]'">
                 按聚类
               </button>
               <button @click="onColorByChange('churn')"
                       class="text-xs px-3 py-1 rounded-lg transition-colors"
-                      :class="scatterColorBy === 'churn' ? 'bg-[#fde8e8] text-[#c81e1e]' : 'bg-[#f1f5f9] text-[#7c8aa5] hover:text-[#374151]'">
+                      :class="scatterColorBy === 'churn' ? 'bg-[#fde8e8] text-[#c81e1e]' : 'bg-[#f1f5f9] text-[#5b6b83] hover:text-[#374151]'">
                 按流失
               </button>
             </div>
@@ -788,10 +794,10 @@ onBeforeUnmount(() => {
 
         <!-- Cluster Stats Table -->
         <div class="glass-card p-5 overflow-auto">
-          <h3 class="text-sm font-medium text-[#7c8aa5] mb-3">聚类统计</h3>
+          <h3 class="text-sm font-medium text-[#5b6b83] mb-3">聚类统计</h3>
           <table v-if="profiles?.clusters" class="w-full text-xs">
             <thead>
-              <tr class="text-[#7c8aa5] border-b border-[#e5e9f0]">
+              <tr class="text-[#5b6b83] border-b border-[#e5e9f0]">
                 <th class="text-left py-2">分群</th>
                 <th class="text-right py-2">人数</th>
                 <th class="text-right py-2">流失率</th>
@@ -830,11 +836,11 @@ onBeforeUnmount(() => {
       <!-- Comparison Charts Row -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="glass-card p-5">
-          <h3 class="text-sm font-medium text-[#7c8aa5] mb-4">客群指标对比（余额 vs 薪资 vs 流失率）</h3>
+          <h3 class="text-sm font-medium text-[#5b6b83] mb-4">客群指标对比（余额 vs 薪资 vs 流失率）</h3>
           <div ref="compareChart" class="w-full h-[300px]"></div>
         </div>
         <div class="glass-card p-5">
-          <h3 class="text-sm font-medium text-[#7c8aa5] mb-4">各簇人数与流失率分布</h3>
+          <h3 class="text-sm font-medium text-[#5b6b83] mb-4">各簇人数与流失率分布</h3>
           <div ref="churnChart" class="w-full h-[300px]"></div>
         </div>
       </div>
@@ -842,14 +848,14 @@ onBeforeUnmount(() => {
       <!-- Radar + Table Row -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="glass-card p-5">
-          <h3 class="text-sm font-medium text-[#7c8aa5] mb-4">客群特征雷达图</h3>
+          <h3 class="text-sm font-medium text-[#5b6b83] mb-4">客群特征雷达图</h3>
           <div ref="radarChart" class="w-full h-[320px]"></div>
         </div>
         <div class="glass-card p-5 overflow-auto">
-          <h3 class="text-sm font-medium text-[#7c8aa5] mb-4">客群画像</h3>
+          <h3 class="text-sm font-medium text-[#5b6b83] mb-4">客群画像</h3>
           <table v-if="profiles?.clusters" class="w-full text-sm">
             <thead>
-              <tr class="text-[#7c8aa5] border-b border-[#e5e9f0]">
+              <tr class="text-[#5b6b83] border-b border-[#e5e9f0]">
                 <th class="text-left py-2 px-2">分群</th>
                 <th class="text-right py-2 px-2">人数</th>
                 <th class="text-right py-2 px-2">流失率</th>
@@ -922,7 +928,7 @@ onBeforeUnmount(() => {
   border-radius: 8px; padding: 9px 11px;
   color: #92400e !important; font-size: 12.5px !important;
 }
-.cc-dim { color: #9aa7bd !important; font-size: 12px !important; }
+.cc-dim { color: #5b6b83 !important; font-size: 12px !important; }
 .cc-confirm-foot {
   display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;
 }

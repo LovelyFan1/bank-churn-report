@@ -23,7 +23,7 @@
 
     · 无 RAG 检索节点 —— 语料检索二期加
     · 无 interrupt() 图内中断 —— 写操作用"返回待确认 + 前端按钮"实现
-    · 无 checkpointer —— 会话不持久化
+    · 图不使用 checkpointer；Router 在共享数据库持久化有限任务状态
     · 无流式
 
 这些将来都是**加节点**，不是重构图 —— 这是先用图的意义。
@@ -32,6 +32,7 @@
 import json
 import logging
 import re
+import time
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
@@ -39,6 +40,7 @@ from langgraph.graph import END, StateGraph
 from app.agent import (answer_builder, context as ctx_mod, guard_rules, llm,
                        tools, verify as verify_mod)
 from app.agent.state import AgentState, initial_state
+from app.agent import list_queries, quantities
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -67,7 +69,7 @@ _WRITER_SYSTEM = """你是银行客户流失预警系统的分析助手。
 下面会给你**工具刚刚返回的真实数据**。请输出两样东西：
 
 1. `headline`：一句话结论，不超过 25 字，直接给答案。
-   例：「挽回价值最高的 3 位客户」「当前决策阈值 0.6」。
+   例：「风险资产评分最高的 3 位客户」「当前决策阈值 0.6」。
 
 2. `insights`：0~3 条短句解读，**每条不超过 40 字**。
    只写你在数据里**真实看到的**对比或规律。
@@ -82,11 +84,12 @@ _WRITER_SYSTEM = """你是银行客户流失预警系统的分析助手。
 3. **不要输出表格、不要输出 Markdown 标记**（# * | ` 等）——
    客户卡片、指标明细、按钮都由系统用结构化组件渲染。
 4. **不要在 insights 里重复卡片上已经显示的数值**。卡片已经用
-   「22.0 万」「97.6%」这样的格式展示了每个客户的期望挽回、概率、余额，
+   「22.0 万」「97.6%」这样的格式展示了每个客户的风险资产评分、概率、余额，
    你再写一遍 `220080.25` 既冗余又难读。要写就写**对比与原因**，
    需要指代某个客户时用姓名，不要用数字。
-   反例（差）：「Bentley 期望挽回 220080.25 居首」
-   正例（好）：「Bentley 期望挽回居首，但已有在途工单」
+   反例（差）：「Bentley 风险资产评分 220080.25 居首」
+   正例（好）：「Bentley 风险资产评分居首，但已有在途工单」
+   风险资产评分是概率乘余额，不能说成实际挽回金额或利润；情景测算必须说明假设。
 5. **枚举值必须译成中文**：CRITICAL→极高、HIGH→高危、MEDIUM→中等、
    LOW→低风险；价值层 HIGH→高价值、LOW→中低价值、ZERO→零余额。
    不要在中文句子里夹带 CRITICAL/HIGH 这类英文。
@@ -203,6 +206,8 @@ def node_agent(state: AgentState) -> dict:
     ⚠ 会话上下文也走同一条路：**只注入一份指针清单**（编号 + 极简标签），
       不注入历史原文、不注入工具原始结果。见 agent/context.py。
     """
+    if time.monotonic() >= state.get("deadline", float("inf")):
+        return {"messages": [AIMessage(content="查询达到时间预算，请缩小范围后重试。") ]}
     model = llm.router_llm().bind_tools(_tool_schemas())
 
     msgs: list = [SystemMessage(content=_DECISION_SYSTEM)]
@@ -259,7 +264,14 @@ def node_agent(state: AgentState) -> dict:
     #   ⚠ 必须限定在上下文集内（而不是全库搜索），否则"这三位"可能
     #     被解析成任意客户 —— 那是越权，也会让用户莫名其妙。
     if write_intent and not cids:
-        ctx_customers = (state.get("context_in") or {}).get("customers") or []
+        incoming = state.get("context_in") or {}
+        ctx_customers = [{"id": cid} for cid in incoming.get("displayed_customer_ids", [])]
+        ctx_customers = ctx_customers or incoming.get("customers") or []
+        position = quantities.ordinal(state.get("question") or "")
+        if position is not None:
+            if position > len(ctx_customers):
+                raise ValueError("序号不在当前展示名单中，请重新查询或指定编号")
+            ctx_customers = [ctx_customers[position - 1]]
         for c in ctx_customers:
             cid = c.get("id")
             if cid:
@@ -350,12 +362,14 @@ def node_force_write(state: AgentState) -> dict:
     """强制调用写工具的中转节点（取消/改单场景）。
 
     决定用哪个写工具：
-      pending / in_progress 工单 + 取消意图 → propose_delete_work_order
+      取消 → propose_update_work_order(status=cancelled)，明确删除 → 删除工具
 
     ⚠ 也带防重入：置 `force_write_tool` 后，route_after_tools 里
       用 `state.get("force_write_tool")` 判据避免再次进入。
     """
-    return {"force_write_tool": "propose_delete_work_order"}
+    from app.agent.order_safety import operation
+    return {"force_write_tool": "propose_delete_work_order" if operation(
+        state.get("question") or "") == "delete" else "propose_update_work_order"}
 
 
 # 哪些工具的参数是"客户编号"，需要走输出侧白名单
@@ -391,6 +405,15 @@ def _scope_error(state: AgentState, name: str, args: dict,
     question = state.get("question") or ""
     merged = list(state.get("tool_results") or []) + list(results_so_far or [])
 
+    if name in tools.WRITE_TOOL_NAMES:
+        action = ("create" if name in ("propose_create_work_order", "propose_create_work_orders_batch")
+                  else "delete" if name == "propose_delete_work_order"
+                  else "cancel" if args.get("status") == "cancelled" else "update")
+        error = guard_rules.write_action_error(question, action,
+            args.get("customer_ids") or args.get("customer_id"))
+        if error:
+            return error
+
     if name in _CID_TOOLS:
         # ⚠ 两种参数名都要处理：单数工具用 customer_id，
         #   批量工具用 customer_ids（列表）。
@@ -404,6 +427,18 @@ def _scope_error(state: AgentState, name: str, args: dict,
 
         cand = raw if isinstance(raw, list) else [raw]
         allowed = ctx_mod.allowed_customer_ids(ctx, question, merged)
+        explicit_cids = ctx_mod.explicit_ids(question)
+        if explicit_cids:
+            allowed = {cid.upper() for cid in explicit_cids}
+        else:
+            position = quantities.ordinal(question)
+            if position is not None:
+                displayed = (ctx or {}).get('displayed_customer_ids') or []
+                if not displayed:
+                    return "序号不在当前展示名单中，请重新查询或指定编号"
+                if position > len(displayed):
+                    return "序号不在当前展示名单中，请重新查询或指定编号"
+                allowed = {displayed[position - 1].upper()}
         bad = [str(c).upper() for c in cand
                if c and str(c).upper() not in allowed]
         if bad:
@@ -411,6 +446,17 @@ def _scope_error(state: AgentState, name: str, args: dict,
             return ctx_mod.out_of_scope_msg(bad[0], allowed)
 
     elif name in _OID_TOOLS:
+        from app.agent.order_safety import target, operation
+        try:
+            cid, explicit_oid = target(question, ctx)
+        except ValueError as e:
+            return str(e)
+        if name == "propose_delete_work_order" and operation(question) != "delete":
+            return "取消不等于删除。只有用户明确要求永久删除时才能使用删除工具。"
+        if args.get("status") == "cancelled" and operation(question) != "cancel":
+            return "用户没有明确提出取消，请先澄清。"
+        if cid and str(args.get("customer_id") or "").upper() != cid:
+            return f"目标客户是 {cid}，请按该 customer_id 精确查询工单，不得操作其他客户。"
         oid = args.get("order_id")
         if oid is None:
             return None
@@ -418,6 +464,10 @@ def _scope_error(state: AgentState, name: str, args: dict,
             oid = int(oid)
         except (TypeError, ValueError):
             return None            # 类型错误交给工具报错，信息更准确
+        if explicit_oid and oid != explicit_oid:
+            return f"用户指定了工单 #{explicit_oid}，不能替换成 #{oid}。"
+        if explicit_oid == oid:
+            return None  # 工具仍须查询真实详情并校验 customer_id
         allowed_o = ctx_mod.allowed_order_ids(ctx, merged)
         if oid not in allowed_o:
             logger.warning("agent: 工单号越界拦截 %s oid=%s", name, oid)
@@ -459,8 +509,33 @@ def node_tools(state: AgentState) -> dict:
     seen_this_round: dict[str, dict] = {}
 
     for tc in last.tool_calls:
+        if time.monotonic() >= state.get("deadline", float("inf")):
+            break
         name = tc["name"]
-        args = tc.get("args") or {}
+        args = dict(tc.get("args") or {})
+        if name == "list_customers":
+            q = state.get("question", "")
+            previous = (state.get("context_in") or {}).get("list_query")
+            if previous and list_queries.FOLLOWUP.search(q):
+                args, _ = list_queries.continuation(previous, q, args)
+            args.update(list_queries.requested_changes(q))
+            size = quantities.quantity(q)
+            if size is not None:
+                args["limit"] = size
+            args.setdefault("exited", 0)
+            args.setdefault("has_order", False)
+            if any(w in q for w in ("未流失", "尚未流失", "没有流失")):
+                args["exited"] = 0
+            if any(w in q for w in ("没有进行中工单", "没有在途工单", "未建单", "没有工单")):
+                args["has_order"] = False
+            if "值得" in q and any(w in q for w in ("人工", "挽留", "投入")):
+                args["worth_only"] = True
+        if name == "list_work_orders":
+            cids = ctx_mod.explicit_ids(state.get("question") or "")
+            focus = (state.get("context_in") or {}).get("focus_customer_id")
+            referring = any(w in (state.get("question") or "") for w in ("他", "她", "该", "这个", "这位"))
+            if len(cids) == 1 or (not cids and focus and referring):
+                args["customer_id"] = cids[0].upper() if cids else focus
         dedup_key = f"{name}::{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
 
         if dedup_key in seen_this_round:
@@ -640,6 +715,8 @@ def node_synthesis(state: AgentState) -> dict:
             f"再次强调：每个数字都必须来自上面的 JSON。"
         )),
     ]
+    if time.monotonic() >= state.get("deadline", float("inf")):
+        return {"draft": "", "headline": "", "insights": []}
     resp = llm.writer_llm().invoke(msgs)
     headline, insights = _parse_writer_output(resp.content)
     return {"draft": resp.content, "headline": headline, "insights": insights}
@@ -744,7 +821,7 @@ def node_verify(state: AgentState) -> dict:
             # 工单类操作：卡片主标识是 order_id，不是客户
             oid = p.get("order_id")
             st_cn = {"pending": "待处理", "in_progress": "处理中",
-                     "completed": "已完成", "lost": "已流失"}
+                     "completed": "已完成", "lost": "已流失", "cancelled": "已取消"}
             headline = pa.get("summary") or "待确认操作"
             entities = [{
                 "customer_id": cur.get("customer_id"),
@@ -765,16 +842,26 @@ def node_verify(state: AgentState) -> dict:
                 "worthiness": {"verdict": None, "net_text": None, "label": None},
             }]
             facts = [{"label": "操作", "value":
-                      "取消（删除）工单" if action == "delete_work_order" else "修改工单"}]
+                      "永久删除工单" if action == "delete_work_order" else
+                      "取消工单（保留记录）" if p.get("status") == "cancelled" else "修改工单"}]
             if action == "delete_work_order":
                 facts.append({"label": "可恢复", "value": "否 —— 删除不可逆"})
+        elif action == "create_work_order_batch":
+            rows = [{**it, "surname": it.get("customer_name"),
+                     "expected_value": it.get("expected_value_snapshot"),
+                     "value_tier": it.get("value_tier_snapshot"), "exited": 0}
+                    for it in pa.get("items", [])]
+            headline = pa.get("summary") or f"为 {len(rows)} 位客户准备工单"
+            entities = answer_builder._from_customer_list({"items": rows}, "", []) ["entities"]
+            facts = [{"label": "负责人", "value":
+                      (pa.get("items") or [{}])[0].get("assignee") or "未指定"}]
         else:
             headline = pa.get("summary") or "待确认操作"
             entities = [{
                 "customer_id": p.get("customer_id"),
                 "surname": p.get("customer_name"),
                 "primary": {
-                    "label": "期望挽回",
+                    "label": "风险资产评分",
                     "value_text": yuan(p.get("expected_value_snapshot")),
                     "value_wan": wan(p.get("expected_value_snapshot")),
                     "raw": p.get("expected_value_snapshot"),
@@ -818,14 +905,14 @@ def node_verify(state: AgentState) -> dict:
                 "citations": _citations(state)}
 
     # 只校验 LLM 写的文字
-    llm_text = " ".join(
-        [state.get("headline") or ""] + list(state.get("insights") or [])
+    llm_text = "\n".join(
+        [state.get("headline") or "", state.get("direct_answer") or ""] + list(state.get("insights") or [])
     )
     ok, orphans = verify_mod.verify(
-        llm_text, tool_results,
+        llm_text, tool_results, question=state.get("question") or "",
         # 上下文里的数字也算合法出处 —— 否则多轮追问引用上一轮数据
         # 会被误判为幻觉，徽章集体退化。详见 verify.verify 的说明。
-        extra_sources=ctx_mod.numbers(state.get("context_in")),
+        extra_sources=None,
     )
 
     headline = state.get("headline") or ""
@@ -866,7 +953,7 @@ def node_verify(state: AgentState) -> dict:
         logger.warning("agent: 零工具调用即作答，标记 no_data q=%s",
                        state.get("question", "")[:40])
         direct = (state.get("direct_answer") or "").strip()
-        if direct:
+        if direct and ok:
             # ── 模型没查数据，但它的话本身就是完整答案 ──────────────
             # 场景：寒暄 / 问身份 / 问能力 / 常识。见 node_synthesis 的说明。
             #
@@ -903,7 +990,7 @@ def node_verify(state: AgentState) -> dict:
         return {
             "verify_passed": ok,
             "verify_fail": orphans,
-            "final": state.get("draft", ""),
+            "final": answer_builder.to_text(ans),
             "answer": ans,
             "answer_basis": "no_data",
             "citations": [],
@@ -913,10 +1000,15 @@ def node_verify(state: AgentState) -> dict:
         tool_results, state["question"],
         llm_headline=headline, llm_insights=insights,
     )
+    if not ok:
+        warning = dict(ans.get("warning") or {})
+        warning["level"] = "warn"
+        warning["text"] = "；".join(filter(None, (warning.get("text"), verify_mod.explain(orphans))))
+        ans["warning"] = warning
     return {
         "verify_passed": ok,
         "verify_fail": orphans,
-        "final": state.get("draft", ""),
+        "final": answer_builder.to_text(ans),
         "answer": ans,
         "answer_basis": ("llm_verified" if ok else "llm_partial_dropped"),
         "citations": _citations(state),
@@ -936,7 +1028,7 @@ def node_fallback(state: AgentState) -> dict:
     note = verify_mod.explain(state.get("verify_fail", []))
     if note:
         ans["warning"] = {"level": "warn", "text": note, "hint": ""}
-    return {"final": ans.get("text", ""), "answer": ans,
+    return {"final": answer_builder.to_text(ans), "answer": ans,
             "citations": _citations(state)}
 
 
@@ -1022,17 +1114,24 @@ def _pending_text(pending: dict) -> str:
     ⚠ 三种写操作分别措辞：
       create_work_order  建单
       update_work_order  改状态/负责人
-      delete_work_order  取消（删除）
+      delete_work_order  永久删除（不同于取消）
       不能共用一套文案 —— 用户必须一眼看清"这次要做的到底是什么"，
       尤其删除是不可逆的。
     """
     action = pending.get("action")
     p = pending.get("payload") or {}
     cur = pending.get("current") or {}
+    if action == "create_work_order_batch":
+        lines = [pending.get("summary") or "批量建单待确认"]
+        for it in pending.get("items", []):
+            lines.append(f"{it['customer_id']}（{it.get('customer_name', '')}），负责人 {it.get('assignee') or '未指定'}")
+        for it in pending.get("failed", []):
+            lines.append(f"{it['customer_id']}：未准备成功，{it['reason']}")
+        return "\n".join(lines) + "\n请核对名单与负责人，确认后才会执行。"
 
     if action == "delete_work_order":
         return (
-            f"### ⏸ 待确认：取消工单\n\n"
+            f"### ⏸ 待确认：永久删除工单\n\n"
             f"{pending.get('summary')}\n\n"
             f"**该操作需要你确认后才会执行。**\n\n"
             f"- 工单编号：#{p.get('order_id')}\n"
@@ -1095,6 +1194,10 @@ def _tool_schemas() -> list[dict]:
       参数表由各工具函数的签名与 docstring 约定，此处显式声明。
     """
     return [
+        {"type": "function", "function": {
+            "name": "get_retention_summary",
+            "description": "查询实际工单标记的挽留/流失人数及来源限制；不使用理论收益替代实际结果。",
+            "parameters": {"type": "object", "properties": {}}}},
         {
             "type": "function",
             "function": {
@@ -1134,9 +1237,13 @@ def _tool_schemas() -> list[dict]:
                                                       "ZERO=零余额。"
                                                       "「价值一般/中等价值」用 LOW"},
                         "min_balance": {"type": "number",
-                                        "description": "余额下限（本地过滤）"},
+                                         "description": "余额下限（服务端筛选）"},
                         "max_balance": {"type": "number",
-                                        "description": "余额上限（本地过滤）"},
+                                         "description": "余额上限（服务端筛选）"},
+                        "exited": {"type": "integer", "enum": [0, 1],
+                                   "description": "0=未流失（推荐默认），1=历史流失客户"},
+                        "has_order": {"type": "boolean", "description": "是否有在途工单，默认false"},
+                        "worth_only": {"type": "boolean", "description": "仅返回按当前测算值得人工挽留的客户"},
                         "sort_by": {"type": "string",
                                     "enum": ["expected_value", "probability", "balance"]},
                         "limit": {"type": "integer",
@@ -1162,7 +1269,7 @@ def _tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_business_summary",
-                "description": "查成本收益推算：年度流失、期望挽留人数、"
+                "description": "查成本收益推算：样本流失、期望挽留人数、"
                                "干预投入、ROI。全部是推算值。",
                 "parameters": {"type": "object", "properties": {}},
             },
@@ -1188,9 +1295,10 @@ def _tool_schemas() -> list[dict]:
                     "properties": {
                         "status": {"type": "string",
                                    "enum": ["pending", "in_progress",
-                                            "completed", "lost"],
+                                            "completed", "lost", "cancelled"],
                                    "description": "按状态筛选，留空为全部"},
                         "assignee": {"type": "string", "description": "按负责人筛选"},
+                        "customer_id": {"type": "string", "description": "精确客户编号；查询某客户的工单必须传此字段，不能用 assignee 代替"},
                         "limit": {"type": "integer", "description": "1~50，默认 20"},
                     },
                 },
@@ -1247,18 +1355,20 @@ def _tool_schemas() -> list[dict]:
             "function": {
                 "name": "propose_update_work_order",
                 "description": "**提议**修改工单的状态/负责人/备注（不会立即执行）。"
+                               "取消使用 status=cancelled，保留记录。"
                                "用 order_id 指定工单，可先用 list_work_orders 查到。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "order_id": {"type": "integer", "description": "工单编号"},
+                        "customer_id": {"type": "string", "description": "目标客户编号，须与工单归属一致"},
                         "status": {"type": "string",
                                    "enum": ["pending", "in_progress",
-                                            "completed", "lost"]},
+                                            "completed", "lost", "cancelled"]},
                         "assignee": {"type": "string"},
                         "note": {"type": "string"},
                     },
-                    "required": ["order_id"],
+                    "required": ["order_id", "customer_id"],
                 },
             },
         },
@@ -1266,14 +1376,15 @@ def _tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "propose_delete_work_order",
-                "description": "**提议**删除工单（即「取消这张单」，不会立即执行）。"
+                "description": "**提议**永久删除工单。仅用户明确要求删除时可用；取消不等于删除。"
                                "⚠ 不可逆，必须先用 list_work_orders 确认 order_id 正确。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "order_id": {"type": "integer", "description": "工单编号"},
+                        "customer_id": {"type": "string", "description": "目标客户编号，须与工单归属一致"},
                     },
-                    "required": ["order_id"],
+                    "required": ["order_id", "customer_id"],
                 },
             },
         },
@@ -1313,7 +1424,8 @@ def route_after_agent(state: AgentState) -> str:
       因为校验器只查"数字有没有出处"，一个数字都没有自然"通过"。
       即：**无依据的断言得了高可信度标记**，这是最危险的一类错误。
     """
-    if state.get("rounds", 0) >= settings.AGENT_MAX_TOOL_ROUNDS:
+    if (time.monotonic() >= state.get("deadline", float("inf"))
+            or state.get("rounds", 0) >= settings.AGENT_MAX_TOOL_ROUNDS):
         logger.warning("agent: 达到工具轮次上界 %s，停止调用",
                        settings.AGENT_MAX_TOOL_ROUNDS)
         return "synthesize"
@@ -1402,23 +1514,24 @@ def route_after_tools(state: AgentState) -> str:
     # 结果用户看不到确认按钮，操作无从完成。
     # 这里用确定性规则补一刀：识别到取消意图 + 查到了未结工单 → 强制提议。
     q = state.get("question", "")
+    if not guard_rules.detect_write_intent_multi(q)[0] and any(
+            tr.get("ok") and tr.get("tool") == "list_customers"
+            for tr in state.get("tool_results", [])):
+        return "synthesize"
     if state.get("rounds", 0) <= 2 and _wants_cancel(q):
         done = {r["name"] for r in state.get("tool_calls_made", [])}
         if not ({"propose_delete_work_order", "propose_update_work_order"} & done):
             ids = _open_order_ids(state)
             if ids:
                 # 只处理第一张（多张时让模型按用户意图选，不替它决定）
-                logger.info("agent: 取消意图但未提议，强制 propose_delete_work_order")
+                logger.info("agent: 工单操作意图但未提议，进入受校验的写工具路径")
                 return "force_write"
     return "agent"
 
 
-# 取消/删除工单的意图词
-_CANCEL_KW = ["取消", "删除", "删掉", "撤销", "作废"]
-
-
 def _wants_cancel(q: str) -> bool:
-    return any(k in (q or "") for k in _CANCEL_KW)
+    from app.agent.order_safety import operation
+    return operation(q or "") is not None
 
 
 def _open_order_ids(state: AgentState) -> list[int]:
@@ -1519,35 +1632,58 @@ def run(question: str, session_id: str = "default",
       verify_failed   被丢弃的孤儿数字（非空说明 LLM 编了数字）
       context         更新后的会话上下文（前端存下，下一轮回传）
 
-    `context` 由前端回传，见 agent/context.py 顶部关于"为什么无状态"的说明。
+    `context` 来自 Router 的共享会话记录，见 agent/context.py。
     """
-    ctx_in = ctx_mod.normalize(context)
+    token = tools._request_deadline.set(time.monotonic() + 45)
+    try:
+        ctx_in = ctx_mod.normalize(context)
 
-    st = initial_state(session_id, question)
-    st["context_in"] = ctx_in
-    out = get_graph().invoke(st, {"recursion_limit": 20})
+        st = initial_state(session_id, question)
+        st["deadline"] = time.monotonic() + 45
+        st["context_in"] = ctx_in
+        continuation = ctx_in.get("list_query")
+        followup = list_queries.FOLLOWUP.search(question)
+        actual = "实际" in question and any(w in question for w in ("挽留", "回访"))
+        if not guard_rules.check(question) and ((followup and continuation and not guard_rules.write_intents(question)) or actual):
+            if actual:
+                name, args = "get_retention_summary", {}
+            else:
+                name = "list_customers"
+                args, changed = list_queries.continuation(continuation, question)
+            r = tools.call_tool(name, args)
+            if not r.get("ok"):
+                raise ValueError(r.get("error") or "查询失败")
+            records = [{"tool": name, "args": args, "ok": True, "data": r["result"]}]
+            ans = answer_builder.build(records, question)
+            if not actual and changed:
+                ans["warning"] = {"level": "info", "text": "筛选或排序已改变，从新范围首批开始。"}
+            out = {"answer": ans, "final": answer_builder.to_text(ans), "answer_basis": "system_data",
+                   "tool_results": records, "tool_calls_made": [{"name": name, "args": args, "ok": True}]}
+        else:
+            out = get_graph().invoke(st, {"recursion_limit": 20})
 
-    # ── 合并本轮实体，产出下一轮要用的上下文 ──────────────────
-    cur = ctx_mod.extract(out.get("tool_results") or [],
-                          out.get("pending_action"))
-    ctx_out = ctx_mod.merge(ctx_in, cur)
+        # ── 合并本轮实体，产出下一轮要用的上下文 ──────────────────
+        cur = ctx_mod.extract(out.get("tool_results") or [],
+                              out.get("pending_action"))
+        ctx_out = ctx_mod.merge(ctx_in, cur)
 
-    return {
-        # 结构化答案 —— 前端主要消费这个
-        "answer": out.get("answer") or {},
-        # 纯文本兜底 —— 兼容旧前端，也为排查提供可读内容
-        "text": out.get("final") or "",
-        "basis": out.get("answer_basis") or "unknown",
-        "citations": out.get("citations") or [],
-        "pending_action": out.get("pending_action"),
-        "tool_calls": [
-            {"name": r["name"], "args": r["args"], "ok": r["ok"],
-             "error": r.get("error")}
-            for r in out.get("tool_calls_made", [])
-        ],
-        "verify_failed": out.get("verify_fail") or [],
-        "guard_topic": out.get("guard_topic"),
-        # 会话上下文 —— 前端原样存下，下一轮 request 里带回来。
-        # 这样后端**不需要任何进程内状态**，多 worker 天然一致。
-        "context": ctx_out,
-    }
+        return {
+            # 结构化答案 —— 前端主要消费这个
+            "answer": out.get("answer") or {},
+            # 纯文本兜底 —— 兼容旧前端，也为排查提供可读内容
+            "text": out.get("final") or "",
+            "basis": out.get("answer_basis") or "unknown",
+            "citations": out.get("citations") or [],
+            "pending_action": out.get("pending_action"),
+            "tool_calls": [
+                {"name": r["name"], "args": r["args"], "ok": r["ok"],
+                 "error": r.get("error")}
+                for r in out.get("tool_calls_made", [])
+            ],
+            "verify_failed": out.get("verify_fail") or [],
+            "guard_topic": out.get("guard_topic"),
+            # 会话上下文由 Router 持久化；前端副本用于展示恢复。
+            "context": ctx_out,
+        }
+    finally:
+        tools._request_deadline.reset(token)

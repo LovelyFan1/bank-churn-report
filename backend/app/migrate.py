@@ -49,6 +49,20 @@ _PENDING_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # 建单人（行员号）。加列前建的工单为 NULL —— 这是事实，
     # 不编造填充值。前端显示为"建单人不明（历史数据）"。
     ("work_orders", "created_by", "VARCHAR"),
+    ("work_orders", "assignee_username", "VARCHAR"),
+    ("work_orders", "assignee_name_snapshot", "VARCHAR"),
+    ("work_orders", "result_source", "VARCHAR NOT NULL DEFAULT 'unknown'"),
+    ("work_orders", "result_recorded_by", "VARCHAR"),
+    ("work_orders", "verification_state", "VARCHAR NOT NULL DEFAULT 'unverified'"),
+    ("work_orders", "verified_by", "VARCHAR"),
+    ("work_orders", "verified_at", "DATETIME"),
+    ("work_orders", "observation_start", "DATETIME"),
+    ("work_orders", "observation_end", "DATETIME"),
+    ("work_orders", "result_evidence", "TEXT"),
+    ("work_orders", "actual_cost", "FLOAT"),
+    ("work_orders", "actual_benefit", "FLOAT"),
+    ("audit_logs", "auth_method", "VARCHAR"),
+    ("users", "auth_version", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -66,6 +80,13 @@ def run_migrations(engine: Engine) -> list[str]:
     幂等：重复调用在第二次起返回空列表。
     """
     applied: list[str] = []
+
+    # 已有JWT没有登记会话，不做懒迁移；部署后统一重新登录。
+    from app.models.user import AuthSession
+    tables = inspect(engine).get_table_names()
+    if "users" in tables and "auth_sessions" not in tables:
+        AuthSession.__table__.create(engine, checkfirst=True)
+        applied.append("auth_sessions")
 
     for table, column, ddl_type in _PENDING_COLUMNS:
         cols = _existing_columns(engine, table)
@@ -85,4 +106,10 @@ def run_migrations(engine: Engine) -> list[str]:
 
     if applied:
         print(f"[migrate] 已补列：{', '.join(applied)}", flush=True)
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            duplicates = conn.execute(text("SELECT customer_id FROM work_orders WHERE status IN ('pending', 'in_progress') GROUP BY customer_id HAVING COUNT(*) > 1 LIMIT 1")).first()
+            if duplicates:
+                raise RuntimeError("存在同一客户的重复在途工单，请先人工核对；迁移不会删除记录")
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_customer_work_order ON work_orders(customer_id) WHERE status IN ('pending', 'in_progress')"))
     return applied

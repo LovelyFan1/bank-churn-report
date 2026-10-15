@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
@@ -110,26 +110,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
         except auth.TokenError as e:
             return _unauthorized(str(e))
 
-        if payload.get("scope") != "full":
-            return _unauthorized("令牌不可用于该操作，请完成登录")
-
-        username = payload.get("sub") or ""
-        if not username:
-            return _unauthorized("令牌缺少用户标识")
-
         # ⚠ 查库校验"用户仍存在且未停用"。这是无状态 JWT 的必经代价：
         #   不查库则停用账号要等到令牌自然过期才生效 —— 对银行内部系统
         #   不可接受（离职当天必须立刻失效）。代价是一次主键查询（<1ms）。
         #   复用同一个 session：依赖注入的 get_db 会另开一个，故这里自查自关。
         from app.database import SessionLocal
-        from app.models.user import User
         db = SessionLocal()
         try:
-            u = db.query(User).filter(User.username == username).first()
-            if u is None:
-                return _unauthorized("用户不存在，请重新登录")
-            if not u.is_active:
-                return _forbidden("账号已停用，请联系管理员")
+            try:
+                u = auth.validate_session(db, payload)
+            except HTTPException as e:
+                return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+            request.state.auth_payload = payload
             # 挂到 request.state，供 current_user 复用（避免二次查库）
             request.state.auth_user = {
                 "username": u.username,
@@ -137,6 +129,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 "role": u.role,
                 "id": u.id,
                 "totp_enabled": bool(u.totp_enabled),
+                "department": u.department,
+                "must_change_password": u.must_change_password,
+                "last_login_at": u.last_login_at,
             }
         finally:
             db.close()
@@ -154,7 +149,3 @@ class AuthMiddleware(BaseHTTPMiddleware):
 def _unauthorized(detail: str) -> JSONResponse:
     # 统一 401 语义：前端据此跳登录页
     return JSONResponse(status_code=401, content={"detail": detail})
-
-
-def _forbidden(detail: str) -> JSONResponse:
-    return JSONResponse(status_code=403, content={"detail": detail})

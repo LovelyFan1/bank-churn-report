@@ -1,12 +1,43 @@
 """客户列表服务 — 复用 risk_scoring 打分，负责筛选/排序/分页/汇总。
 
-打分（概率校准 + 分级）统一由 risk_scoring 提供，本服务只做列表逻辑。
+打分（未校准模型评分 + 分级）统一由 risk_scoring 提供，本服务只做列表逻辑。
 """
 
 from sqlalchemy.orm import Session
 
 from app.models.work_order import WorkOrder
 from app.services import risk_scoring
+
+
+def assert_retention_eligible(db: Session, customer_id: str,
+                              exclude_order_id: int | None = None):
+    """创建与进入在途状态共用资格；不依赖模型，不修改历史记录。"""
+    from fastapi import HTTPException
+    from app.models.customer import Customer
+    record = db.query(Customer).filter(Customer.customer_id == customer_id).first()
+    if record is None:
+        raise HTTPException(404, "客户不存在")
+    if record.exited != 0:
+        raise HTTPException(409, "已流失客户不能创建或重开挽留工单，请使用召回业务流程")
+    active = db.query(WorkOrder.id).filter(
+        WorkOrder.customer_id == customer_id,
+        WorkOrder.status.in_(("pending", "in_progress")),
+    )
+    if exclude_order_id is not None:
+        active = active.filter(WorkOrder.id != exclude_order_id)
+    if active.first():
+        raise HTTPException(409, "该客户已有其他在途工单，不能创建或重新开启")
+    return record
+
+
+def get_retention_customer(db: Session, customer_id: str) -> dict:
+    """建单资格与可信快照；历史流失客户进入独立召回流程。"""
+    from fastapi import HTTPException
+    record = assert_retention_eligible(db, customer_id)
+    detail = get_customer_detail(db, customer_id)
+    if detail is None:
+        raise HTTPException(409, "模型未就绪，无法生成可信的建单快照")
+    return {**detail, "exited": record.exited}
 
 
 def _active_order_ids(db: Session) -> set:
@@ -31,6 +62,11 @@ def list_customers(
     has_order: bool | None = None,
     sort_by: str = "probability",
     sort_order: str = "desc",
+    min_balance: float | None = None,
+    max_balance: float | None = None,
+    offset: int | None = None,
+    worth_only: bool = False,
+    exclude_ids: list[str] | None = None,
 ) -> dict:
     scored = risk_scoring.get_scored_customers(db)
     risk_info = risk_scoring.get_risk_info()
@@ -48,6 +84,7 @@ def list_customers(
     items, summary = _filtered_customers(
         db, search=search, geography=geography, risk_level=risk_level,
         value_tier=value_tier, exited=exited, has_order=has_order,
+        min_balance=min_balance, max_balance=max_balance, worth_only=worth_only,
     )
 
     # 排序
@@ -62,23 +99,31 @@ def list_customers(
     }
     key = key_map.get(sort_by, "probability")
     reverse = sort_order != "asc"
+    items.sort(key=lambda c: c["customer_id"])
     items.sort(key=lambda c: c.get(key) if c.get(key) is not None else -1, reverse=reverse)
+    matched_total = len(items)
+    excluded = set(exclude_ids or [])
+    items = [c for c in items if c["customer_id"] not in excluded]
 
     # 分页
     total = len(items)
     total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
-    start = (page - 1) * page_size
+    start = offset if offset is not None else (page - 1) * page_size
     page_items = items[start:start + page_size]
 
     return {
         "items": page_items,
         "total": total,
+        "matched_total": matched_total,
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,
         "model_used": risk_info.get("model"),
         "summary": summary,
         "risk": risk_info,
+        "cohort": {"population": "current_customer_snapshot", "model_version": risk_info.get('model_version'),
+                   "exited": exited, "has_order": has_order, "risk_level": risk_level,
+                   "value_tier": value_tier, "geography": geography},
     }
 
 
@@ -90,6 +135,9 @@ def _filtered_customers(
     value_tier: str | None = None,
     exited: int | None = None,
     has_order: bool | None = None,
+    min_balance: float | None = None,
+    max_balance: float | None = None,
+    worth_only: bool = False,
 ) -> tuple[list[dict], dict]:
     """按筛选条件返回全量客户（不分页）。供导出复用，避免与 list_customers 各写一套。
 
@@ -119,6 +167,14 @@ def _filtered_customers(
         items = [c for c in items if c["exited"] == exited]
     if has_order is not None:
         items = [c for c in items if c["has_active_order"] == has_order]
+    if min_balance is not None:
+        items = [c for c in items if c["balance"] >= min_balance]
+    if max_balance is not None:
+        items = [c for c in items if c["balance"] <= max_balance]
+    if worth_only:
+        items = [c for c in items if risk_scoring.worthiness(
+            c["probability"], c["balance"],
+            expected_value=c.get("expected_value"))["verdict"] == "worth"]
 
     # 四个等级的完整分布 —— 供数据概览页的「风险等级分布」饼图使用。
     # 此前饼图的数据来自 batch-score 的 risk_distribution，但那个任务会把

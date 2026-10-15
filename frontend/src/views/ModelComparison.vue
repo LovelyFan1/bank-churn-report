@@ -1,6 +1,7 @@
 <script setup>
+import Dialog from '../components/Dialog.vue'
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '../utils/charts'
 import api, { isCanceled } from '../api'
 import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
@@ -44,6 +45,8 @@ const confusionData = ref(null)
 const shapData = ref(null)
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4']
+const MODEL_COLORS = { 'LightGBM': COLORS[0], 'XGBoost': COLORS[1], 'GBDT': COLORS[2],
+  'Random Forest': COLORS[3], 'Logistic Regression': COLORS[4] }
 
 // 中英文映射
 const LABELS = {
@@ -80,11 +83,15 @@ async function trainModels() {
   trainingMessage.value = '提交训练任务...'
   try {
     // 1) 提交训练任务 → 拿到 task_id
-    const { data: submitData } = await api.post('/model/train')
+    const { data: submitData } = await api.post('/model/train', {}, {
+      headers: { 'Idempotency-Key': globalThis.crypto.randomUUID() },
+      signal: scope.signal,
+    })
     const trainTaskId = submitData.task_id
 
     // 2) 轮询训练进度（训练完成后自动包含 SHAP）
     await pollTask(trainTaskId, {
+      signal: scope.signal,
       onProgress: (meta) => {
         trainingMessage.value = meta.message || '训练中...'
       },
@@ -241,19 +248,20 @@ function initRocChart(el) {
     const curves = _rocRes.curves
     chart.setOption({
       tooltip: { trigger: 'item', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-      legend: { bottom: 0, textStyle: { color: '#7c8aa5', fontSize: 11 }, itemGap: 16 },
-      grid: { left: 60, right: 20, top: 30, bottom: 50 },
-      xAxis: { name: 'FPR (假正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' }, axisLine: { lineStyle: { color: '#d5dce8' } }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } },
-      yAxis: { name: 'TPR (真正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' }, axisLine: { lineStyle: { color: '#d5dce8' } }, nameTextStyle: { color: '#7c8aa5', fontSize: 11 } },
+      legend: { type: 'scroll', bottom: 0, textStyle: { color: '#5b6b83', fontSize: 11 }, itemGap: 16 },
+      grid: { left: 60, right: 20, top: 30, bottom: 65 },
+      xAxis: { name: 'FPR (假正率)', nameLocation: 'middle', nameGap: 28, type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' }, axisLine: { lineStyle: { color: '#d5dce8' } }, nameTextStyle: { color: '#5b6b83', fontSize: 11 } },
+      yAxis: { name: 'TPR (真正率)', type: 'value', min: 0, max: 1, splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' }, axisLine: { lineStyle: { color: '#d5dce8' } }, nameTextStyle: { color: '#5b6b83', fontSize: 11 } },
       series: [
         { type: 'line', data: [[0, 0], [1, 1]], lineStyle: { color: '#d5dce8', type: 'dashed' }, symbol: 'none', silent: true },
         ...Object.entries(curves).map(([name, data], i) => ({
           name,
           type: 'line',
           data: data.fpr.map((f, j) => [f, data.tpr[j]]),
-          smooth: true,
+          smooth: false,
           showSymbol: false,
-          lineStyle: { width: 2, color: COLORS[i % COLORS.length] },
+          lineStyle: { width: 2, color: MODEL_COLORS[name] || COLORS[i % COLORS.length] },
+          itemStyle: { color: MODEL_COLORS[name] || COLORS[i % COLORS.length] },
         }))
       ]
     })
@@ -269,14 +277,14 @@ function initRadarChart(el) {
 
     chart.setOption({
       tooltip: { backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-      legend: { bottom: 0, textStyle: { color: '#7c8aa5', fontSize: 11 }, itemGap: 16 },
+      legend: { type: 'scroll', bottom: 0, textStyle: { color: '#5b6b83', fontSize: 11 }, itemGap: 16 },
       radar: {
         indicator: metricLabels.map(m => ({ name: m, max: 1 })),
         shape: 'polygon',
-        splitNumber: 4,
+        splitNumber: 5,
         radius: '60%',
         center: ['50%', '46%'],
-        axisName: { color: '#7c8aa5', fontSize: 10, lineHeight: 16 },
+        axisName: { color: '#5b6b83', fontSize: 10, lineHeight: 16 },
         splitLine: { lineStyle: { color: '#eef1f6' } },
         splitArea: { areaStyle: { color: ['rgba(29,78,216,0.02)', 'rgba(29,78,216,0.04)'] } },
         axisLine: { lineStyle: { color: '#eef1f6' } }
@@ -286,9 +294,9 @@ function initRadarChart(el) {
         data: models.map((m, i) => ({
           name: m.model_name,
           value: metrics.map(k => m[k]),
-          areaStyle: { color: COLORS[i % COLORS.length] + '15' },
-          lineStyle: { color: COLORS[i % COLORS.length] },
-          itemStyle: { color: COLORS[i % COLORS.length] }
+          areaStyle: { color: (MODEL_COLORS[m.model_name] || COLORS[i % COLORS.length]) + '15' },
+          lineStyle: { color: MODEL_COLORS[m.model_name] || COLORS[i % COLORS.length] },
+          itemStyle: { color: MODEL_COLORS[m.model_name] || COLORS[i % COLORS.length] }
         }))
       }]
     })
@@ -304,7 +312,8 @@ function initFeatureChart(el) {
 
     // Use best model's importance
     const bestModel = comparison.value.best_model
-    const modelImp = importance[bestModel] || importance[Object.keys(importance)[0]]
+    const modelImp = importance[bestModel]
+    if (!modelImp || impData.model_version !== comparison.value.model_version) { chart.dispose(); return }
 
     const sortedFeatures = features
       .map((f, i) => ({ name: f, value: modelImp[f] || 0 }))
@@ -313,8 +322,8 @@ function initFeatureChart(el) {
     chart.setOption({
       tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
       grid: { left: 120, right: 30, top: 10, bottom: 20 },
-      xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
-      yAxis: { type: 'category', data: sortedFeatures.map(f => fmtLabel(f.name)), axisLabel: { color: '#7c8aa5', fontSize: 10 }, axisLine: { lineStyle: { color: '#d5dce8' } } },
+      xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
+      yAxis: { type: 'category', data: sortedFeatures.map(f => fmtLabel(f.name)), axisLabel: { color: '#5b6b83', fontSize: 10 }, axisLine: { lineStyle: { color: '#d5dce8' } } },
       series: [{
         type: 'bar',
         data: sortedFeatures.map((f, i) => ({
@@ -323,14 +332,14 @@ function initFeatureChart(el) {
         })),
         barWidth: 16,
         itemStyle: { borderRadius: [0, 4, 4, 0] },
-        label: { show: true, position: 'right', color: '#7c8aa5', fontSize: 10, formatter: (p) => p.value.toFixed(3) }
+        label: { show: true, position: 'right', color: '#5b6b83', fontSize: 10, formatter: (p) => p.value.toFixed(3) }
       }]
     })
     chartInstances.push(chart)
 }
 
 function initShapChart(el) {
-  if (!_shapRes) return
+  if (!_shapRes || _shapRes.model_version !== comparison.value.model_version) return
   const chart = echarts.init(el)
     const bestModel = comparison.value?.best_model
     const shapImp = _shapRes.shap_importance[bestModel] || {}
@@ -340,8 +349,8 @@ function initShapChart(el) {
     chart.setOption({
       tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
       grid: { left: 130, right: 30, top: 10, bottom: 20 },
-      xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#7c8aa5' } },
-      yAxis: { type: 'category', data: sorted.map(([k]) => fmtLabel(k)), axisLabel: { color: '#7c8aa5', fontSize: 10 }, axisLine: { lineStyle: { color: '#d5dce8' } } },
+      xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
+      yAxis: { type: 'category', data: sorted.map(([k]) => fmtLabel(k)), axisLabel: { color: '#5b6b83', fontSize: 10 }, axisLine: { lineStyle: { color: '#d5dce8' } } },
       series: [{
         type: 'bar',
         data: sorted.map(([k, v], i) => ({
@@ -353,7 +362,7 @@ function initShapChart(el) {
         })),
         barWidth: 18,
         itemStyle: { borderRadius: [0, 6, 6, 0] },
-        label: { show: true, position: 'right', color: '#7c8aa5', fontSize: 10, formatter: (p) => p.value.toFixed(4) }
+        label: { show: true, position: 'right', color: '#5b6b83', fontSize: 10, formatter: (p) => p.value.toFixed(4) }
       }]
     })
     chartInstances.push(chart)
@@ -411,7 +420,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 重训二次确认 —— 与工单状态变更用同一种自绘弹窗，视觉一致 -->
-    <div v-if="trainConfirm" class="mc-overlay" @click.self="trainConfirm = false">
+    <Dialog :open="!!trainConfirm" title="重新训练全部模型" :danger="true" @close="trainConfirm = false">
       <div class="mc-confirm">
         <h3>重新训练全部模型？</h3>
         <div class="mc-confirm-body">
@@ -427,7 +436,7 @@ onBeforeUnmount(() => {
           <button class="mc-btn mc-btn-primary" @click="trainModels">确认重训</button>
         </div>
       </div>
-    </div>
+    </Dialog>
 
     <div v-if="loading" class="flex items-center justify-center h-64">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
@@ -436,12 +445,12 @@ onBeforeUnmount(() => {
     <!-- 模型未就绪：明确提示 + 提供训练入口，而不是渲染一堆空框 -->
     <div v-else-if="loadError" class="glass-card p-10 text-center">
       <div class="text-3xl mb-3">🧠</div>
-      <h3 class="text-base font-medium text-gray-300 mb-2">模型尚未就绪</h3>
+      <h3 class="text-base font-medium text-gray-300 mb-2">模型数据加载失败</h3>
       <p class="text-sm text-gray-500 mb-5 max-w-lg mx-auto">
         {{ loadError }}
         <br>
         <span class="text-xs text-gray-600">
-          若刚点过「重新训练」，训练期间模型文件正在被写入，稍等片刻后刷新即可。
+          请检查服务连接或模型可用状态后刷新重试。
         </span>
       </p>
       <div class="flex items-center justify-center gap-3">
@@ -498,11 +507,12 @@ onBeforeUnmount(() => {
           </thead>
           <tbody>
             <tr v-for="(m, i) in comparison.models" :key="m.model_name"
-                :class="['border-b border-[#e5e9f0]', i === 0 ? 'bg-[#e8f0fe]' : 'hover:bg-[#f8fafc]']">
+                :class="['border-b border-[#e5e9f0]', m.model_name === comparison.best_model ? 'bg-[#e8f0fe]' : 'hover:bg-[#f8fafc]']">
               <td class="py-3 px-3 font-medium flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full" :style="{ background: COLORS[i % COLORS.length] }"></span>
+                <span class="w-2 h-2 rounded-full" :style="{ background: MODEL_COLORS[m.model_name] || COLORS[i % COLORS.length] }"></span>
                 {{ m.model_name }}
-                <span v-if="i === 0" class="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300">最优</span>
+                <span v-if="i === 0" class="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-700">测试AUC第一</span>
+                <span v-if="m.model_name === comparison.best_model" class="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800">已启用</span>
               </td>
               <td class="text-right py-3 px-3 text-gray-300">{{ (m.accuracy * 100).toFixed(2) }}%</td>
               <td class="text-right py-3 px-3 text-gray-300">{{ (m.precision * 100).toFixed(2) }}%</td>
@@ -529,13 +539,13 @@ onBeforeUnmount(() => {
 
       <!-- Feature Importance -->
       <div class="glass-card p-5">
-        <h3 class="text-sm font-medium text-gray-400 mb-4">特征重要性 (最佳模型)</h3>
+        <h3 class="text-sm font-medium text-gray-400 mb-4">特征重要性（{{ comparison.best_model }} · {{ comparison.model_version }}）</h3>
         <div ref="featureChart" class="w-full h-[320px]"></div>
       </div>
 
       <!-- SHAP Global Importance -->
       <div class="glass-card p-5">
-        <h3 class="text-sm font-medium text-gray-400 mb-2">SHAP特征贡献度 (最佳模型)</h3>
+        <h3 class="text-sm font-medium text-gray-400 mb-2">SHAP特征贡献度（{{ comparison.best_model }} · {{ comparison.model_version }}）</h3>
         <p class="text-xs text-gray-600 mb-4">基于SHAP值的特征对流失预测的平均贡献，数值越大影响越强</p>
         <div ref="shapChart" class="w-full h-[320px]"></div>
       </div>
@@ -549,16 +559,16 @@ onBeforeUnmount(() => {
             <div class="text-xs text-gray-500 mb-3 text-center font-medium">{{ name }}</div>
             <div class="grid grid-cols-2 gap-1 text-center text-xs">
               <div class="p-2 rounded bg-green-500/10 text-green-400">
-                <div class="text-[10px] text-gray-500">TN<br>真负</div>{{ data.tn }}
+                <div class="text-[10px] text-slate-700">TN<br>真负</div>{{ data.tn }}
               </div>
               <div class="p-2 rounded bg-red-500/10 text-red-400">
-                <div class="text-[10px] text-gray-500">FP<br>假正</div>{{ data.fp }}
+                <div class="text-[10px] text-slate-700">FP<br>假正</div>{{ data.fp }}
               </div>
               <div class="p-2 rounded bg-orange-500/10 text-orange-400">
-                <div class="text-[10px] text-gray-500">FN<br>假负</div>{{ data.fn }}
+                <div class="text-[10px] text-slate-700">FN<br>假负</div>{{ data.fn }}
               </div>
               <div class="p-2 rounded bg-blue-500/10 text-blue-400">
-                <div class="text-[10px] text-gray-500">TP<br>真正</div>{{ data.tp }}
+                <div class="text-[10px] text-slate-700">TP<br>真正</div>{{ data.tp }}
               </div>
             </div>
           </div>
