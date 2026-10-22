@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.env.*
+!.env.example
+.auth_secret
+**/.auth_secret
 *.db
 .git/
 .idea/
@@ -10,6 +14,7 @@ venv/
 env/
 
 saved_models.bak*/
+saved_models/
 .audit/
 .venv*/
 get-pip.py

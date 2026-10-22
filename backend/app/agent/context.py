@@ -80,6 +80,59 @@ def explicit_ids(text: str) -> list[str]:
     return out
 
 
+def resolve_create_targets(question: str, ctx: dict | None) -> list[str]:
+    """Resolve the complete user-authorized create scope; ambiguity never widens it.
+
+    The displayed list defines ordinal/group references. The smaller detail cache
+    is only a legacy fallback, and a singular reference needs a unique focus.
+    Callers preparing a batch may split this list, but must retain all targets.
+    """
+    from app.agent import guard_rules, quantities
+
+    intent = guard_rules.write_intents(question).get("create")
+    if intent is None:
+        raise ValueError("请明确指定要创建工单的客户；咨询或否定不会创建提议。")
+    explicit = list(intent["customer_ids"])
+    text = "，".join(intent["clauses"])
+    ctx = normalize(ctx)
+    displayed = ctx["displayed_customer_ids"] or [c["id"] for c in ctx["customers"]]
+    positions = re.findall(r"第(" + quantities.TOKEN + r")\s*(?:位|个|名)", text)
+    if positions:
+        if len(positions) != 1:
+            raise ValueError("请逐位指定客户编号；多个序号不会自动扩充为整批。")
+        position = quantities.integer(positions[0])
+        if not 1 <= position <= len(displayed):
+            raise ValueError("序号不在当前展示名单中，请重新查询或指定编号。")
+        targets = [displayed[position - 1]]
+        if explicit and explicit != targets:
+            raise ValueError("序号与明确客户编号不一致，请核对后重新指定。")
+        return targets
+    if explicit:
+        return explicit
+    first = re.search(r"前(" + quantities.TOKEN + r")\s*(?:位|个|名|人)", text)
+    if first:
+        size = quantities.integer(first[1])
+        if not 1 <= size <= len(displayed):
+            raise ValueError("人数超出当前展示名单，请重新查询或指定编号。")
+        return displayed[:size]
+    group = re.search(r"他们|她们|它们|这些|那些|上述|全部|所有|这批|那批|"
+                      r"(?:这|那)(?:" + quantities.TOKEN + r"|几)\s*(?:位|个|名|人)", text)
+    if group:
+        if not displayed:
+            raise ValueError("当前没有可确认的客户名单，请先查询或指定编号。")
+        size = quantities.quantity(text)
+        if size is not None and size != len(displayed):
+            raise ValueError("指定人数与当前展示名单不一致，请使用序号或明确客户编号。")
+        return displayed
+    if re.search(r"他|她|这位|那位|这个客户|那个客户|该客户|刚才(?:那个|这位)?", text):
+        focus = ctx.get("focus_customer_id")
+        if focus:
+            return [focus]
+        if len(displayed) == 1:
+            return displayed
+    raise ValueError("当前建单对象不唯一，请指定一个序号、客户编号或完整名单。")
+
+
 def normalize(raw: Any) -> dict:
     """校验并裁剪前端回传的上下文。
 

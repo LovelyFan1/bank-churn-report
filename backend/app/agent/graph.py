@@ -263,22 +263,8 @@ def node_agent(state: AgentState) -> dict:
     #
     #   ⚠ 必须限定在上下文集内（而不是全库搜索），否则"这三位"可能
     #     被解析成任意客户 —— 那是越权，也会让用户莫名其妙。
-    if write_intent and not cids:
-        incoming = state.get("context_in") or {}
-        ctx_customers = [{"id": cid} for cid in incoming.get("displayed_customer_ids", [])]
-        ctx_customers = ctx_customers or incoming.get("customers") or []
-        position = quantities.ordinal(state.get("question") or "")
-        if position is not None:
-            if position > len(ctx_customers):
-                raise ValueError("序号不在当前展示名单中，请重新查询或指定编号")
-            ctx_customers = [ctx_customers[position - 1]]
-        for c in ctx_customers:
-            cid = c.get("id")
-            if cid:
-                cids.append(str(cid).upper())
-        if cids:
-            logger.info("agent: 写意图含指代，从上下文解析出 %d 位客户：%s",
-                        len(cids), cids)
+    if write_intent:
+        cids = ctx_mod.resolve_create_targets(state["question"], state.get("context_in"))
 
     write_tools_done = {r["name"] for r in made}
     # ── 强制提议：按目标数量选工具 ──────────────────────────
@@ -413,6 +399,18 @@ def _scope_error(state: AgentState, name: str, args: dict,
             args.get("customer_ids") or args.get("customer_id"))
         if error:
             return error
+        if action == "update":
+            error = guard_rules.completion_result_error(question, args)
+            if error:
+                return error
+        if action == "create":
+            try:
+                targets = ctx_mod.resolve_create_targets(question, ctx)
+            except ValueError as exc:
+                return str(exc)
+            proposed = args.get("customer_ids") or [args.get("customer_id")]
+            if set(proposed) != set(targets):
+                return "建单对象与明确指定的客户不一致，请重新核对完整名单。"
 
     if name in _CID_TOOLS:
         # ⚠ 两种参数名都要处理：单数工具用 customer_id，
@@ -636,10 +634,8 @@ def node_synthesis(state: AgentState) -> dict:
         w_intent, cids, assignee = guard_rules.detect_write_intent_multi(
             state["question"])
         # 指代同样从上下文解析（与 node_agent 里的逻辑一致）
-        if w_intent and not cids:
-            for c in (state.get("context_in") or {}).get("customers") or []:
-                if c.get("id"):
-                    cids.append(str(c["id"]).upper())
+        if w_intent:
+            cids = ctx_mod.resolve_create_targets(state["question"], state.get("context_in"))
         if w_intent and cids:
             logger.warning("agent: LLM 未产出待确认动作，启用确定性兜底 cids=%s", cids)
             if len(cids) > 1:
@@ -716,10 +712,17 @@ def node_synthesis(state: AgentState) -> dict:
         )),
     ]
     if time.monotonic() >= state.get("deadline", float("inf")):
-        return {"draft": "", "headline": "", "insights": []}
-    resp = llm.writer_llm().invoke(msgs)
-    headline, insights = _parse_writer_output(resp.content)
-    return {"draft": resp.content, "headline": headline, "insights": insights}
+        return {"draft": "", "headline": "", "insights": [],
+                "synthesis_warning": "解读达到时间预算，已保留查询到的系统数据。"}
+    try:
+        resp = llm.writer_llm().invoke(msgs)
+        content = resp.content
+        headline, insights = _parse_writer_output(content)
+    except Exception as exc:
+        logger.warning("agent: 写手不可用，保留系统数据 (%s)", type(exc).__name__)
+        return {"draft": "", "headline": "", "insights": [],
+                "synthesis_warning": "模型解读暂不可用，已保留查询到的系统数据，请以数据卡片为准。"}
+    return {"draft": content, "headline": headline, "insights": insights}
 
 
 def _parse_writer_output(raw: str) -> tuple[str, list[str]]:
@@ -1005,12 +1008,18 @@ def node_verify(state: AgentState) -> dict:
         warning["level"] = "warn"
         warning["text"] = "；".join(filter(None, (warning.get("text"), verify_mod.explain(orphans))))
         ans["warning"] = warning
+    synthesis_warning = state.get("synthesis_warning")
+    if synthesis_warning:
+        warning = dict(ans.get("warning") or {})
+        warning["level"] = "warn"
+        warning["text"] = "；".join(filter(None, (warning.get("text"), synthesis_warning)))
+        ans["warning"] = warning
     return {
         "verify_passed": ok,
         "verify_fail": orphans,
         "final": answer_builder.to_text(ans),
         "answer": ans,
-        "answer_basis": ("llm_verified" if ok else "llm_partial_dropped"),
+        "answer_basis": ("system_data" if synthesis_warning else "llm_verified" if ok else "llm_partial_dropped"),
         "citations": _citations(state),
     }
 
@@ -1150,6 +1159,8 @@ def _pending_text(pending: dict) -> str:
             changes.append(f"负责人 → {p['assignee']}")
         if p.get("note"):
             changes.append("备注已更新")
+        if p.get("result"):
+            changes.append("处理结果 → " + {"retained": "挽留成功", "lost": "已流失"}.get(p["result"], p["result"]))
         return (
             f"### ⏸ 待确认：修改工单\n\n"
             f"{pending.get('summary')}\n\n"
@@ -1356,6 +1367,7 @@ def _tool_schemas() -> list[dict]:
                 "name": "propose_update_work_order",
                 "description": "**提议**修改工单的状态/负责人/备注（不会立即执行）。"
                                "取消使用 status=cancelled，保留记录。"
+                               "完成必须明确填写result=retained或lost；用户未说明结果时引导到工单结果表单，不能默认挽留成功。"
                                "用 order_id 指定工单，可先用 list_work_orders 查到。",
                 "parameters": {
                     "type": "object",
@@ -1367,6 +1379,8 @@ def _tool_schemas() -> list[dict]:
                                             "completed", "lost", "cancelled"]},
                         "assignee": {"type": "string"},
                         "note": {"type": "string"},
+                        "result": {"type": "string", "enum": ["retained", "lost"],
+                                   "description": "用户明确声明的结案结果；未说明时不得默认retained"},
                     },
                     "required": ["order_id", "customer_id"],
                 },
@@ -1642,9 +1656,10 @@ def run(question: str, session_id: str = "default",
         st["deadline"] = time.monotonic() + 45
         st["context_in"] = ctx_in
         continuation = ctx_in.get("list_query")
-        followup = list_queries.FOLLOWUP.search(question)
-        actual = "实际" in question and any(w in question for w in ("挽留", "回访"))
-        if not guard_rules.check(question) and ((followup and continuation and not guard_rules.write_intents(question)) or actual):
+        followup = list_queries.is_customer_continuation(question)
+        actual = list_queries.is_global_retention_summary(question, ctx_in)
+        if (not guard_rules.check(question) and not guard_rules.write_intents(question)
+                and ((followup and continuation) or actual)):
             if actual:
                 name, args = "get_retention_summary", {}
             else:

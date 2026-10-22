@@ -27,6 +27,7 @@ import { assignees as staffList, canAssign, loadAssignees, defaultAssignee } fro
 import { riskLabel } from '../utils/risk'
 import { batchPlan } from '../utils/agentBatch'
 import { statusLabel } from '../utils/workOrders'
+import { reconcileAgentSession } from '../utils/agentSession'
 
 /**
  * 会话持久化 —— 用户要求「切换窗口时会话不消失」。
@@ -43,8 +44,8 @@ import { statusLabel } from '../utils/workOrders'
  *   3. **显示历史 ≠ 模型记忆**。这里存的是**显示历史**（turns），
  *      恢复它只是让用户看到之前的对话。
  *      真正让模型能理解「第二个」「他」这类指代的是 `agentContext`
- *      —— 一份**只含编号的指针清单**，随每次提问回传后端（见 send 与
- *      backend/app/agent/context.py）。后端因此保持无状态，多 worker 一致。
+ *      —— 后端按用户与会话持久化的指针清单。前端保存恢复副本，
+ *      每次写操作提交版本，成功后以服务端返回的上下文为准。
  *   4. **缓存按用户分键**（两轮修正的结果）：
  *        第一轮问题：所有账号共用一个键 'agent.session.v1' ——
  *                   切换账号后新账号看到上一个账号的完整对话。
@@ -137,25 +138,36 @@ const listEl = ref(null)
 const restored = ref(false)   // 是否从缓存恢复过（用于提示用户）
 const sessionError = ref('')
 const contextExpired = ref(false)
+const clearing = ref(false)
 
 /**
  * 会话上下文（短期记忆）—— 只存编号等指针，不存内容。
  *
- * ⚠ 这是**让模型能理解指代**的唯一机制：
- *   用户问「第二个为什么值得」时，后端收到 context 才知道"第二个"是谁。
- *   它随每次 /agent/ask 回传，响应里带回更新后的版本。
- *
- * ⚠ 为什么由前端持有而不是后端保存：后端是 `uvicorn --workers 4`，
- *   进程内记忆会让 4 个 worker 各自为政（"有时记得有时不记得"）。
- *   见 backend/app/agent/context.py 顶部说明。
- *
- * 结构：{ customers: [{id, name, prob, balance}], orders: [{order_id, ...}] }
- * 体积：约 100 token，**不随轮次增长**（上限 20 个实体，溢出淘汰最旧）。
+ * 服务端持久化当前焦点、列表及版本；前端只保存恢复副本。
+ * 提问与确认共用同一版本，避免多窗口覆盖或确认后继续指向旧客户。
  */
 const agentContext = ref({ customers: [], orders: [] })
 const newSessionId = () => globalThis.crypto?.randomUUID?.() || `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`
 const sessionId = ref(newSessionId())
 const sessionVersion = ref(0)
+const sessionBusy = computed(() => clearing.value || sending.value
+  || turns.value.some(t => t.confirming || t.retracting || t.batch?.running))
+
+function sessionFields(contextMode) {
+  return { session_id: sessionId.value, session_version: sessionVersion.value,
+    ...(contextMode ? { context_mode: contextMode } : {}) }
+}
+
+async function refreshSession() {
+  const { data } = await api.get(`/agent/session/${encodeURIComponent(sessionId.value)}`)
+  syncOrderContext(data, true)
+  contextExpired.value = !!data.expired
+}
+
+async function refreshOnConflict(error) {
+  if (error.response?.status !== 409) return
+  try { await refreshSession() } catch { /* 保留原始操作错误，等待用户重查。 */ }
+}
 
 const samples = [
   '帮我调出挽回价值最高的3个客户',
@@ -200,10 +212,7 @@ onMounted(async () => {
   }
   if (saved?.sessionId) {
     try {
-      const { data } = await api.get(`/agent/session/${encodeURIComponent(sessionId.value)}`)
-      agentContext.value = data.context || { customers: [], orders: [] }
-      sessionVersion.value = data.session_version
-      contextExpired.value = data.expired
+      await refreshSession()
     } catch (e) {
       agentContext.value = { customers: [], orders: [] }
       sessionError.value = '服务端上下文未能恢复，请重新查询。'
@@ -293,13 +302,15 @@ function pendingTokens(turn) {
 }
 
 async function clearSession() {
-  if (sending.value) return
+  if (sessionBusy.value) return
+  clearing.value = true
   try {
     await api.post(`/agent/session/${encodeURIComponent(sessionId.value)}/clear`, {
       confirmation_tokens: turns.value.flatMap(pendingTokens),
     })
   } catch (e) {
     sessionError.value = e.response?.data?.detail || e.message
+    clearing.value = false
     return
   }
   // 先删键、再清 turns，并用 suppressPersist 跳过 watcher 的空写，
@@ -316,6 +327,7 @@ async function clearSession() {
   sessionId.value = newSessionId()
   sessionVersion.value = 0
   restored.value = false
+  clearing.value = false
   nextTick(() => { suppressPersist = false })
 }
 
@@ -339,7 +351,7 @@ function basisOf(b) {
 
 async function send(text) {
   const q = (text ?? question.value).trim()
-  if (!q || sending.value) return
+  if (!q || sessionBusy.value) return
   question.value = ''
   turns.value.push({ role: 'user', text: q })
   sending.value = true
@@ -355,8 +367,8 @@ async function send(text) {
       context: agentContext.value,
     }, { timeout: 90000 })
     // 更新上下文：后端返回的是**合并后的**新清单，直接替换
-    if (data.context) agentContext.value = data.context
-    if (Number.isInteger(data.session_version)) sessionVersion.value = data.session_version
+    syncOrderContext(data)
+    contextExpired.value = false
 
     const pending = data.pending_action || null
     // ── 批量提议自动展开为批量确认面板 ──────────────────────
@@ -412,13 +424,7 @@ async function send(text) {
       confirmResult: null,
     })
   } catch (e) {
-    if (e.response?.status === 409) {
-      try {
-        const { data } = await api.get(`/agent/session/${encodeURIComponent(sessionId.value)}`)
-        agentContext.value = data.context
-        sessionVersion.value = data.session_version
-      } catch { /* 保留原始错误，允许下次主动重试。 */ }
-    }
+    await refreshOnConflict(e)
     turns.value.push({
       role: 'agent',
       answer: { kind: 'text', headline: '请求失败', text: e.response?.data?.detail || e.message },
@@ -438,6 +444,7 @@ async function scrollToEnd() {
 
 /** 打开批量确认面板（方案 A 第一步：先看清楚要建什么，再确认） */
 async function openBatch(turn, action) {
+  if (sessionBusy.value) return
   const plan = batchPlan(action.targets)
   // 单人不再"重新发问"，统一走面板 —— 见模板 ⑦ 的说明
   turn.batch = {
@@ -462,7 +469,7 @@ async function openBatch(turn, action) {
 
 async function nextBatch(turn) {
   const b = turn.batch
-  if (!b || b.running || !b.remaining?.length) return
+  if (!b || sessionBusy.value || !b.remaining?.length) return
   if (b.result) b.previousResults.push(b.result)
   const plan = batchPlan(b.remaining)
   b.targets = plan.current
@@ -475,19 +482,22 @@ async function nextBatch(turn) {
 
 async function prepareBatch(turn) {
   const b = turn.batch
-  if (!b || b.running) return
+  if (!b || sessionBusy.value) return
   b.running = true
   b.error = ''
   try {
     const { data } = await api.post('/agent/prepare-create', {
       customer_ids: b.targets, assignee: b.assignee,
+      ...sessionFields(),
     })
+    syncOrderContext(data)
     b.items = data.items || []
     b.failed = data.failed || []
     if (b.items.length) b.assignee = b.items[0].assignee
     if (!b.items.length) b.error = b.failed.map(it => `${it.customer_id}：${it.reason}`).join('；')
   } catch (e) {
     b.items = []
+    await refreshOnConflict(e)
     b.error = e.response?.data?.detail || e.message
   } finally {
     b.running = false
@@ -502,6 +512,7 @@ async function prepareBatch(turn) {
  *   而不是只显示一个 id。
  */
 async function openCancel(turn, action) {
+  if (sessionBusy.value) return
   const ids = action.targets || []
   const byId = new Map()
   for (const e of (turn.answer.entities || [])) {
@@ -533,12 +544,15 @@ async function openCancel(turn, action) {
     for (const item of b.detail) {
       const { data } = await api.post('/agent/prepare-order-cancel', {
         order_id: item.order_id, customer_id: item.customer_id,
+        ...sessionFields(),
       })
+      syncOrderContext(data)
       b.proposals.push(data)
       item.customer_name = data.current.customer_name
       item.status = data.current.status
     }
   } catch (e) {
+    await refreshOnConflict(e)
     b.error = e.response?.data?.detail || e.message
   } finally {
     b.running = false
@@ -546,7 +560,8 @@ async function openCancel(turn, action) {
 }
 
 async function closeBatch(turn) {
-  if (!turn.batch || turn.batch.running) return
+  if (!turn.batch || sessionBusy.value) return
+  turn.retracting = true
   try {
     await api.post('/agent/retract', { confirmation_tokens: pendingTokens(turn) })
     turn.batch.open = false
@@ -554,13 +569,15 @@ async function closeBatch(turn) {
     turn.batch.items = []
   } catch (e) {
     turn.batch.error = e.response?.data?.detail || e.message
+  } finally {
+    turn.retracting = false
   }
 }
 
 /** 提交批量建单 —— 唯一落库入口，且必须用户点了确认 */
 async function submitBatch(turn) {
   const b = turn.batch
-  if (!b || b.running) return
+  if (!b || sessionBusy.value) return
   b.running = true
   b.error = ''
   try {
@@ -577,15 +594,16 @@ async function submitBatch(turn) {
           const { data } = await api.post('/agent/confirm', {
             action: pending.action, payload: pending.payload,
             confirmation_token: pending.confirmation_token,
+            ...sessionFields(b.targets.length > 1 ? (results.length ? 'batch' : 'batch_start') : 'single'),
           })
           results.push({ order_id: oid, order: data.order })
           syncOrderContext(data)
         } catch (e) {
+          await refreshOnConflict(e)
           failed.push({ order_id: oid,
                         reason: e.response?.data?.detail || e.message })
         }
       }
-      if (b.targets.length > 1) agentContext.value.focus_customer_id = null
       b.result = {
         cancelled: true,
         succeeded: results.length,
@@ -598,17 +616,20 @@ async function submitBatch(turn) {
       }
     } else {
       const { data } = await api.post('/agent/confirm-batch', {
+        ...sessionFields(),
         proposals: (b.items || []).map(it => ({
           action: 'create_work_order', confirmation_token: it.confirmation_token,
           payload: Object.fromEntries(Object.entries(it).filter(([key]) => key !== 'confirmation_token')),
         })),
       })
+      syncOrderContext(data, data.expired === true)
       data.failed = [...(data.failed || []), ...(b.failed || [])]
       data.failed_count = data.failed.length
       data.requested = new Set([...b.targets, ...data.failed.map(it => it.customer_id)]).size
       b.result = data
     }
   } catch (e) {
+    await refreshOnConflict(e)
     b.error = e.response?.data?.detail || e.message
   } finally {
     b.running = false
@@ -616,7 +637,7 @@ async function submitBatch(turn) {
 }
 
 async function confirmAction(turn) {
-  if (!turn.pending || turn.confirming || turn.confirmed || turn.cancelled) return
+  if (sessionBusy.value || !turn.pending || turn.confirmed || turn.cancelled) return
   turn.confirming = true
   turn.confirmError = ''
   try {
@@ -624,6 +645,7 @@ async function confirmAction(turn) {
       action: turn.pending.action,
       payload: turn.pending.payload,
       confirmation_token: turn.pending.confirmation_token,
+      ...sessionFields(),
     })
     turn.confirmed = true
     turn.confirmResult = data.order || { id: data.order_id, ...data.deleted_order }
@@ -638,6 +660,7 @@ async function confirmAction(turn) {
         ? { label: '执行后状态', value: statusText } : s)
     }
   } catch (e) {
+    await refreshOnConflict(e)
     turn.confirmError = e.response?.data?.detail || e.message
   } finally {
     turn.confirming = false
@@ -645,6 +668,8 @@ async function confirmAction(turn) {
 }
 
 async function cancelAction(turn) {
+  if (sessionBusy.value || !turn.pending || turn.confirmed || turn.cancelled) return
+  turn.retracting = true
   // ⚠ 不能把 pending 置 null：确认区外层是 v-if="t.pending"，
   //   置空会让容器消失，"已取消"提示永远不显示。
   try {
@@ -652,6 +677,8 @@ async function cancelAction(turn) {
     turn.cancelled = true
   } catch (e) {
     turn.confirmError = e.response?.data?.detail || e.message
+  } finally {
+    turn.retracting = false
   }
 }
 
@@ -664,15 +691,17 @@ function confirmLabel(action) {
   }[action] || '确认执行'
 }
 
-function syncOrderContext(data) {
-  const order = data.order || { id: data.order_id, ...data.deleted_order }
-  const ctx = agentContext.value
-  ctx.orders = (ctx.orders || []).filter(o => o.order_id !== order.id)
-  if (!data.deleted && order.id) {
-    ctx.orders.unshift({ order_id: order.id, customer_id: order.customer_id,
-      name: order.customer_name, status: order.status })
+function syncOrderContext(data, allowExpired = false) {
+  const current = { sessionId: sessionId.value, sessionVersion: sessionVersion.value,
+    context: agentContext.value }
+  const updated = reconcileAgentSession(current, data, { allowExpired })
+  if (updated === current) {
+    sessionError.value = '会话状态未能同步，请重新查询后继续操作。'
+    return
   }
-  ctx.focus_customer_id = order.customer_id || null
+  agentContext.value = updated.context
+  sessionVersion.value = updated.sessionVersion
+  sessionError.value = ''
 }
 
 function receiptLabel(turn) {
@@ -693,7 +722,7 @@ function plain(s) {
   return (s || '').replace(/\*\*/g, '').replace(/`/g, '')
 }
 
-const canAsk = computed(() => !sending.value && question.value.trim().length > 0)
+const canAsk = computed(() => !sessionBusy.value && question.value.trim().length > 0)
 
 /** 实体标签配色 —— 风险/价值/经济性三类标签用不同色系，避免混淆 */
 function tagClass(tag) {
@@ -728,7 +757,7 @@ function warnClass(level) {
       </div>
       <div class="agent-status">
         <button v-if="turns.length" class="btn-clear" @click="clearSession"
-                :disabled="sending" title="清空显示缓存、当前服务端上下文和待确认凭据，并开始新会话">清空会话</button>
+                :disabled="sessionBusy" title="清空显示缓存、当前服务端上下文和待确认凭据，并开始新会话">清空会话</button>
         <span :class="['dot', health?.available ? 'ok' : 'off']"></span>
         <span v-if="health?.available" class="status-txt">已连接 · {{ health.model }}</span>
         <span v-else class="status-txt off">不可用：{{ health?.reason || '检测中…' }}</span>
@@ -853,7 +882,7 @@ function warnClass(level) {
                    2 人走另一条），测试与用户都难预期。
                    批量端点收 1 个 id 完全正常，故统一走 openBatch。 -->
               <button v-if="a.id === 'create_orders' && a.targets.length"
-                      class="btn-action" @click="openBatch(t, a)">
+                      class="btn-action" :disabled="sessionBusy" @click="openBatch(t, a)">
                 {{ a.label }}
               </button>
               <span v-if="a.note" class="action-note">{{ a.note }}</span>
@@ -864,7 +893,7 @@ function warnClass(level) {
           <div v-if="t.answer.kind === 'workorder_list' && t.answer.actions?.length" class="actions">
             <template v-for="a in t.answer.actions" :key="'w' + a.id">
               <button v-if="a.id === 'cancel_order' && a.targets.length"
-                      class="btn-action btn-danger" @click="openCancel(t, a)">
+                      class="btn-action btn-danger" :disabled="sessionBusy" @click="openCancel(t, a)">
                 {{ a.label }}
               </button>
               <span v-if="a.note" class="action-note">{{ a.note }}</span>
@@ -893,10 +922,10 @@ function warnClass(level) {
                      在"取消工单"场景下严重误导 —— 用户点"确认建单"却删掉了一张单。 -->
                 <button class="btn-confirm"
                         :class="{ 'btn-danger-solid': t.pending.action === 'delete_work_order' }"
-                        :disabled="t.confirming" @click="confirmAction(t)">
+                        :disabled="sessionBusy" @click="confirmAction(t)">
                   {{ t.confirming ? '执行中…' : t.pending.payload?.status === 'cancelled' ? '确认取消工单（保留记录）' : confirmLabel(t.pending.action) }}
                 </button>
-                <button class="btn-cancel" :disabled="t.confirming" @click="cancelAction(t)">放弃操作</button>
+                <button class="btn-cancel" :disabled="sessionBusy" @click="cancelAction(t)">{{ t.retracting ? '放弃中…' : '放弃操作' }}</button>
               </template>
             </div>
             <p v-if="t.confirmError" class="err">{{ t.confirmError }}</p>
@@ -955,7 +984,7 @@ function warnClass(level) {
                   <label>负责人（必选，默认派给发起人）</label>
                   <!-- 与页面建单同一份行员名单、同一接口 —— 三处入口行为一致 -->
                   <select v-if="canAssign && staffList.length" v-model="t.batch.assignee"
-                          :disabled="t.batch.running" @change="prepareBatch(t)">
+                          :disabled="sessionBusy" @change="prepareBatch(t)">
                     <option value="" disabled>请选择负责人</option>
                     <option v-for="a in staffList" :key="a.username" :value="a.username">
                       {{ a.display_name }}（{{ a.username }}·{{ a.department || a.role_label }}）
@@ -977,14 +1006,14 @@ function warnClass(level) {
               <div class="batch-btns">
                 <button class="btn-confirm"
                         :class="{ 'btn-danger-solid': t.batch.kind === 'cancel' }"
-                        :disabled="t.batch.running || (t.batch.kind !== 'cancel' && !t.batch.items?.length)" @click="submitBatch(t)">
+                        :disabled="sessionBusy || (t.batch.kind !== 'cancel' && !t.batch.items?.length)" @click="submitBatch(t)">
                   {{ t.batch.running ? '执行中…'
                      : (t.batch.kind === 'cancel'
                         ? `确认取消这 ${t.batch.targets.length} 张工单`
                         : `确认为这 ${t.batch.items?.length || 0} 人建单`) }}
                 </button>
-                <button class="btn-cancel" :disabled="t.batch.running" @click="closeBatch(t)">取消</button>
-                <button v-if="!t.batch.items?.length && t.batch.remaining?.length" class="btn-confirm" :disabled="t.batch.running" @click="nextBatch(t)">准备下一批（仍需确认）</button>
+                <button class="btn-cancel" :disabled="sessionBusy" @click="closeBatch(t)">取消</button>
+                <button v-if="!t.batch.items?.length && t.batch.remaining?.length" class="btn-confirm" :disabled="sessionBusy" @click="nextBatch(t)">准备下一批（仍需确认）</button>
               </div>
               <p v-if="t.batch.error" class="err">{{ t.batch.error }}</p>
             </div>

@@ -706,6 +706,8 @@ async def update_work_order(order_id: int, body: WorkOrderUpdate,
 
     final_status = update_data.get("status", order.status)
     final_result = update_data.get("result", order.result)
+    if final_status not in {"pending", "in_progress", "completed", "lost", "cancelled"}:
+        raise HTTPException(422, "工单状态无效，请明确指定合法状态")
     if final_status in ("pending", "in_progress", "cancelled") and final_result is not None:
         raise HTTPException(422, "未结案工单不能填写挽留结果")
     if final_status == "lost" and final_result != "lost":

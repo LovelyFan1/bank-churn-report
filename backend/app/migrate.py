@@ -63,6 +63,7 @@ _PENDING_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("work_orders", "actual_benefit", "FLOAT"),
     ("audit_logs", "auth_method", "VARCHAR"),
     ("users", "auth_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("pending_agent_actions", "session_id", "VARCHAR(64)"),
 )
 
 
@@ -104,6 +105,11 @@ def run_migrations(engine: Engine) -> list[str]:
         applied.append(f"{table}.{column}")
         logger.info("migrate: 已为 %s 补列 %s", table, column)
 
+    if "pending_agent_actions.session_id" in applied:
+        # 升级前的令牌无法追溯会话，首次加列时撤销；后来显式无会话API仍兼容。
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE pending_agent_actions SET consumed=1 WHERE session_id IS NULL AND consumed=0"))
+
     if applied:
         print(f"[migrate] 已补列：{', '.join(applied)}", flush=True)
     if engine.dialect.name == "sqlite":
@@ -112,4 +118,11 @@ def run_migrations(engine: Engine) -> list[str]:
             if duplicates:
                 raise RuntimeError("存在同一客户的重复在途工单，请先人工核对；迁移不会删除记录")
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_customer_work_order ON work_orders(customer_id) WHERE status IN ('pending', 'in_progress')"))
+            # 只限制新插入和显式状态更新，历史非法行保留原样并可编辑其它字段。
+            allowed = "'pending', 'in_progress', 'completed', 'lost', 'cancelled'"
+            for event, suffix in (("INSERT", "insert"), ("UPDATE OF status", "update")):
+                conn.execute(text(f"""CREATE TRIGGER IF NOT EXISTS work_orders_valid_status_{suffix}
+                    BEFORE {event} ON work_orders
+                    WHEN NEW.status IS NULL OR NEW.status NOT IN ({allowed})
+                    BEGIN SELECT RAISE(ABORT, 'invalid work order status'); END"""))
     return applied

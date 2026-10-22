@@ -456,7 +456,8 @@ def propose_update_work_order(order_id: int,
                               status: str | None = None,
                               assignee: str | None = None,
                               note: str | None = None,
-                              customer_id: str | None = None) -> dict:
+                              customer_id: str | None = None,
+                              result: str | None = None) -> dict:
     """**提议**修改工单（改状态/负责人/备注），不会立即执行。
 
     status: pending / in_progress / completed / lost
@@ -465,6 +466,7 @@ def propose_update_work_order(order_id: int,
 
     取消使用 status=cancelled，保留记录；仅允许取消待处理或处理中工单。
     customer_id 必须是用户指定或当前焦点客户，不得从其他客户的工单反推。
+    completed 必须由用户明确指定 result=retained / lost；不能把完成默认作挽留成功。
 
     ⚠ 这是**写操作**，必须经用户确认。不要在回答里声称"已经改好了"。
     """
@@ -473,19 +475,33 @@ def propose_update_work_order(order_id: int,
         raise ValueError("工单不属于指定客户，已拦截")
     if status == "cancelled" and d.get("status") not in ("pending", "in_progress"):
         raise ValueError("只能取消待处理或处理中的工单")
+    allowed_statuses = {"pending", "in_progress", "completed", "lost", "cancelled"}
+    if status is not None and status not in allowed_statuses:
+        raise ValueError("工单状态无效")
+    if result is not None and result not in ("retained", "lost"):
+        raise ValueError("挽留结果必须为 retained（挽留成功）或 lost（流失）")
+    if status == "completed" and result is None:
+        raise ValueError("完成工单必须明确填写挽留结果：挽留成功或流失；请补充结果或到工单页面填写。")
+    effective_status = status if status is not None else d.get("status")
+    if result is not None and effective_status not in ("completed", "lost"):
+        raise ValueError("未结案工单不能填写挽留结果")
+    if effective_status == "lost" and result not in (None, "lost"):
+        raise ValueError("已流失状态必须对应流失结果")
     return {
         "__pending_action__": True,
         "action": "update_work_order",
         "summary": (f"修改工单 #{order_id}"
                     f"（客户 {d.get('customer_name')}）"
                     + (f"，状态改为 {status}" if status else "")
-                    + (f"，负责人改为 {assignee}" if assignee else "")),
+                    + (f"，负责人改为 {assignee}" if assignee else "")
+                    + (f"，结果：{'挽留成功' if result == 'retained' else '流失'}" if result else "")),
         "payload": {
             "order_id": int(order_id),
             "customer_id": customer_id.upper(),
             "status": status,
             "assignee": assignee,
             "note": note,
+            **({"result": result} if result is not None else {}),
         },
         "current": {
             "status": d.get("status"),

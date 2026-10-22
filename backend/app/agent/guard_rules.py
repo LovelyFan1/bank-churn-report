@@ -58,7 +58,7 @@ _RULES = [
         "key": "temporal_trend",
         "must": [
             "明年", "下一年", "未来", "趋势", "预测", "forecast",
-            "接下来", "会怎样", "走势", "环比", "同比", "增长",
+            "会怎样", "走势", "环比", "同比", "增长",
             "下降多少", "变化趋势", "时间序列", "几个月后", "季度",
         ],
         "why": (
@@ -145,7 +145,10 @@ def check(question: str) -> GuardHit | None:
         return None
 
     q = question.strip()
-    if re.search(r"未来|明年|下个月|下季度", q) and re.search(r"多少|下降|增长|趋势|预测|会", q):
+    clauses = re.split(r"[，,。；;\n]|但是|不过|但", q)
+    temporal_q = "，".join(clause for clause in clauses if not re.search(
+        r"(?:不需要|不要|不用|不必|无需|别|禁止|不).{0,6}(?:预测|外推|推测)", clause))
+    if re.search(r"未来|明年|下个月|下季度", temporal_q) and re.search(r"多少|下降|增长|趋势|预测|会", temporal_q):
         return GuardHit(key="future_trend", reason="当前数据没有时间序列和预测窗口，不能预测未来人数或趋势。",
                         instead="可以查询当前样本的风险分布和测算条件。")
 
@@ -155,7 +158,8 @@ def check(question: str) -> GuardHit | None:
 
     hit = None
     for rule in _RULES:
-        if any(kw in q for kw in rule["must"]):
+        subject = temporal_q if rule["key"] == "temporal_trend" else q
+        if any(kw in subject for kw in rule["must"]):
             hit = rule
             break
 
@@ -222,7 +226,7 @@ _CID_RE = re.compile(r"(?<![A-Za-z0-9])C\d{4,}(?![A-Za-z0-9])", re.IGNORECASE)
 _REFERENTIAL = re.compile(
     r"第[零一二三四五六七八九十百两\d]+\s*(?:位|个|名)|"
     r"(这|那)(几|[零一二三四五六七八九十百两]+|\d+)?\s*(位|个|名|人|张|条|批)|"
-    r"他们|它们|她们|上述|上面(这|那)?(几|些|些个)?|刚才(那|这)?(几|些)?|"
+    r"他们|它们|她们|他|她|这位|那位|这个客户|那个客户|该客户|上述|上面(这|那)?(几|些|些个)?|刚才(那|这)?(几|些)?|"
     r"这些|那些|全部|所有"
 )
 
@@ -290,6 +294,36 @@ def write_action_error(question: str, action: str, customer_ids=None) -> str | N
         if any(str(cid).upper() not in explicit for cid in ids):
             return "写操作对象与该动作的明确客户不一致，请分别指定动作和对象。"
     return None
+
+
+def completion_result_error(question: str, payload: dict) -> str | None:
+    """A completion/result update needs one explicit, non-negated user result.
+
+    This intentionally recognizes a small declaration vocabulary. Unclear
+    language asks the user to specify the result rather than inventing success.
+    """
+    result = payload.get("result")
+    if payload.get("status") != "completed" and result is None:
+        return None
+    guide = "请明确声明本客户的挽留结果（挽留成功/已流失），或到工单结果表单填写；不能默认挽留成功。"
+    if result not in ("retained", "lost"):
+        return guide
+    declarations = set()
+    customer_id = str(payload.get("customer_id") or "").upper()
+    for clause in re.split(r"[，,。；;\n]|但是|不过|但", question or ""):
+        ids = {cid.upper() for cid in _CID_RE.findall(clause)}
+        if ids and customer_id not in ids:
+            continue
+        if re.search(r"是否|是不是|要不要|能否|如何|怎么|吗|[?？]", clause):
+            continue
+        for label, pattern in (("retained", r"retained|挽留成功|已挽留|已留存"),
+                               ("lost", r"lost|已流失|挽留失败|结果(?:为|是|[:：])\s*流失")):
+            for match in re.finditer(pattern, clause, re.I):
+                prefix = clause[max(0, match.start() - 12):match.start()]
+                if re.search(r"(?:不要|不许|不准|不能|不是|没有|未能|未|别|不).{0,6}$", prefix):
+                    continue
+                declarations.add(label)
+    return None if declarations == {result} else guide
 
 
 def detect_write_intent(question: str) -> tuple[bool, str | None, str | None]:

@@ -1,11 +1,13 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Index, text
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Index, CheckConstraint, text
 from sqlalchemy.sql import func
 from app.database import Base
 
 
 class WorkOrder(Base):
     __tablename__ = "work_orders"
-    __table_args__ = (Index("uq_active_customer_work_order", "customer_id", unique=True,
+    __table_args__ = (CheckConstraint(
+        "status IN ('pending', 'in_progress', 'completed', 'lost', 'cancelled')",
+        name="ck_work_order_status"), Index("uq_active_customer_work_order", "customer_id", unique=True,
         sqlite_where=text("status IN ('pending', 'in_progress')"),
         postgresql_where=text("status IN ('pending', 'in_progress')")),)
 
@@ -18,7 +20,7 @@ class WorkOrder(Base):
     balance = Column(Float)                         # 客户余额
     risk_factors = Column(Text)                     # 风险因素 JSON 字符串
     strategy = Column(String)                       # 建议策略
-    status = Column(String, default="pending")      # pending / in_progress / completed / lost
+    status = Column(String, default="pending", nullable=False)  # 含 cancelled
     result_source = Column(String, default='manual')
     result_recorded_by = Column(String)
     verification_state = Column(String, default='unverified')

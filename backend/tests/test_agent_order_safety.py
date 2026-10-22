@@ -97,7 +97,8 @@ class OrderSafetyTests(unittest.TestCase):
     def confirm(self, p):
         return self.client.post("/api/agent/confirm", json={
             "action": p["action"], "payload": p["payload"],
-            "confirmation_token": p.get("confirmation_token")})
+            "confirmation_token": p.get("confirmation_token"),
+            **{key: p[key] for key in ("session_id", "session_version") if key in p}})
 
     def test_chinese_adjacent_ids(self):
         self.assertEqual(context.explicit_ids("为C071081取消工单"), ["C071081"])
@@ -584,7 +585,9 @@ class ProjectRepairTests(unittest.TestCase):
             graph.node_tools(state)
         args = call.call_args.args[1]
         self.assertEqual(args["offset"], 0)
-        self.assertEqual(args["min_balance"], 60000)
+        # ‘超过’必须排除恰好60000；不能把严格边界退化为‘至少’。
+        import math
+        self.assertEqual(args["min_balance"], math.nextafter(60000, math.inf))
         self.assertEqual(args["risk_level"], "HIGH")
         self.assertEqual(args["sort_by"], "expected_value")
 

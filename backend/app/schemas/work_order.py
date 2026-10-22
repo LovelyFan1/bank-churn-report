@@ -106,7 +106,7 @@ class WorkOrderUpdate(BaseModel):
     @classmethod
     def validate_status(cls, v: str | None) -> str | None:
         if v is None:
-            return v
+            raise ValueError("status 不能为 null；不修改状态时请省略该字段")
         allowed = {"pending", "in_progress", "completed", "lost", "cancelled"}
         if v not in allowed:
             raise ValueError(f"status must be one of {allowed}")

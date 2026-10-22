@@ -85,6 +85,7 @@ class AgentState(TypedDict, total=False):
     draft: str
     headline: str
     insights: list[str]
+    synthesis_warning: str       # 措辞失败时保留工具数据，并解释降级原因
     # 决策节点的**原答正文** —— 仅在"模型没查数据、但它的话本身就是答案"
     # 时填入（寒暄、身份、常识类）。见 graph.node_synthesis 的说明。
     #
@@ -134,6 +135,7 @@ def initial_state(session_id: str, question: str) -> AgentState:
         draft="",
         headline="",
         insights=[],
+        synthesis_warning="",
         direct_answer="",
         verify_fail=[],
         verify_passed=False,

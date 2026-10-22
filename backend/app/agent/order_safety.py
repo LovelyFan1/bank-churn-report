@@ -22,6 +22,7 @@ class PendingAgentAction(Base):
     username = Column(String, nullable=False)
     action = Column(String, nullable=False)
     payload = Column(Text, nullable=False)
+    session_id = Column(String(64))
     snapshot = Column(Text)
     expires_at = Column(Float, nullable=False)
     consumed = Column(Integer, nullable=False, default=0)
@@ -131,8 +132,18 @@ def fingerprint(order):
     return hashlib.sha256(json.dumps(raw, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def issue(db, user, pending):
+def issue(db, user, pending, *, session_id=None):
     from app.routers.work_orders import _assert_can_touch
+    lease = db.info.get("agent_session_lease")
+    if session_id is not None and lease:
+        sid, version, deadline = lease
+        checked = db.query(AgentSession).filter(
+            AgentSession.username == user.username, AgentSession.session_id == sid,
+            AgentSession.session_id == session_id, AgentSession.version == version,
+            AgentSession.busy_until == deadline, AgentSession.busy_until > time.time(),
+        ).update({"busy_until": deadline}, synchronize_session=False)
+        if checked != 1:
+            raise HTTPException(409, "会话请求已失效，请重新准备操作。")
     action, body = pending["action"], pending["payload"]
     snap = None
     if action in ORDER_ACTIONS:
@@ -167,7 +178,7 @@ def issue(db, user, pending):
     db.add(PendingAgentAction(
         token_hash=hashlib.sha256(token.encode()).hexdigest(), username=user.username,
         action=action, payload=json.dumps(body, ensure_ascii=False), snapshot=snap,
-        expires_at=time.time() + 600, consumed=0))
+        session_id=session_id, expires_at=time.time() + 600, consumed=0))
     db.commit()
     pending["confirmation_token"] = token
     return pending
@@ -191,6 +202,28 @@ def claim(db, user, request):
     body = json.loads(item.payload)
     if request.get("action") != item.action or request.get("payload") != body:
         raise HTTPException(409, "确认内容与待确认操作不一致，请重新查询。")
+    session_id = request.get("session_id")
+    if item.session_id is None:
+        if session_id is not None or request.get("session_version") is not None:
+            raise HTTPException(409, "历史未绑定凭据不能转入当前会话，请重新准备操作。")
+    else:
+        if session_id != item.session_id:
+            raise HTTPException(409, "确认凭据不属于当前会话，请重新准备操作。")
+        version = request.get("session_version")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise HTTPException(409, "缺少有效会话版本，请刷新会话后重试。")
+        now = time.time()
+        # 与凭据、业务写入和审计处于同一个事务；并发旧窗口不能覆盖上下文。
+        changed = db.query(AgentSession).filter(
+            AgentSession.username == user.username,
+            AgentSession.session_id == session_id,
+            AgentSession.version == version,
+            AgentSession.expires_at > now,
+            AgentSession.busy_until <= now,
+        ).update({"version": version + 1}, synchronize_session=False)
+        if changed != 1:
+            raise HTTPException(409, "会话已更新、已过期或正在处理请求，请刷新后重新确认。")
+        db.expire_all()
     if item.action in ORDER_ACTIONS:
         from app.routers.work_orders import _assert_can_touch
         order = db.get(WorkOrder, body["order_id"])

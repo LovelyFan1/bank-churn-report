@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -160,6 +160,10 @@ def agent_ask(body: AskRequest, request: Request,
         pending = result.get("pending_action")
         if pending:
             action = pending.get("action")
+            if action == "update_work_order":
+                error = guard_rules.completion_result_error(q, pending.get("payload") or {})
+                if error:
+                    raise ValueError(error)
             kind = ("create" if action in ("create_work_order", "create_work_order_batch")
                     else "delete" if action == "delete_work_order"
                     else "cancel" if (pending.get("payload") or {}).get("status") == "cancelled" else "update")
@@ -168,11 +172,23 @@ def agent_ask(body: AskRequest, request: Request,
             error = guard_rules.write_action_error(q, kind, ids)
             if error:
                 raise ValueError(error)
+            if kind == "create":
+                approved = set(ctx_mod.resolve_create_targets(q, ctx))
+                if action == "create_work_order_batch":
+                    actual = {it.get("customer_id") for it in pending.get("items", [])}
+                    actual.update(it.get("customer_id") for it in pending.get("failed", []))
+                    actual.update(pending.get("remaining_customer_ids") or [])
+                    requested = set(pending.get("requested_customer_ids") or actual)
+                    if requested != approved or actual != approved:
+                        raise ValueError("建单方案与本轮指定的完整客户范围不一致，请重新指定对象。")
+                elif len(approved) != 1 or ids not in approved:
+                    raise ValueError("建单方案与本轮指定的客户范围不一致，请重新指定对象。")
         if pending and pending.get("action") == "create_work_order_batch":
             plan = pending
             pending = _prepare_create(db, user,
                 [it["customer_id"] for it in pending.get("items", [])],
-                (pending.get("items") or [{}])[0].get("assignee", ""))
+                (pending.get("items") or [{}])[0].get("assignee", ""),
+                session_id=body.session_id)
             pending["failed"] += plan.get("failed") or []
             for key in ("requested_customer_ids", "remaining_customer_ids", "batch_limit"):
                 if key in plan:
@@ -194,7 +210,7 @@ def agent_ask(body: AskRequest, request: Request,
                 if order.id != p.get("order_id"):
                     raise ValueError("模型提出的工单与当前目标不一致，已拦截，请指定工单编号重新操作。")
                 p["customer_id"] = order.customer_id
-            order_safety.issue(db, user, pending)
+            order_safety.issue(db, user, pending, session_id=body.session_id)
             result = _pending_reply(pending, ctx)
         completed = True
     except ValueError as e:
@@ -214,15 +230,13 @@ def agent_ask(body: AskRequest, request: Request,
         )
     finally:
         db.rollback()
-        session = db.get(order_safety.AgentSession, (user.username, body.session_id))
-        if session:
-            if completed:
-                session.context = json.dumps(result.get("context") or ctx, ensure_ascii=False)
-                session.version += 1
-                version = session.version
-            session.busy_until = 0
-            session.expires_at = time.time() + SESSION_TTL_SECONDS
-            db.commit()
+        state = _finish_session(db, user, body.session_id,
+                                (result.get("context") or ctx) if completed else None)
+        if state:
+            version = state["session_version"]
+
+    if result.get("pending_action"):
+        result["pending_action"].update(session_id=body.session_id, session_version=version)
 
     return {
         "question": q,
@@ -256,15 +270,43 @@ def _start_session(db, user, body):
         for c in ctx["customers"]:
             c["prob"], c["balance"] = None, None
     version = row.version
+    lease = now + 180
     claimed = db.query(model).filter(model.username == user.username,
         model.session_id == body.session_id, model.version == version,
-        model.busy_until <= now).update({"busy_until": now + 180}, synchronize_session=False)
+        model.busy_until <= now).update({"busy_until": lease}, synchronize_session=False)
     if claimed != 1:
         db.rollback()
         raise HTTPException(409, "当前会话正在处理上一条请求，请等待完成")
     db.query(model).filter(model.expires_at < now, model.busy_until <= now).delete(synchronize_session=False)
     db.commit()
+    db.info["agent_session_lease"] = (body.session_id, version, lease)
     return ctx, version
+
+
+def _finish_session(db, user, session_id, context=None):
+    """只有持有原租约的请求能发布结果，过时请求不能覆盖后来窗口。"""
+    lease = db.info.pop("agent_session_lease", None)
+    if not lease or lease[0] != session_id:
+        return None
+    _, version, deadline = lease
+    values = {"busy_until": 0, "expires_at": time.time() + SESSION_TTL_SECONDS}
+    if context is not None:
+        context = ctx_mod.normalize(context)
+        values.update(context=json.dumps(context, ensure_ascii=False), version=version + 1)
+    changed = db.query(order_safety.AgentSession).filter(
+        order_safety.AgentSession.username == user.username,
+        order_safety.AgentSession.session_id == session_id,
+        order_safety.AgentSession.version == version,
+        order_safety.AgentSession.busy_until == deadline,
+    ).update(values, synchronize_session=False)
+    if changed != 1:
+        db.rollback()
+        if context is not None:
+            raise HTTPException(409, "会话已更新，本次结果已失效，请刷新后重试")
+        return None
+    db.commit()
+    return {"session_id": session_id, "session_version": version + (context is not None),
+            "context": context} if context is not None else None
 
 
 def _pending_reply(pending, context):
@@ -282,9 +324,9 @@ def read_session(session_id: str,
                  db: Session = Depends(get_db)):
     row = db.get(order_safety.AgentSession, (user.username, session_id))
     if row is None or row.expires_at <= time.time():
-        return {"context": ctx_mod.empty(), "session_version": 0, "expired": True,
+        return {"session_id": session_id, "context": ctx_mod.empty(), "session_version": 0, "expired": True,
                 "context_ttl_seconds": SESSION_TTL_SECONDS, "expires_at": None}
-    return {"context": json.loads(row.context), "session_version": row.version, "expired": False,
+    return {"session_id": session_id, "context": json.loads(row.context), "session_version": row.version, "expired": False,
             "context_ttl_seconds": SESSION_TTL_SECONDS, "expires_at": row.expires_at}
 
 
@@ -319,15 +361,37 @@ def clear_session(session_id: str, body: RevokeRequest,
     if row and row.busy_until > time.time():
         raise HTTPException(409, "会话请求尚在处理，完成后再清空")
     if row:
-        row.context = "{}"
-        row.version += 1
-        row.expires_at = 0
+        changed = db.query(order_safety.AgentSession).filter(
+            order_safety.AgentSession.username == user.username,
+            order_safety.AgentSession.session_id == session_id,
+            order_safety.AgentSession.version == row.version,
+            order_safety.AgentSession.busy_until <= time.time(),
+        ).update({"context": "{}", "version": row.version + 1, "expires_at": 0},
+                 synchronize_session=False)
+        if changed != 1:
+            db.rollback()
+            raise HTTPException(409, "会话已在其他窗口更新，请刷新后再清空")
+    db.query(order_safety.PendingAgentAction).filter(
+        order_safety.PendingAgentAction.username == user.username,
+        order_safety.PendingAgentAction.session_id == session_id,
+    ).update({"consumed": 1}, synchronize_session=False)
     _revoke_tokens(db, user, body.confirmation_tokens)
     db.commit()
     return {"cleared": True}
 
 
-class PrepareCancelRequest(BaseModel):
+class SessionWriteRequest(BaseModel):
+    session_id: str | None = Field(default=None, min_length=1, max_length=64)
+    session_version: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_session_pair(self):
+        if (self.session_id is None) != (self.session_version is None):
+            raise ValueError("会话标识和版本必须同时提供")
+        return self
+
+
+class PrepareCancelRequest(SessionWriteRequest):
     order_id: int = Field(gt=0)
     customer_id: str = Field(pattern=r"^C\d{4,}$")
 
@@ -337,12 +401,47 @@ async def prepare_order_cancel(body: PrepareCancelRequest,
                                user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
                                db: Session = Depends(get_db)):
     """列表选择的单子也必须先准备并展示快照，再由用户确认。"""
+    ctx = None
+    if body.session_id is not None:
+        ctx, _ = _start_session(db, user, AskRequest(question="准备取消工单",
+            session_id=body.session_id, session_version=body.session_version))
     try:
         order = order_safety.resolve(db, user, f"取消 {body.customer_id} 工单 #{body.order_id}",
                                      None, cancel=True)
+        pending = order_safety.issue(db, user, order_safety.proposal(order), session_id=body.session_id)
+        if ctx is not None:
+            pending.update(_finish_session(db, user, body.session_id, ctx))
+        return pending
     except ValueError as e:
         raise HTTPException(409, str(e))
-    return order_safety.issue(db, user, order_safety.proposal(order))
+    finally:
+        db.rollback()
+        _finish_session(db, user, body.session_id)
+
+
+def _sync_confirmed_context(db, user, payload, order, *, deleted=False):
+    session_id = payload.get("session_id")
+    if session_id is None:
+        return {}
+    session = db.get(order_safety.AgentSession, (user.username, session_id))
+    ctx = ctx_mod.normalize(json.loads(session.context))
+    mode = payload.get("context_mode", "single")
+    batch = mode != "single"
+    if mode in ("single", "batch_start"):
+        ctx["orders"] = []
+    else:
+        ctx["orders"] = [o for o in ctx["orders"] if o["order_id"] != order["id"]]
+    if not deleted:
+        ctx["orders"].append({"order_id": order["id"], "customer_id": order["customer_id"],
+                              "name": order.get("customer_name") or "", "status": order["status"]})
+    elif not batch:
+        # 删除后没有可继续指代的工单，不得悄悄回退到更早的客户或历史单。
+        ctx = ctx_mod.empty()
+    ctx["focus_customer_id"] = None if batch or deleted else order["customer_id"]
+    ctx = ctx_mod.normalize(ctx)
+    session.context = json.dumps(ctx, ensure_ascii=False)
+    session.expires_at = time.time() + SESSION_TTL_SECONDS
+    return {"session_id": session_id, "session_version": session.version, "context": ctx}
 
 
 @router.post("/confirm")
@@ -376,6 +475,8 @@ async def agent_confirm(payload: dict, request: Request,
     body = payload.get("payload")
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="缺少 payload")
+    if payload.get("context_mode", "single") not in ("single", "batch_start", "batch"):
+        raise HTTPException(422, "无效上下文操作模式")
 
     db = SessionLocal()
     try:
@@ -412,13 +513,14 @@ async def agent_confirm(payload: dict, request: Request,
                         "via": "agent"},
                 source="agent", ip=auth_deps._client_ip(request),
                 message=f"通过智能助手为客户 {created.get('customer_id')} 创建挽留工单")
+            state = _sync_confirmed_context(db, user, payload, created)
             db.commit()
-            return {"created": True, "action": action, "order": created}
+            return {"created": True, "action": action, "order": created, **state}
 
         if action == "update_work_order":
             oid = int(body.get("order_id"))
             fields = {k: v for k, v in body.items()
-                      if k in ("status", "assignee", "note") and v is not None}
+                      if k in ("status", "assignee", "note", "result") and v is not None}
             if not fields:
                 raise HTTPException(status_code=422,
                                     detail="update_work_order 至少需要 status/assignee/note 之一")
@@ -432,8 +534,9 @@ async def agent_confirm(payload: dict, request: Request,
                         "via": "agent"},
                 source="agent", ip=auth_deps._client_ip(request),
                 message=f"通过智能助手{'取消（保留记录）' if updated.get('status') == 'cancelled' else '修改'}工单 #{oid}")
+            state = _sync_confirmed_context(db, user, payload, updated)
             db.commit()
-            return {"created": False, "action": action, "order": updated}
+            return {"created": False, "action": action, "order": updated, **state}
 
         # delete_work_order
         oid = int(body.get("order_id"))
@@ -452,9 +555,10 @@ async def agent_confirm(payload: dict, request: Request,
             detail={"order_id": oid, "deleted_order": before, "via": "agent"},
             source="agent", ip=auth_deps._client_ip(request),
             message=f"通过智能助手删除工单 #{oid}")
+        state = _sync_confirmed_context(db, user, payload, {"id": oid, **(before or {})}, deleted=True)
         db.commit()
         return {"created": False, "action": action, "deleted": True,
-                "order_id": oid, "deleted_order": before}
+                "order_id": oid, "deleted_order": before, **state}
 
     except HTTPException as e:
         db.rollback()
@@ -482,12 +586,12 @@ async def agent_confirm(payload: dict, request: Request,
         db.close()
 
 
-class PrepareCreateRequest(BaseModel):
+class PrepareCreateRequest(SessionWriteRequest):
     customer_ids: list[str] = Field(min_length=1, max_length=20)
     assignee: str = Field(default="", max_length=64)
 
 
-def _prepare_create(db, user, ids, assignee=""):
+def _prepare_create(db, user, ids, assignee="", *, session_id=None):
     if not auth.has_perm(user.role or "", auth.PERM_ORDER_WRITE):
         raise HTTPException(403, "无工单写入权限")
     from app.services.customer_service import get_retention_customer
@@ -502,7 +606,7 @@ def _prepare_create(db, user, ids, assignee=""):
                 action=d.get("action"), channel=d.get("channel"))["note"]
             proposal = {"action": "create_work_order", "payload": {
                 "customer_id": cid, "assignee": assignee, "note": note}}
-            order_safety.issue(db, user, proposal)
+            order_safety.issue(db, user, proposal, session_id=session_id)
             items.append({**proposal["payload"], "confirmation_token": proposal["confirmation_token"]})
         except HTTPException as e:
             db.rollback()
@@ -515,10 +619,20 @@ def _prepare_create(db, user, ids, assignee=""):
 def prepare_create(body: PrepareCreateRequest,
                    user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE)),
                    db: Session = Depends(get_db)):
-    return _prepare_create(db, user, body.customer_ids, body.assignee)
+    if body.session_id is None:
+        return _prepare_create(db, user, body.customer_ids, body.assignee)
+    ctx, _ = _start_session(db, user, AskRequest(question="准备创建工单",
+        session_id=body.session_id, session_version=body.session_version))
+    try:
+        pending = _prepare_create(db, user, body.customer_ids, body.assignee, session_id=body.session_id)
+        pending.update(_finish_session(db, user, body.session_id, ctx))
+        return pending
+    finally:
+        db.rollback()
+        _finish_session(db, user, body.session_id)
 
 
-class BatchConfirmRequest(BaseModel):
+class BatchConfirmRequest(SessionWriteRequest):
     proposals: list[dict] = Field(min_length=1, max_length=20)
 
 
@@ -526,17 +640,32 @@ class BatchConfirmRequest(BaseModel):
 async def agent_confirm_batch(body: BatchConfirmRequest, request: Request,
                              user: User = Depends(auth_deps.require_perm(auth.PERM_ORDER_WRITE))):
     """逐项消费已审阅的一次性凭据；失败单独汇报，不重建未批准的快照。"""
-    created, failed = [], []
+    created, failed, state = [], [], {}
+    version = body.session_version
     for proposal in body.proposals:
         if proposal.get("action") != "create_work_order":
             raise HTTPException(422, "批量建单只接受 create_work_order 提议")
     for proposal in body.proposals:
         cid = (proposal.get("payload") or {}).get("customer_id")
         try:
-            result = await agent_confirm(proposal, request, user=user)
+            scoped = dict(proposal)
+            if body.session_id is not None:
+                mode = "single" if len(body.proposals) == 1 else "batch" if created else "batch_start"
+                scoped.update(session_id=body.session_id, session_version=version, context_mode=mode)
+            result = await agent_confirm(scoped, request, user=user)
             created.append(result["order"])
+            if "context" in result:
+                state = {key: result[key] for key in ("context", "session_id", "session_version")}
+                version = result["session_version"]
         except HTTPException as e:
             failed.append({"customer_id": cid, "reason": str(e.detail)})
+    if body.session_id is not None:
+        from app.database import SessionLocal
+        with SessionLocal() as db:
+            current = read_session(body.session_id, user=user, db=db)
+            if current["expired"] and not created:
+                raise HTTPException(409, "会话已过期或已清空，请刷新后重新准备操作。")
+            state = {key: current[key] for key in ("context", "session_id", "session_version", "expired")}
     return {"requested": len(body.proposals), "succeeded": len(created),
             "failed_count": len(failed), "skipped_count": 0,
-            "created": created, "failed": failed, "skipped": []}
+            "created": created, "failed": failed, "skipped": [], **state}

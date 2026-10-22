@@ -2,7 +2,7 @@
 # Build and update with both files; database and existing models stay persistent.
 services:
   backend:
-    image: bank-churn-report-backend:deployment-20261005
+    image: bank-churn-report-backend:deployment-20261023
     env_file:
       - path: ./backend/.env
         required: false
@@ -16,7 +16,7 @@ services:
       - ./../模拟仿真客户数据:/data-source:ro
 
   celery-worker:
-    image: bank-churn-report-celery-worker:deployment-20261005
+    image: bank-churn-report-celery-worker:deployment-20261023
     env_file:
       - path: ./backend/.env
         required: false
@@ -28,7 +28,7 @@ services:
       - ./../模拟仿真客户数据:/data-source:ro
 
   frontend:
-    image: bank-churn-report-frontend:deployment-20261005
+    image: bank-churn-report-frontend:deployment-20261023
     build:
       dockerfile: Dockerfile.production
     ports: !override
