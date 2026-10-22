@@ -750,9 +750,25 @@ function receiptLabel(turn) {
  *   `**删除不可恢复**` 这类标记 —— 直接显示会露出星号。
  *   选择在前端清洗而不是只改后端：后端文案将来仍可能有人写 Markdown，
  *   前端做一道兜底更稳（与 verify 的"双重保障"思路一致）。
+ *
+ * ⚠ 2026-10-23 补齐多行正文的清洗（实测：问"你好"时模型用 Markdown 列能力，
+ *   界面上露出 `**客户风险**` 和 `- ` 短横线）。正文用的是 pre-wrap 多行渲染，
+ *   只去星号不够，还要处理标题井号、列表符号、引用和分隔线。
+ *   清洗是**确定性的**，不依赖模型自觉（提示词要求过，模型照样会写）。
  */
 function plain(s) {
-  return (s || '').replace(/\*\*/g, '').replace(/`/g, '')
+  return String(s || '')
+    .replace(/^#{1,6}\s*/gm, '')            // 标题：### 标题 → 标题
+    .replace(/^\s*[-*+]\s+/gm, '· ')         // 无序列表：- x → · x
+    .replace(/^\s*(\d+[.)])\s+/gm, '$1 ')   // 有序列表：保留序号与一个空格
+    .replace(/\*\*(.+?)\*\*/g, '$1')         // 粗体：**x** → x
+    // ⚠ 刻意不处理 `__x__`：那会把 `__error__`、`__init__` 这类标识符
+    //   改坏，而模型写粗体几乎只用 `**`。宁可漏一种写法，不改坏字段名。
+    .replace(/`{1,3}/g, '')                  // 行内代码 / 代码围栏
+    .replace(/^\s*>\s?/gm, '')               // 引用
+    .replace(/^\s*([-*_])\1{2,}\s*$/gm, '')  // 分隔线 --- / *** / ___
+    .replace(/\n{3,}/g, '\n\n')              // 多余空行压成一行
+    .replace(/[ \t]+$/gm, '')                // 行尾空格
 }
 
 const canAsk = computed(() => !sessionBusy.value && question.value.trim().length > 0)
@@ -901,7 +917,7 @@ function warnClass(level) {
 
           <!-- ⑥ 纯文本兜底 -->
           <div v-if="t.answer.kind === 'text' && t.answer.text" class="ans-text">
-            {{ t.answer.text }}
+            {{ plain(t.answer.text) }}
           </div>
 
           <!-- ⑦ 动作按钮 —— 目标与可用性由后端确定 -->
