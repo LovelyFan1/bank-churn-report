@@ -331,42 +331,21 @@ async function clearSession() {
   nextTick(() => { suppressPersist = false })
 }
 
-const BASIS = {
-  llm_verified: { label: '系统数据 · 模型解读需复核', cls: 'b-verified' },
-  system_data: { label: '系统数据 · 确定性查询', cls: 'b-verified' },
-  // ⚠ 口径说明（2026-10-23 调整）：模型写的解读没通过核验时，界面上**只剩纯系统数据**
-  //   （卡片、数字、标题全部由 Python 从工具结果构造，没有一句模型措辞）。
-  //   原先这里显示"模型解读含未溯源数字 · 已丢弃该段"，描述的其实是系统内部动作，
-  //   用户看到的却像一个故障 —— 首次查询就可能出现，演示误导性很强。
-  //   现在：徽章按**实际展示内容**标为"系统数据"；省略这件事收进「依据」面板，
-  //   `basis` 仍保留 llm_partial_dropped 供日志与追溯，不改变接口语义。
-  llm_partial_dropped: { label: '系统数据 · 确定性查询', cls: 'b-verified' },
-  // system_meta = 系统模板直接回答（你是谁/能做什么/技术栈）。
-  // 与 LLM 无关，因此不存在幻觉可能，但也不是"数据查询"。
-  system_meta: { label: '系统信息 · 确定性回答', cls: 'b-meta' },
-  // no_data = 模型没查任何数据就作答。可能是常识性回答，
-  // 但没有系统数据支撑，不能显示"已校验"。
-  no_data: { label: '未经数据核对', cls: 'b-nodata' },
-  guard_blocked: { label: '触及系统边界 · 已在调用模型前拦截', cls: 'b-guard' },
-  system_pending_action: { label: '系统生成的待确认操作', cls: 'b-pending' },
-  // ── E01/E02 新增口径（与后端 capabilities.basis_meaning 一一对应）──
-  // ⚠ operation_rejected 与 tool_error 都是**代码生成**的确定性说明：
-  //   前者是业务规则拒绝（已有在途工单/已流失），后者是工具查询失败。
-  //   两者都不得显示成"已校验"——它们没有经过模型，也没有可展示的解读。
-  operation_rejected: { label: '业务规则拒绝 · 未执行写操作', cls: 'b-fallback' },
-  tool_error: { label: '查询未成功 · 原因由系统给出', cls: 'b-fallback' },
-  upstream_unavailable: { label: '模型服务暂不可用 · 本轮未查询', cls: 'b-guard' },
-  disabled: { label: '智能体未启用', cls: 'b-guard' },
-  // 请求层的失败口径（以前一律显示"智能体未启用"，把超时/无权限误导成功能关闭）
-  unauthorized: { label: '登录已失效', cls: 'b-guard' },
-  forbidden: { label: '无使用权限', cls: 'b-guard' },
-  conflict: { label: '会话冲突', cls: 'b-fallback' },
-  invalid_request: { label: '请求不合法', cls: 'b-fallback' },
-  unavailable: { label: '服务暂时不可用', cls: 'b-guard' },
-}
-function basisOf(b) {
-  return BASIS[b] || { label: b || '未知', cls: '' }
-}
+// ── 回答口径徽章：已从界面移除（2026-10-23）────────────────────
+//
+// ⚠ 为什么删掉而不是改文案：
+//   以前每条回答顶部都有一个口径标签（"系统数据 · 模型解读需复核"、
+//   "未经数据核对"…）。它们是给开发/评审看的**内部溯源标记**，
+//   但用户读到的是"这条答案可能有问题"—— 演示时每条回答都挂一次，
+//   既解释不清也不改变任何操作。
+//
+//   删除后**安全性没有变化**：
+//     · 模型解读仍要过实体/指标/单位核对，不过就不显示；
+//     · 失败、拒绝、模型不可用等**会改变行动**的状态，仍由 headline
+//       与 warning 明确说出（那些不是口径标签，是结论本身）；
+//     · `basis` 仍随接口返回，也仍存进 localStorage，日志与排查不受影响。
+//
+//   若将来需要恢复，映射表可从 git 历史取回（提交 d72f1dc 及之前）。
 
 /**
  * 把一次失败的请求映射成**可区分**的提示。
@@ -863,8 +842,6 @@ function warnClass(level) {
         <div v-if="t.role === 'user'" class="bubble user-bubble">{{ t.text }}</div>
 
         <div v-else class="bubble agent-bubble">
-          <div :class="['basis', basisOf(t.basis).cls]">{{ basisOf(t.basis).label }}</div>
-
           <!-- ① 结论 -->
           <h2 v-if="t.answer.headline" class="ans-headline">{{ plain(t.answer.headline) }}</h2>
 
@@ -1195,17 +1172,6 @@ function warnClass(level) {
 .bubble { max-width: 86%; border-radius: 10px; padding: 11px 14px; font-size: 13px; line-height: 1.75; }
 .user-bubble { background: #1d4ed8; color: #fff; white-space: pre-wrap; }
 .agent-bubble { background: #f8fafc; border: 1px solid #e5e9f0; color: #1f2937; width: 100%; }
-
-.basis { display: inline-block; font-size: 10.5px; padding: 2px 8px; border-radius: 10px;
-         margin-bottom: 8px; font-weight: 600; }
-.b-verified { color: #0f766e; background: #e6f6f3; border: 1px solid #b7e4dc; }
-.b-fallback { color: #b45309; background: #fdf6e3; border: 1px solid #f0dfa8; }
-/* system_meta：系统模板回答（非 LLM），中性偏冷色 */
-.b-meta { color: #1d4ed8; background: #eef3fb; border: 1px solid #c7d6ee; }
-/* no_data：未经数据核对。用琥珀色提示（不是红色 —— 答案未必错，只是没依据） */
-.b-nodata { color: #b45309; background: #fdf6e3; border: 1px solid #f0dfa8; }
-.b-guard    { color: #1d4ed8; background: #eef3fb; border: 1px solid #c7d6ee; }
-.b-pending  { color: #6d28d9; background: #f3f0ff; border: 1px solid #ddd6fe; }
 
 /* ① 结论 */
 .ans-headline { font-size: 15.5px; font-weight: 700; color: #17335c; margin: 2px 0 10px; line-height: 1.5; }
