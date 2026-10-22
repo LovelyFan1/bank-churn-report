@@ -87,6 +87,51 @@ def reset() -> None:
     _writer = None
 
 
+# ══════════════════════════════════════════════════════════
+# 上游异常分类（E02）
+# ══════════════════════════════════════════════════════════
+#
+# 为什么集中在这里：模型调用点分布在决策节点与措辞节点，若各写一份
+# `except (TimeoutError, ...)`，迟早出现"某处漏了一类"，表现为
+# 偶发的通用 500 —— 用户看到的是"系统崩了"，而不是"模型暂不可用"。
+#
+# ⚠ 只认**上游服务**的故障。编程错误（TypeError/KeyError）不得归类为
+#   上游不可用，否则真 bug 会被伪装成"稍后重试"，永远查不出来。
+
+_UPSTREAM_CODES = {
+    "APITimeoutError": ("upstream_timeout", True),
+    "APIConnectionError": ("upstream_unavailable", True),
+    "RateLimitError": ("upstream_rate_limited", True),
+    "InternalServerError": ("upstream_unavailable", True),
+    "APIStatusError": ("upstream_error", True),
+}
+
+
+def classify_upstream_error(exc: BaseException) -> dict | None:
+    """把上游异常映射成稳定的错误码；不是上游故障则返回 None。"""
+    code, retryable = _UPSTREAM_CODES.get(type(exc).__name__, (None, True))
+    if code is None:
+        try:
+            import openai
+        except Exception:                        # 依赖缺失时退回内置判断
+            openai = None
+        if openai is not None and isinstance(exc, openai.OpenAIError):
+            code = "upstream_unavailable"
+        elif isinstance(exc, (TimeoutError, ConnectionError)):
+            code = "upstream_timeout" if isinstance(exc, TimeoutError) else "upstream_unavailable"
+        elif isinstance(exc, OSError):
+            code = "upstream_unavailable"
+        else:
+            return None
+    message = {
+        "upstream_timeout": "模型服务响应超时，本轮未能完成解读。",
+        "upstream_rate_limited": "模型服务当前限流，请稍后重试。",
+        "upstream_unavailable": "模型服务暂时不可用。",
+        "upstream_error": "模型服务返回异常，本轮未能完成解读。",
+    }.get(code, "模型服务暂时不可用。")
+    return {"code": code, "message": message, "retryable": retryable}
+
+
 def is_available() -> tuple[bool, str]:
     """检查 Agent 是否可用，返回 (可用, 原因)。供接口层给出明确提示。"""
     if not settings.AGENT_ENABLED:

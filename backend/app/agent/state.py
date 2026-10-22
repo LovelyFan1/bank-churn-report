@@ -86,6 +86,18 @@ class AgentState(TypedDict, total=False):
     headline: str
     insights: list[str]
     synthesis_warning: str       # 措辞失败时保留工具数据，并解释降级原因
+    # 决策模型不可用时的显式状态（E02）。
+    # ⚠ 必须是**独立字段**而不是靠消息列表推断：旧消息里可能残留上一条
+    #   AIMessage.tool_calls，仅看消息会重复执行旧工具、或再进强制分支。
+    upstream_failure: bool
+    upstream_error: dict | None
+    # 确定性错误回答（工具拒绝 / 只有失败结果时由代码生成，不经模型改写）
+    error_answer: dict | None
+    # 覆盖 answer_basis（如上游降级需要 basis=upstream_unavailable）
+    answer_basis_override: str | None
+    # 上一轮可信历史事实（服务端只读工具产物，已裁剪、带 TTL），
+    # 供核验与写手引用；**不参与**名单、序号与写目标解析。
+    history_facts: list[dict]
     # 决策节点的**原答正文** —— 仅在"模型没查数据、但它的话本身就是答案"
     # 时填入（寒暄、身份、常识类）。见 graph.node_synthesis 的说明。
     #
@@ -136,6 +148,11 @@ def initial_state(session_id: str, question: str) -> AgentState:
         headline="",
         insights=[],
         synthesis_warning="",
+        upstream_failure=False,
+        upstream_error=None,
+        error_answer=None,
+        answer_basis_override=None,
+        history_facts=[],
         direct_answer="",
         verify_fail=[],
         verify_passed=False,

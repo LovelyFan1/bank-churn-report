@@ -54,6 +54,20 @@ def main() -> int:
     """建表 + 补列 + 播种（幂等）。成功返回 0，失败返回 1。"""
     Base.metadata.create_all(bind=engine)
 
+    # ── 并发口径留痕（E04）──────────────────────────────────
+    # 单进程启动阶段打印**实际加载**的 SQLite 版本与 journal 模式：
+    # 出问题时能第一时间判断"是不是库/模式的问题"，而不是靠猜。
+    # ⚠ 只读探测，不切换 journal_mode（见 app/database.py 的说明）。
+    try:
+        from app.database import sqlite_runtime_info
+        rt = sqlite_runtime_info()
+        if rt.get("is_sqlite"):
+            print(f"[preseed] SQLite {rt.get('sqlite_version')} "
+                  f"journal_mode={rt.get('journal_mode')} "
+                  f"busy_timeout={rt.get('busy_timeout_ms')}ms", flush=True)
+    except Exception as exc:                      # 探测失败不应阻断启动
+        print(f"[preseed] SQLite 运行口径探测失败: {type(exc).__name__}", flush=True)
+
     # ⚠ 补列必须紧接 create_all，且早于任何 ORM 查询：
     #   create_all 只建新表，**不会**给已有表加列。缺这一步的话，
     #   老库上任何 SELECT created_by 都会 500（报 no such column），

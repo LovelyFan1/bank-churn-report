@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from app.agent import guard_rules, llm, order_safety
+from app.agent import tools as tools_mod
 from app.agent import context as ctx_mod
 SESSION_TTL_SECONDS = 3600
 from app.database import get_db
@@ -102,7 +103,18 @@ async def agent_capabilities():
             "no_data": "模型未查询任何系统数据即作答，未经数据核对",
             "guard_blocked": "该问题触及本系统答不了的边界，已在调用模型前拦截",
             "system_pending_action": "系统生成的待确认操作说明（未执行写操作）",
+            "operation_rejected": "业务规则拒绝了本次操作，原因由系统按错误码生成（不经过模型）",
+            "tool_error": "工具查询失败，原因由系统按错误码生成（不经过模型）",
+            "upstream_unavailable": "模型服务暂不可用，本轮没有执行查询或写入",
             "disabled": "智能体未启用",
+        },
+        "history_fact_policy": {
+            "ttl_seconds": ctx_mod.FACT_TTL_SECONDS,
+            "max_answers": ctx_mod.MAX_FACT_ANSWERS,
+            "max_facts": ctx_mod.MAX_FACTS,
+            "metrics": ["probability", "balance", "expected_value"],
+            "note": "只保存服务端只读查询得到的数值，用于回答「刚才/上次」；"
+                    "问「现在/最新」时会重新查询，历史值不作为当前值。",
         },
     }
 
@@ -137,7 +149,22 @@ def agent_ask(body: AskRequest, request: Request,
     if not q:
         raise HTTPException(status_code=422, detail="问题不能为空")
 
-    ctx, version = _start_session(db, user, body)
+    # ⚠ 工具层的 HTTP 自调必须带**本次登录用户**的令牌（E05）：
+    #   过去带服务级内部令牌，中间件把它换成 admin —— Agent 的查询于是
+    #   以管理员身份执行，绕开按用户的可见范围。这里只把令牌放进
+    #   请求范围的 ContextVar，不写库、不进 state、不打日志。
+    raw_authz = request.headers.get("authorization") or ""
+    user_token = (raw_authz.split(" ", 1)[1].strip()
+                  if raw_authz.lower().startswith("bearer ") else None)
+    token_handle = tools_mod.set_request_token(user_token)
+
+    try:
+        ctx, version = _start_session(db, user, body)
+    except Exception:
+        # 会话准备失败（409/402 等）也必须恢复 ContextVar，否则同线程
+        # 后续请求会带着上一位用户的令牌
+        tools_mod.reset_request_token(token_handle)
+        raise
     result = {}
     completed = False
     explicit = ctx_mod.explicit_ids(q)
@@ -229,6 +256,9 @@ def agent_ask(body: AskRequest, request: Request,
                    else "智能体执行失败，请稍后重试或联系管理员。",
         )
     finally:
+        # ⚠ 先恢复 ContextVar，再做会话收尾 —— 收尾里的任何查询都不应
+        #   继续以"上一位用户"的身份发出去（跨请求串号的典型来源）。
+        tools_mod.reset_request_token(token_handle)
         db.rollback()
         state = _finish_session(db, user, body.session_id,
                                 (result.get("context") or ctx) if completed else None)
@@ -262,13 +292,17 @@ def _start_session(db, user, body):
     expired = row.expires_at <= now
     if not expired and body.session_version is not None and body.session_version != row.version:
         raise HTTPException(409, "会话已在其他窗口更新，请刷新会话后重试")
-    ctx = ctx_mod.normalize(json.loads(row.context)) if not expired else ctx_mod.empty()
+    ctx = (ctx_mod.normalize(json.loads(row.context), trusted=True)
+           if not expired else ctx_mod.empty())
     if row.version == 0:
-        # 兼容旧前端的实体指针；客户端数值与筛选任务不作为可信事实。
+        # 兼容旧前端的实体指针；客户端数值、历史事实与筛选任务都不作为可信依据。
+        # ⚠ trusted=False 会**整段丢弃**客户端 facts —— 历史事实是核验白名单
+        #   的一部分，能由客户端写就等于关掉校验（E03.6）。
         ctx = ctx_mod.normalize(body.context)
         ctx.pop("list_query", None)
         for c in ctx["customers"]:
             c["prob"], c["balance"] = None, None
+        ctx["facts"] = []
     version = row.version
     lease = now + 180
     claimed = db.query(model).filter(model.username == user.username,
@@ -291,7 +325,7 @@ def _finish_session(db, user, session_id, context=None):
     _, version, deadline = lease
     values = {"busy_until": 0, "expires_at": time.time() + SESSION_TTL_SECONDS}
     if context is not None:
-        context = ctx_mod.normalize(context)
+        context = ctx_mod.normalize(context, trusted=True)
         values.update(context=json.dumps(context, ensure_ascii=False), version=version + 1)
     changed = db.query(order_safety.AgentSession).filter(
         order_safety.AgentSession.username == user.username,
@@ -314,7 +348,8 @@ def _pending_reply(pending, context):
     out = node_verify({"pending_action": pending, "tool_results": []})
     return {"answer": out["answer"], "text": out["final"],
             "basis": out["answer_basis"], "pending_action": pending,
-            "context": ctx_mod.merge(ctx_mod.normalize(context), ctx_mod.extract([], pending)),
+            "context": ctx_mod.merge(ctx_mod.normalize(context, trusted=True),
+                                     ctx_mod.extract([], pending)),
             "citations": [], "tool_calls": [], "verify_failed": []}
 
 
@@ -424,7 +459,7 @@ def _sync_confirmed_context(db, user, payload, order, *, deleted=False):
     if session_id is None:
         return {}
     session = db.get(order_safety.AgentSession, (user.username, session_id))
-    ctx = ctx_mod.normalize(json.loads(session.context))
+    ctx = ctx_mod.normalize(json.loads(session.context), trusted=True)
     mode = payload.get("context_mode", "single")
     batch = mode != "single"
     if mode in ("single", "batch_start"):
@@ -438,7 +473,7 @@ def _sync_confirmed_context(db, user, payload, order, *, deleted=False):
         # 删除后没有可继续指代的工单，不得悄悄回退到更早的客户或历史单。
         ctx = ctx_mod.empty()
     ctx["focus_customer_id"] = None if batch or deleted else order["customer_id"]
-    ctx = ctx_mod.normalize(ctx)
+    ctx = ctx_mod.normalize(ctx, trusted=True)
     session.context = json.dumps(ctx, ensure_ascii=False)
     session.expires_at = time.time() + SESSION_TTL_SECONDS
     return {"session_id": session_id, "session_version": session.version, "context": ctx}

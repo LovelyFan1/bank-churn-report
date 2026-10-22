@@ -194,7 +194,29 @@ def _context_block(state: AgentState) -> str:
 def node_agent(state: AgentState) -> dict:
     """② LLM 决策节点 —— 决定调工具还是直接答。
 
-    这是图里**唯一**允许 LLM 决定控制流的地方。
+    这里是**上游异常的唯一出口**（E02）：模型初建、绑定工具、首次调用、
+    强制工具调用、以及拿到读取结果后的再次调用，全部在同一个 try 里。
+    捕获后置 `upstream_failure` 并结束本轮模型决策，路由据此直接进入
+    措辞节点 —— 既不会因旧消息里残留的 tool_calls 重复执行工具，也不会
+    再回到 force_tools / force_write 分支空转。
+
+    ⚠ 未知的编程错误**不在这里吞掉**：只捕获已识别的上游异常类型
+      （超时 / 连接 / 上游状态码），其余继续冒泡，保持可观测。
+    """
+    try:
+        return _agent_decide(state)
+    except Exception as exc:                      # noqa: BLE001 —— 分类后再抛
+        failure = llm.classify_upstream_error(exc)
+        if failure is None:
+            raise
+        logger.warning("agent: 决策模型不可用 code=%s err=%s",
+                       failure["code"], type(exc).__name__)
+        return {"upstream_failure": True, "upstream_error": failure,
+                "messages": [AIMessage(content="")]}
+
+
+def _agent_decide(state: AgentState) -> dict:
+    """node_agent 的实际决策逻辑（不含异常边界）。
 
     ⚠ 为什么不把历史 AIMessage/ToolMessage 原样回灌（踩过坑）：
       OpenAI 协议要求每个 tool_call 都必须有配对的 tool_call_id 的
@@ -474,6 +496,38 @@ def _scope_error(state: AgentState, name: str, args: dict,
     return None
 
 
+def _call_key(name: str, args: dict) -> str:
+    """工具调用的**规范化**指纹 —— 用于"同参数已被拒绝"的判定。
+
+    ⚠ 模型可能省略 `assignee=""` 这类空值，而确定性兜底会补上；
+      若按原始参数比较，两次调用会被当成不同请求，于是重复触发一个
+      必然失败的业务拒绝（用户白等一轮）。故这里剔掉空值再比较。
+    """
+    clean = {k: v for k, v in (args or {}).items() if v not in (None, "", [], {})}
+    return f"{name}::{json.dumps(clean, sort_keys=True, ensure_ascii=False)}"
+
+
+def _failure_data(r: dict) -> dict:
+    """把工具失败记录裁成 `tool_results[].data` 的安全形状。
+
+    ⚠ 只放 `error/error_code/retryable` 与工具自己给的 details。
+      原始异常文本、HTTP 响应体、内网地址一律不进 `data` —— 它会流到
+      前端、`text`、批量失败原因与模型上下文（E01.3）。
+    """
+    data = {"error": r.get("error") or "操作未成功。",
+            "error_code": r.get("error_code") or "TOOL_ERROR",
+            "retryable": bool(r.get("retryable", False))}
+    for key, value in (r.get("details") or {}).items():
+        if key not in data:
+            data[key] = value
+    return data
+
+
+def _record_failure(state: AgentState, name: str, args: dict, r: dict) -> dict:
+    """统一的失败留痕 —— tool_calls_made 与 tool_results 同源。"""
+    return {"tool": name, "args": args, "ok": False, "data": _failure_data(r)}
+
+
 def node_tools(state: AgentState) -> dict:
     """③ 执行工具。
 
@@ -488,6 +542,10 @@ def node_tools(state: AgentState) -> dict:
 
     ⚠ 越界拦截（会话上下文配套）：带编号的工具在执行前先过 `_scope_error`，
       编号无法溯源则不执行、把原因回给模型让它重决策（见该函数说明）。
+
+    ⚠ 失败也必须**留痕**（E01.4）：写提议失败过去只进 `tool_calls_made`，
+      不进 `tool_results`，于是用户最终只看到"未能取得数据" ——
+      原因（已有在途工单 / 已流失 / 无权访问）全部丢失。
     """
     last = None
     for m in reversed(state.get("messages", [])):
@@ -505,6 +563,14 @@ def node_tools(state: AgentState) -> dict:
     # ⚠ 作用域仅限**本轮**（本函数一次调用）—— 跨轮不去重，
     #    因为模型可能确实需要重查（先查列表、再查其中某一项）。
     seen_this_round: dict[str, dict] = {}
+
+    # 已经**明确不可重试**的拒绝：同工具同参数本轮请求不再尝试第二次。
+    # 否则模型会反复重试一个注定失败的业务拒绝，用户白等几十秒（E01.5）。
+    blocked: dict[str, dict] = {}
+    for rec in made:
+        if rec.get("ok") or rec.get("retryable", True):
+            continue
+        blocked.setdefault(_call_key(rec["name"], rec.get("args") or {}), rec)
 
     for tc in last.tool_calls:
         if time.monotonic() >= state.get("deadline", float("inf")):
@@ -537,41 +603,63 @@ def node_tools(state: AgentState) -> dict:
         dedup_key = f"{name}::{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
 
         if dedup_key in seen_this_round:
-            cached = seen_this_round[dedup_key]
             logger.info("agent: 跳过重复工具调用 %s（本轮已执行）", name)
             continue
 
+        if _call_key(name, args) in blocked:
+            logger.info("agent: 同一请求已明确拒绝，跳过重复尝试 %s", name)
+            continue
         # ── 输出侧边界：编号必须可溯源 ────────────────────────
         scope_err = _scope_error(state, name, args, results)
         if scope_err:
-            r = {"ok": False, "error": scope_err}
+            r = {"ok": False, "error": scope_err, "error_code": "OUT_OF_SCOPE",
+                 "retryable": False}
             seen_this_round[dedup_key] = r
             made.append({"name": name, "args": args, "ok": False,
-                         "result": None, "error": scope_err})
-            results.append({"tool": name, "args": args, "ok": False,
-                            "data": {"error": scope_err}})
+                         "result": None, "error": scope_err,
+                         "error_code": "OUT_OF_SCOPE", "retryable": False})
+            results.append(_record_failure(state, name, args, r))
             continue
 
         if name in tools.WRITE_TOOL_NAMES:
             # 写操作：生成待确认动作，**不落库**
             r = tools.call_tool(name, args)
             seen_this_round[dedup_key] = r
-            made.append({"name": name, "args": args, "ok": r.get("ok", False),
-                         "result": r.get("result"), "error": r.get("error")})
-            if r.get("ok"):
-                pending = r["result"]
-            logger.info("agent: 写操作转为待确认 name=%s args=%s", name, args)
+            ok = bool(r.get("ok"))
+            result = r.get("result")
+            if ok:
+                # 形状校验：ok=True 不足以证明这是可执行动作（E01.8）
+                valid, reason = tools.validate_pending(result)
+                if not valid:
+                    logger.warning("agent: 待确认动作形状无效 %s：%s", name, reason)
+                    ok, result = False, None
+                    r = {"ok": False,
+                         "error": "未能生成可执行的确认请求，请稍后重试或到工单页面操作。",
+                         "error_code": "INVALID_PENDING_ACTION", "retryable": False}
+            made.append({"name": name, "args": args, "ok": ok,
+                         "result": result, "error": r.get("error"),
+                         "error_code": r.get("error_code"),
+                         "retryable": r.get("retryable", True)})
+            if ok:
+                pending = result
+                logger.info("agent: 写操作转为待确认 name=%s args=%s", name, args)
+            else:
+                results.append(_record_failure(state, name, args, r))
+                logger.info("agent: 写提议失败 %s code=%s（原因已记录）",
+                            name, r.get("error_code"))
             continue
 
         r = tools.call_tool(name, args)
         seen_this_round[dedup_key] = r
         made.append({"name": name, "args": args, "ok": r.get("ok", False),
-                     "result": r.get("result"), "error": r.get("error")})
+                     "result": r.get("result"), "error": r.get("error"),
+                     "error_code": r.get("error_code"),
+                     "retryable": r.get("retryable", True)})
         results.append({
             "tool": name,
             "args": args,
             "ok": r.get("ok", False),
-            "data": r.get("result") if r.get("ok") else {"error": r.get("error")},
+            "data": r.get("result") if r.get("ok") else _failure_data(r),
         })
         logger.info("agent: 工具 %s ok=%s", name, r.get("ok"))
 
@@ -616,9 +704,106 @@ def _last_decision_text(state: AgentState) -> str:
     return ""
 
 
+_BUSINESS_CODES = {
+    "ACTIVE_ORDER_EXISTS", "CUSTOMER_EXITED", "CUSTOMER_NOT_FOUND", "INVALID_STATUS",
+    "RESULT_REQUIRED", "TARGET_MISMATCH", "BATCH_NO_ITEMS", "BATCH_LIMIT_EXCEEDED",
+    "STALE_MODEL_VERSION", "CONFLICT", "NOT_FOUND", "OUT_OF_SCOPE",
+    "INVALID_PENDING_ACTION", "BUSINESS_REJECTED",
+}
+
+_NEXT_STEP = {
+    "ACTIVE_ORDER_EXISTS": "该客户已有在途工单，请先处理现有工单，或换一位客户。",
+    "CUSTOMER_EXITED": "已流失客户不能准备建单，请改选未流失客户。",
+    "CUSTOMER_NOT_FOUND": "请核对客户编号后重试。",
+    "BATCH_NO_ITEMS": "本批客户都不满足建单条件，可换一批或先处理在途工单。",
+    "BATCH_LIMIT_EXCEEDED": "请把名单拆成不超过 50 位后再试。",
+    "RESULT_REQUIRED": "请补充挽留结果（挽留成功或流失）后再提交。",
+    "TARGET_MISMATCH": "请指定该工单对应的客户编号后重试。",
+    "PERMISSION_DENIED": "当前角色无权执行该操作，请联系管理员。",
+    "TIMEOUT": "请缩小查询范围或稍后重试。",
+    "UPSTREAM_UNAVAILABLE": "系统服务暂时不可用，请稍后重试。",
+    "OUT_OF_SCOPE": "请先查询名单，或直接写出客户编号。",
+}
+
+
+def _failure_answer(state: AgentState, failures: list[dict]) -> dict:
+    """只有失败结果时，由**代码**生成确定性错误回答（E01.6）。
+
+    ⚠ 为什么不能交给模型改写：业务拒绝的原因（已有在途工单 / 已流失 /
+      无权访问）是确定性事实，模型转述时容易弱化成"未能取得数据"，
+      甚至补一句"没有匹配的客户"。用户需要知道**为什么**没做成，
+      以及**下一步该做什么**。这两件事都能由错误码直接映射。
+    """
+    primary = next((tr for tr in reversed(failures)
+                    if tr.get("tool") in tools.WRITE_TOOL_NAMES), failures[-1])
+    data = primary.get("data") or {}
+    code = data.get("error_code") or "TOOL_ERROR"
+    reason = data.get("error") or "操作未成功。"
+    retryable = bool(data.get("retryable"))
+    business = code in _BUSINESS_CODES
+
+    lines = [f"未能完成：{reason}"]
+    failed_items = data.get("failed") or []
+    if failed_items:
+        detail = "；".join(f"{it.get('customer_id')}（{it.get('reason')}）"
+                          for it in failed_items[:10])
+        lines.append(f"逐项结果：{detail}")
+    remaining = data.get("remaining_customer_ids") or []
+    if remaining:
+        lines.append(f"名单还剩 {len(remaining)} 位未处理（下一批仍需你确认，不会自动执行）。")
+    hint = _NEXT_STEP.get(code) or ("请稍后重试。" if retryable else "请调整条件后重试。")
+    lines.append(f"可以这样处理：{hint}")
+
+    return {
+        "kind": "text",
+        "headline": "操作未完成" if business else "查询未成功",
+        "warning": {"level": "warn", "text": reason, "hint": hint},
+        "entities": [], "facts": [], "actions": [], "insights": [],
+        "text": "\n".join(lines),
+        "error": {"code": code, "retryable": retryable},
+    }
+
+
+def _degraded_answer(state: AgentState) -> dict:
+    """上游不可用时的结构性收尾（E02）。
+
+    有成功数据 → 保留数据卡片，只丢掉模型解读；
+    没有数据   → 给明确可重试的上游不可用说明，**不编造任何业务事实**，
+                 也不产生新的待确认动作。
+    """
+    info = state.get("upstream_error") or {}
+    successes = [tr for tr in state.get("tool_results") or [] if tr.get("ok")]
+    if successes:
+        return {
+            "draft": "", "headline": "", "insights": [],
+            "synthesis_warning": "模型解读暂不可用，已保留本轮查询结果；"
+                                 "卡片与数字仍来自系统数据。",
+            "answer_basis_override": "system_data",
+        }
+    message = info.get("message") or "模型服务暂时不可用。"
+    return {
+        "error_answer": {
+            "kind": "text",
+            "headline": "模型服务暂时不可用",
+            "warning": {"level": "warn", "text": message,
+                        "hint": "这是上游模型服务的故障，不代表查询失败或没有数据；稍后重试即可。"},
+            "entities": [], "facts": [], "actions": [], "insights": [],
+            "text": f"抱歉，{message}本轮没有执行任何查询或写入，请稍后重试。",
+            "error": {"code": info.get("code") or "upstream_unavailable",
+                      "retryable": bool(info.get("retryable", True))},
+        },
+        "answer_basis_override": "upstream_unavailable",
+        "draft": "", "headline": "", "insights": [],
+    }
+
+
 def node_synthesis(state: AgentState) -> dict:
     """④ 生成回答 —— LLM 只负责措辞，数字已由工具确定。"""
     pending = state.get("pending_action")
+
+    # ── 上游已判故障：不再调用同一个故障上游 ────────────────
+    if state.get("upstream_failure"):
+        return _degraded_answer(state)
 
     # ── 确定性兜底：写意图必须产出待确认动作 ──────────────────
     #
@@ -630,6 +815,8 @@ def node_synthesis(state: AgentState) -> dict:
     #   故此处直接再判一次写意图：若识别到写意图 + 有客户编号，
     #   却仍没有 pending_action，就**绕过 LLM** 直接调用提议工具。
     #   这样"建单必须经过确认流程"成为系统的硬保证。
+    recorded_results = list(state.get("tool_results") or [])
+    recorded_calls = list(state.get("tool_calls_made") or [])
     if pending is None:
         w_intent, cids, assignee = guard_rules.detect_write_intent_multi(
             state["question"])
@@ -637,22 +824,56 @@ def node_synthesis(state: AgentState) -> dict:
         if w_intent:
             cids = ctx_mod.resolve_create_targets(state["question"], state.get("context_in"))
         if w_intent and cids:
-            logger.warning("agent: LLM 未产出待确认动作，启用确定性兜底 cids=%s", cids)
-            if len(cids) > 1:
-                r = tools.call_tool("propose_create_work_orders_batch",
-                                    {"customer_ids": cids,
-                                     "assignee": assignee or ""})
+            name = ("propose_create_work_orders_batch" if len(cids) > 1
+                    else "propose_create_work_order")
+            call_args = ({"customer_ids": cids, "assignee": assignee or ""}
+                         if len(cids) > 1 else
+                         {"customer_id": cids[0], "assignee": assignee or ""})
+            blocked = {_call_key(r["name"], r.get("args") or {})
+                       for r in recorded_calls
+                       if not r.get("ok") and not r.get("retryable", True)}
+            key = _call_key(name, call_args)
+            if key in blocked:
+                # 同一工具同参数已被明确拒绝 —— 不再重复尝试（E01.5）
+                logger.info("agent: 兜底提议此前已被拒绝，跳过重复调用 %s", name)
             else:
-                r = tools.call_tool("propose_create_work_order",
-                                    {"customer_id": cids[0],
-                                     "assignee": assignee or ""})
-            if r.get("ok"):
-                pending = r["result"]
-            else:
-                logger.error("agent: 兜底建单提议也失败：%s", r.get("error"))
+                logger.warning("agent: LLM 未产出待确认动作，启用确定性兜底 cids=%s", cids)
+                r = tools.call_tool(name, call_args)
+                recorded_calls.append({"name": name, "args": call_args,
+                                       "ok": r.get("ok", False),
+                                       "result": r.get("result"),
+                                       "error": r.get("error"),
+                                       "error_code": r.get("error_code"),
+                                       "retryable": r.get("retryable", True)})
+                if r.get("ok"):
+                    valid, why = tools.validate_pending(r.get("result"))
+                    if valid:
+                        pending = r["result"]
+                    else:
+                        logger.error("agent: 兜底建单提议形状无效：%s", why)
+                        recorded_results.append(_record_failure(
+                            state, name, call_args,
+                            {"ok": False, "error": "未能生成可执行的确认请求，请到工单页面操作。",
+                             "error_code": "INVALID_PENDING_ACTION", "retryable": False}))
+                else:
+                    # ⚠ 兜底再次失败也必须留痕 —— 旧实现只写日志，
+                    #   于是用户看到的是"未能取得数据"，真实原因被吞掉。
+                    logger.error("agent: 兜底建单提议也失败：%s", r.get("error_code"))
+                    recorded_results.append(_record_failure(state, name, call_args, r))
 
     if pending:
-        return {"draft": _pending_text(pending), "pending_action": pending}
+        return {"draft": _pending_text(pending), "pending_action": pending,
+                "tool_results": recorded_results, "tool_calls_made": recorded_calls}
+
+    # ── 只有失败结果：确定性错误回答，不叫模型改写 ──────────────
+    failures = [tr for tr in recorded_results if not tr.get("ok")]
+    successes = [tr for tr in recorded_results if tr.get("ok")]
+    if failures and not successes:
+        logger.info("agent: 本轮仅有失败结果，生成确定性错误回答 codes=%s",
+                    [t.get("data", {}).get("error_code") for t in failures])
+        return {"error_answer": _failure_answer(state, failures),
+                "draft": "", "headline": "", "insights": [],
+                "tool_results": recorded_results, "tool_calls_made": recorded_calls}
 
     # ── 零工具调用：决策节点的回答本身就是完整答案 ──────────────
     #
@@ -684,7 +905,7 @@ def node_synthesis(state: AgentState) -> dict:
     #   即：误判只导致"少说一句"，不会导致"展示编造内容"。
     #
     # ⚠ 只影响 `tool_results` 为空的路径，不碰任何数据查询逻辑。
-    if not state.get("tool_results"):
+    if not recorded_results:
         decision_text = _last_decision_text(state)
         if decision_text and not _needs_data(state.get("question", "")):
             logger.info("agent: 零工具调用且非数据类问题，采用决策节点原答（不再叫写手重编）")
@@ -697,8 +918,7 @@ def node_synthesis(state: AgentState) -> dict:
                     "headline": "",
                     "insights": []}
 
-    payload = json.dumps(state.get("tool_results", []),
-                         ensure_ascii=False, default=str)
+    payload = json.dumps(recorded_results, ensure_ascii=False, default=str)
     if len(payload) > 12000:
         payload = payload[:12000] + "…（数据过长已截断）"
 
@@ -707,8 +927,9 @@ def node_synthesis(state: AgentState) -> dict:
         HumanMessage(content=(
             f"用户问题：{state['question']}\n\n"
             f"工具返回的真实数据（JSON）：\n{payload}\n\n"
-            f"请按要求输出 JSON（headline + insights）。"
-            f"再次强调：每个数字都必须来自上面的 JSON。"
+            + _history_block(state)
+            + "请按要求输出 JSON（headline + insights）。"
+            f"再次强调：每个数字都必须来自上面的数据。"
         )),
     ]
     if time.monotonic() >= state.get("deadline", float("inf")):
@@ -718,11 +939,40 @@ def node_synthesis(state: AgentState) -> dict:
         resp = llm.writer_llm().invoke(msgs)
         content = resp.content
         headline, insights = _parse_writer_output(content)
-    except Exception as exc:
-        logger.warning("agent: 写手不可用，保留系统数据 (%s)", type(exc).__name__)
+    except Exception as exc:                      # noqa: BLE001
+        failure = llm.classify_upstream_error(exc)
+        if failure is None:
+            logger.warning("agent: 写手不可用，保留系统数据 (%s)", type(exc).__name__)
+            return {"draft": "", "headline": "", "insights": [],
+                    "synthesis_warning": "模型解读暂不可用，已保留查询到的系统数据，请以数据卡片为准。"}
+        logger.warning("agent: 写手上游故障 code=%s", failure["code"])
         return {"draft": "", "headline": "", "insights": [],
-                "synthesis_warning": "模型解读暂不可用，已保留查询到的系统数据，请以数据卡片为准。"}
+                "synthesis_warning": "模型解读暂不可用，已保留查询到的系统数据，请以数据卡片为准。",
+                "answer_basis_override": "system_data"}
     return {"draft": content, "headline": headline, "insights": insights}
+
+
+def _history_block(state: AgentState) -> str:
+    """把**上一轮可信事实**渲染给写手（E03.11）。
+
+    ⚠ 只给裁剪后的结构化事实，不回灌整份对话或原始工具结果：
+      写手若不知道历史值，就会出现"校验放行了、文案却说不出"的割裂；
+      但把整份历史灌进去，又会诱导它把旧值当现值复述。
+    """
+    facts = state.get("history_facts") or []
+    if not facts:
+        return ""
+    lines = []
+    for fact in facts[:12]:
+        value = fact.get("value")
+        unit = fact.get("unit")
+        shown = (f"{float(value) * 100:.1f}%" if unit == "fraction" and isinstance(value, (int, float))
+                 else f"¥{float(value):,.2f}" if unit == "yuan" and isinstance(value, (int, float))
+                 else value)
+        lines.append(f"- {fact.get('entity_id')} {fact.get('metric')} = {shown}"
+                     f"（上次查询，{fact.get('observed_at_iso') or '时间不详'}）")
+    return ("\n上一次查询留下的可信数值（仅可用于「刚才/上次」这类表述，"
+            "不能说成现在的最新值）：\n" + "\n".join(lines) + "\n\n")
 
 
 def _parse_writer_output(raw: str) -> tuple[str, list[str]]:
@@ -799,6 +1049,16 @@ def node_verify(state: AgentState) -> dict:
       用户仍能看到完整卡片与按钮，只是少了模型的一句观察。
     """
     tool_results = state.get("tool_results", [])
+
+    # ── 确定性错误回答 / 上游降级：直接采用，不再经过校验与构造 ────
+    if state.get("error_answer"):
+        ans = state["error_answer"]
+        basis = state.get("answer_basis_override") or (
+            "operation_rejected" if (ans.get("error") or {}).get("code") in _BUSINESS_CODES
+            else "tool_error")
+        return {"verify_passed": True, "verify_fail": [],
+                "final": answer_builder.to_text(ans), "answer": ans,
+                "answer_basis": basis, "citations": _citations(state)}
 
     # 待确认写操作：文本由系统生成，不含 LLM 数字，跳过校验
     #
@@ -913,9 +1173,9 @@ def node_verify(state: AgentState) -> dict:
     )
     ok, orphans = verify_mod.verify(
         llm_text, tool_results, question=state.get("question") or "",
-        # 上下文里的数字也算合法出处 —— 否则多轮追问引用上一轮数据
-        # 会被误判为幻觉，徽章集体退化。详见 verify.verify 的说明。
-        extra_sources=None,
+        # 上一轮的可信事实（结构化、带实体/指标/单位/时效）——
+        # 只有这种形状才进核验，浮点数列表/字典一律不放行（E03.8）。
+        extra_sources=state.get("history_facts") or None,
     )
 
     headline = state.get("headline") or ""
@@ -1008,19 +1268,41 @@ def node_verify(state: AgentState) -> dict:
         warning["level"] = "warn"
         warning["text"] = "；".join(filter(None, (warning.get("text"), verify_mod.explain(orphans))))
         ans["warning"] = warning
+    # 读成功 + 写失败：数据卡片保留，另**明确**说清写操作没做成（E01.7）。
+    # ⚠ 不能只靠一张成功卡片掩盖写失败，也不能因为写失败丢掉已查数据。
+    write_failures = [t for t in tool_results
+                      if not t.get("ok") and t.get("tool") in tools.WRITE_TOOL_NAMES]
+    if write_failures:
+        reason = (write_failures[-1].get("data") or {}).get("error") or "操作未准备成功。"
+        warning = dict(ans.get("warning") or {})
+        warning["level"] = "warn"
+        warning["text"] = "；".join(filter(None, (
+            warning.get("text"), f"工单未准备/未创建：{reason}")))
+        warning["hint"] = warning.get("hint") or "已查到的数据仍然有效，可稍后重试该操作。"
+        ans["warning"] = warning
     synthesis_warning = state.get("synthesis_warning")
     if synthesis_warning:
         warning = dict(ans.get("warning") or {})
         warning["level"] = "warn"
         warning["text"] = "；".join(filter(None, (warning.get("text"), synthesis_warning)))
         ans["warning"] = warning
+    history_cites = _history_citations(state, llm_text)
+    if history_cites:
+        ans["history_used"] = True
+        warning = dict(ans.get("warning") or {})
+        warning["text"] = "；".join(filter(None, (
+            warning.get("text"),
+            "其中包含上次查询留下的历史数值，不是本轮实时数据。")))
+        ans["warning"] = warning
+    basis = state.get("answer_basis_override") or (
+        "system_data" if synthesis_warning else "llm_verified" if ok else "llm_partial_dropped")
     return {
         "verify_passed": ok,
         "verify_fail": orphans,
         "final": answer_builder.to_text(ans),
         "answer": ans,
-        "answer_basis": ("system_data" if synthesis_warning else "llm_verified" if ok else "llm_partial_dropped"),
-        "citations": _citations(state),
+        "answer_basis": basis,
+        "citations": _citations(state) + history_cites,
     }
 
 
@@ -1196,6 +1478,33 @@ def _citations(state: AgentState) -> list[str]:
         else:
             out.append(f"tool://{tr['tool']}#failed")
     return out
+
+
+def _history_citations(state: AgentState, text: str) -> list[str]:
+    """只有**实际被引用**的历史事实才出现在 citations（E03.12）。
+
+    判据：同一句中同时出现该客户编号与该指标的中文别名。
+    这样"历史值正确引用"和"历史值被张冠李戴"在展示层可区分，
+    也让前端能提示"这条不是本轮查的"。
+    """
+    facts = state.get("history_facts") or []
+    if not facts or not text:
+        return []
+    aliases = verify_mod._ALIASES
+    out = []
+    for fact in facts:
+        cid = str(fact.get("entity_id") or "").upper()
+        metric = fact.get("metric")
+        if not cid or not metric:
+            continue
+        names = aliases.get(metric) or ()
+        for clause in re.split(r"[，,。；;\n]", text):
+            if cid not in clause.upper():
+                continue
+            if any(name in clause for name in names):
+                out.append(f"history://{cid}?metric={metric}")
+                break
+    return list(dict.fromkeys(out))
 
 
 def _tool_schemas() -> list[dict]:
@@ -1438,6 +1747,9 @@ def route_after_agent(state: AgentState) -> str:
       因为校验器只查"数字有没有出处"，一个数字都没有自然"通过"。
       即：**无依据的断言得了高可信度标记**，这是最危险的一类错误。
     """
+    if state.get("upstream_failure"):
+        # 上游已判故障：立即停止模型决策，不再进 tools / force_tools / force_write
+        return "synthesize"
     if (time.monotonic() >= state.get("deadline", float("inf"))
             or state.get("rounds", 0) >= settings.AGENT_MAX_TOOL_ROUNDS):
         logger.warning("agent: 达到工具轮次上界 %s，停止调用",
@@ -1650,11 +1962,17 @@ def run(question: str, session_id: str = "default",
     """
     token = tools._request_deadline.set(time.monotonic() + 45)
     try:
-        ctx_in = ctx_mod.normalize(context)
+        # ⚠ trusted=True：这里的 context 由 Router 从**服务端会话表**读出，
+        #   不是客户端原始输入。若按不可信处理，历史事实会在进入图之前被
+        #   整段丢掉，E03 的修复就永远不会生效（客户端注入在 Router 侧已拦）。
+        ctx_in = ctx_mod.normalize(context, trusted=True)
 
         st = initial_state(session_id, question)
         st["deadline"] = time.monotonic() + 45
         st["context_in"] = ctx_in
+        # 上一轮可信事实（服务端只读工具产物，已按 TTL/容量裁剪）——
+        # 只用于核验与写手复述，**不参与**名单、序号与写目标解析（E03.4）。
+        st["history_facts"] = ctx_mod.history_facts(ctx_in)
         continuation = ctx_in.get("list_query")
         followup = list_queries.is_customer_continuation(question)
         actual = list_queries.is_global_retention_summary(question, ctx_in)

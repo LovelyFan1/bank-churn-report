@@ -343,10 +343,57 @@ const BASIS = {
   no_data: { label: '未经数据核对', cls: 'b-nodata' },
   guard_blocked: { label: '触及系统边界 · 已在调用模型前拦截', cls: 'b-guard' },
   system_pending_action: { label: '系统生成的待确认操作', cls: 'b-pending' },
+  // ── E01/E02 新增口径（与后端 capabilities.basis_meaning 一一对应）──
+  // ⚠ operation_rejected 与 tool_error 都是**代码生成**的确定性说明：
+  //   前者是业务规则拒绝（已有在途工单/已流失），后者是工具查询失败。
+  //   两者都不得显示成"已校验"——它们没有经过模型，也没有可展示的解读。
+  operation_rejected: { label: '业务规则拒绝 · 未执行写操作', cls: 'b-fallback' },
+  tool_error: { label: '查询未成功 · 原因由系统给出', cls: 'b-fallback' },
+  upstream_unavailable: { label: '模型服务暂不可用 · 本轮未查询', cls: 'b-guard' },
   disabled: { label: '智能体未启用', cls: 'b-guard' },
+  // 请求层的失败口径（以前一律显示"智能体未启用"，把超时/无权限误导成功能关闭）
+  unauthorized: { label: '登录已失效', cls: 'b-guard' },
+  forbidden: { label: '无使用权限', cls: 'b-guard' },
+  conflict: { label: '会话冲突', cls: 'b-fallback' },
+  invalid_request: { label: '请求不合法', cls: 'b-fallback' },
+  unavailable: { label: '服务暂时不可用', cls: 'b-guard' },
 }
 function basisOf(b) {
   return BASIS[b] || { label: b || '未知', cls: '' }
+}
+
+/**
+ * 把一次失败的请求映射成**可区分**的提示。
+ *
+ * ⚠ 旧实现把所有异常都标成 `disabled`，于是上游超时、无权限、会话冲突
+ *   全被显示成"智能体未启用" —— 用户以为功能被关掉了，实际上系统在跑。
+ *   这里按状态码与后端 detail 分开，且**不**复用"未启用"的文案。
+ */
+function failureTurn(e) {
+  const status = e.response?.status
+  const detail = e.response?.data?.detail
+  if (status === 401) {
+    return { basis: 'unauthorized', headline: '登录已失效', text: '请重新登录后再使用智能助手。' }
+  }
+  if (status === 403) {
+    return { basis: 'forbidden', headline: '无使用权限', text: detail || '当前角色无权使用智能助手。' }
+  }
+  if (status === 409) {
+    return { basis: 'conflict', headline: '会话已更新',
+             text: detail || '该会话已在其他窗口更新，请刷新会话后重试。' }
+  }
+  if (status === 422) {
+    return { basis: 'invalid_request', headline: '请求不合法', text: detail || '请检查问题内容后重试。' }
+  }
+  if (status === 503) {
+    return { basis: 'disabled', headline: '智能体未启用', text: detail || '智能体当前不可用。' }
+  }
+  if (status >= 500) {
+    return { basis: 'unavailable', headline: '服务暂时不可用',
+             text: '本轮没有执行任何查询或写入，请稍后重试。' }
+  }
+  return { basis: 'unavailable', headline: '网络请求失败',
+           text: detail || e.message || '请检查网络后重试。' }
 }
 
 async function send(text) {
@@ -425,10 +472,11 @@ async function send(text) {
     })
   } catch (e) {
     await refreshOnConflict(e)
+    const failure = failureTurn(e)
     turns.value.push({
       role: 'agent',
-      answer: { kind: 'text', headline: '请求失败', text: e.response?.data?.detail || e.message },
-      basis: 'disabled', toolCalls: [], verifyFailed: [],
+      answer: { kind: 'text', headline: failure.headline, text: failure.text },
+      basis: failure.basis, toolCalls: [], verifyFailed: [],
       pending: null, showEvidence: false,
     })
   } finally {

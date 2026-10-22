@@ -23,18 +23,26 @@ Agent 不应独断。MVP 先用"返回待确认 + 前端按钮"实现，
 
 代价是多一次本机回环（实测 0.02~0.54s），可接受。
 
-**⚠ 内部鉴权（引入登录系统后新增的必要一环）**
+**⚠ 鉴权：透传**当前用户**的令牌（E05）**
 
 上面这个"HTTP 自调"的设计，在系统加上鉴权之后会**立刻坏掉**：
 工具层的 urllib 请求不带任何令牌，于是全部被 401 拦下 ——
 实测症状是「Agent 查不到任何客户 / 建单说客户不存在」，而接口本身正常。
 
-故此处统一携带**内部令牌**（见 auth_service.internal_token）。
-它只用于服务间调用，配合回环来源校验，不代表任何行员。
+早期修法是携带**服务级内部令牌**，中间件把它换成 admin。那条路有两个问题：
+  1. Agent 的查询以管理员身份执行，绕开了按用户的数据范围 ——
+     一旦把 `agent:use` 开放给客户专员，就是实打实的越权读取；
+  2. 它是一条"万能 admin 通道"，任何能发出该令牌的代码都能调用全部接口。
+
+现在改为：router 把**本次登录用户**的 Bearer 放进 ContextVar（仅请求范围内），
+工具层原样转发，下游照常做会话有效性、角色与可见范围校验。
+没有身份就**拒绝执行**，绝不回退任何服务身份。
+
 真正的写操作仍由用户令牌经 /api/agent/confirm 触发 —— 工具层只查询。
 """
 
 import json
+import logging
 import os
 import time
 from contextvars import ContextVar
@@ -43,29 +51,191 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 # 后端自己的地址。容器内走 localhost（同一容器），
 # 宿主调试时可用环境变量覆盖。
 _BASE = os.environ.get("AGENT_SELF_BASE", "http://127.0.0.1:8000")
 _TIMEOUT = 30
 _request_deadline = ContextVar("agent_request_deadline", default=None)
+# 本轮请求的真实用户 Bearer —— 由 router 在请求范围内设置（见 E05）。
+# ⚠ 只放在 ContextVar，**不进 AgentState、不落库、不打日志、不进提示词**。
+#   换线程/换请求时必须成对 set/reset，否则会串号。
+_request_token: ContextVar[str | None] = ContextVar("agent_request_token", default=None)
+
+
+# ══════════════════════════════════════════════════════════
+# 错误契约（E01）
+# ══════════════════════════════════════════════════════════
+#
+# 所有工具失败都归到这里的类型上，由 `call_tool` 统一转换成：
+#
+#     {"ok": False, "error": "<安全文案>", "error_code": "ACTIVE_ORDER_EXISTS",
+#      "retryable": False, "details": {...}}
+#
+# 为什么要有类型而不是到处 return {"__error__": ...}：
+#   · `__error__` 会被 `call_tool` 包成 ok=True —— 失败被当成成功
+#     （交接清单 E01 的原始缺陷），下游的 pending/事实/卡片全部被污染；
+#   · 不同失败（业务拒绝 / 参数错 / 越权 / 超时 / 上游故障 / 内部错误）
+#     对模型与用户的意义完全不同：有的应重试，有的绝不能重试；
+#   · 只有类型化之后，"安全文案"与"诊断信息"才能分开 —— 用户看到的是
+#     `error`，堆栈与原始响应只进日志。
+
+class ToolError(ValueError):
+    """工具失败基类。`message` 必须是**可直接展示**的中文安全文案。
+
+    ⚠ 为什么继承 `ValueError`：上层（router 的 `except ValueError`）本来就把
+      ValueError 当作"可展示给用户的拒绝"，既有用例也据此断言。保持这个
+      父类，既让错误类型更明确（业务拒绝/参数错/越权/超时/上游/内部），
+      又不改变调用方"失败→给用户一句话"的既有语义。
+      真正的区分靠 `code / retryable`，不靠异常类名。
+    """
+
+    code = "TOOL_ERROR"
+    retryable = False
+
+    def __init__(self, message: str = "", *, code: str | None = None,
+                 retryable: bool | None = None, details: dict | None = None):
+        super().__init__(message or self.code)
+        if message:
+            self.message = message
+        if code is not None:
+            self.code = code
+        if retryable is not None:
+            self.retryable = retryable
+        self.details = details or {}
+
+
+class ToolArgumentError(ToolError):
+    """参数不合法 —— 模型可以改正参数后重试。"""
+
+    code = "INVALID_ARGUMENT"
+    retryable = True
+
+
+class BusinessRejected(ToolError):
+    """业务规则拒绝 —— 重试同样的调用没有意义，必须换方案或告知用户。"""
+
+    code = "BUSINESS_REJECTED"
+    retryable = False
+
+
+class ToolPermissionDenied(ToolError):
+    """下游 401/403 —— 账号失效或权限不足，不得重试。"""
+
+    code = "PERMISSION_DENIED"
+    retryable = False
+
+
+class ToolTimeout(ToolError):
+    """查询超时/超出本轮时间预算。"""
+
+    code = "TIMEOUT"
+    retryable = True
+
+
+class ToolUpstreamError(ToolError):
+    """上游服务不可用（连不上、5xx、响应不可解析）。"""
+
+    code = "UPSTREAM_UNAVAILABLE"
+    retryable = True
+
+
+class AgentIdentityMissing(ToolError):
+    """没有可信身份就调用工具 —— 明确拒绝，不回退任何服务级身份。"""
+
+    code = "IDENTITY_REQUIRED"
+    retryable = False
+
+
+def _client_failure(exc: BaseException) -> ToolError:
+    """把 urllib / 网络层异常映射成类型化失败（不含原始响应体）。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        status = int(getattr(exc, "code", 0) or 0)
+        if status in (401, 403):
+            return ToolPermissionDenied("当前账号无权访问该数据，请确认登录状态与角色权限。")
+        if status == 404:
+            return BusinessRejected("未找到对应的记录，请核对编号。", code="NOT_FOUND")
+        if status == 409:
+            return BusinessRejected("该记录当前状态不允许此操作，请刷新后重试。",
+                                    code="CONFLICT")
+        if status == 422:
+            return ToolArgumentError("查询条件不被接受，请调整参数后重试。")
+        if status >= 500:
+            return ToolUpstreamError("系统服务暂时不可用，请稍后重试。")
+        return ToolError("查询未被接受，请调整条件后重试。", code="UPSTREAM_ERROR")
+    if isinstance(exc, TimeoutError):
+        return ToolTimeout("查询超时，请缩小范围或稍后重试。")
+    if isinstance(exc, (urllib.error.URLError, ConnectionError, OSError)):
+        return ToolUpstreamError("系统服务暂时不可用，请稍后重试。")
+    return ToolError("查询失败，请稍后重试。", code="UPSTREAM_ERROR")
+
+
+# 只允许回环地址 —— 用户令牌只发给自己，不发到任何外部主机。
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _allowed_hosts() -> set[str]:
+    extra = os.environ.get("AGENT_SELF_ALLOWED_HOSTS", "")
+    return _LOOPBACK_HOSTS | {h.strip().lower() for h in extra.split(",") if h.strip()}
+
+
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """禁止跨源重定向 —— 否则 Authorization 会被带到第三方。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        if (old.scheme, old.hostname, old.port) != (new.scheme, new.hostname, new.port):
+            raise ToolUpstreamError("查询被重定向到不安全的目标，已中止。",
+                                    code="UNSAFE_REDIRECT")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SameOriginRedirect())
+
+
+def _base_url() -> str:
+    base = os.environ.get("AGENT_SELF_BASE", _BASE)
+    parsed = urllib.parse.urlsplit(base)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ToolUpstreamError("智能体自调地址配置无效。", code="INVALID_SELF_BASE")
+    if host not in _allowed_hosts():
+        raise ToolUpstreamError("智能体自调地址不在允许范围内。", code="INVALID_SELF_BASE")
+    return base.rstrip("/")
 
 
 def _headers() -> dict:
-    """内部调用统一请求头 —— 带内部令牌，否则会被鉴权中间件 401。
+    """统一请求头 —— 携带**本次登录用户**的 Bearer（E05）。
 
-    ⚠ 延迟到调用时取（而不是模块加载时算），原因有二：
-      1. settings 可能由测试在导入后覆盖
-      2. 避免模块导入即依赖 settings，保持 tools 可独立 import
+    ⚠ 这里曾经携带服务级"内部令牌"，中间件把它转换成 admin ——
+      结果是 Agent 的查询以管理员身份执行，绕过按用户的数据范围；
+      一旦把 `agent:use` 开放给客户专员，就是实打实的越权读取。
+      现在改为透传当前用户令牌：下游照常做会话有效性、角色与范围校验，
+      失败就是失败，不会因为"是内部调用"而升级权限。
+
+    ⚠ 没有令牌时**直接拒绝**，绝不回退任何服务身份。
     """
-    h = {"Accept": "application/json"}
-    try:
+    token = _request_token.get()
+    if not token:
+        # ⚠ 唯一例外：AUTH_ENABLED=false 的显式调试态（此时中间件本就
+        #   不校验任何请求，不存在"权限边界"可言）。默认部署下必须拒绝。
+        from app.config import settings
+        if settings.AUTH_ENABLED:
+            raise AgentIdentityMissing("智能体查询缺少可信身份，已拒绝执行。")
         from app.services import auth_service
-        h["Authorization"] = "Bearer " + auth_service.internal_token()
-    except Exception:
-        # 取不到令牌时**不静默放行** —— 请求会正常 401，
-        # 从而在验证阶段暴露问题，而不是悄悄变成匿名调用
-        pass
-    return h
+        token = auth_service.internal_token()
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+
+def set_request_token(token: str | None):
+    """绑定本轮请求的用户令牌（router 调用，成对 reset）。"""
+    return _request_token.set(token)
+
+
+def reset_request_token(handle) -> None:
+    _request_token.reset(handle)
 
 
 def _get(path: str, **params) -> Any:
@@ -73,14 +243,21 @@ def _get(path: str, **params) -> Any:
     deadline = _request_deadline.get()
     remaining = deadline - time.monotonic() if deadline is not None else _TIMEOUT
     if remaining <= 0:
-        raise TimeoutError("智能体查询已达到时间预算")
+        raise ToolTimeout("本轮查询已达到时间预算，请缩小范围后重试。")
     clean = {k: v for k, v in params.items() if v is not None}
-    url = _BASE + path
+    url = _base_url() + path
     if clean:
         url += "?" + urllib.parse.urlencode(clean, doseq=True)
     req = urllib.request.Request(url, headers=_headers())
-    with urllib.request.urlopen(req, timeout=min(_TIMEOUT, remaining)) as r:
-        return json.loads(r.read().decode())
+    try:
+        with _opener.open(req, timeout=min(_TIMEOUT, remaining)) as r:
+            return json.loads(r.read().decode())
+    except ToolError:
+        raise
+    except Exception as exc:                      # noqa: BLE001 —— 统一归类后重抛
+        # 原始响应体、堆栈与内网地址只进日志，不进入异常文案（E01.3）
+        logger.info("agent tool http failure path=%s err=%s", path, type(exc).__name__)
+        raise _client_failure(exc) from exc
 
 
 # ══════════════════════════════════════════════════════════
@@ -129,12 +306,12 @@ def list_customers(risk_level: str | None = None,
     """查询客户名单；默认仅未流失且没有在途工单，所有筛选在服务端分页前完成。"""
     limit = int(limit or 10)
     if not 1 <= limit <= 50:
-        raise ValueError("一次查询支持1至50位，请明确拆分请求")
+        raise ToolArgumentError("一次查询支持1至50位，请明确拆分请求")
     if len(exclude_ids or []) > 500:
-        raise ValueError("连续名单已达500位，请明确开启新范围查询")
+        raise ToolArgumentError("连续名单已达500位，请明确开启新范围查询")
     offset = max(0, int(offset or 0))
     if sort_by not in {"expected_value", "probability", "balance", "age", "credit_score"}:
-        raise ValueError("不支持该排序字段")
+        raise ToolArgumentError("不支持该排序字段")
     d = _get("/api/customers", page_size=limit, offset=0 if exclude_ids else offset,
              risk_level=risk_level, value_tier=value_tier, min_balance=min_balance,
              max_balance=max_balance, exited=exited,
@@ -142,10 +319,11 @@ def list_customers(risk_level: str | None = None,
              worth_only=str(worth_only).lower(), sort_by=sort_by, sort_order="desc",
              geography=geography, exclude_ids=exclude_ids)
     if d.get("error"):
-        raise ValueError(d["error"])
+        raise ToolError("客户名单查询未被接受，请调整筛选条件。", code="UPSTREAM_ERROR")
     version = (d.get("risk") or {}).get("model_version")
     if expected_version and version != expected_version:
-        raise ValueError("模型快照已改变，旧名单游标不可继续，请重新查询")
+        raise BusinessRejected("模型快照已改变，旧名单游标不可继续，请重新查询。",
+                               code="STALE_MODEL_VERSION")
     keep = ["customer_id", "surname", "balance", "probability", "exited",
             "risk_level", "value_tier", "expected_value", "channel", "action", "has_active_order"]
     rows = []
@@ -270,7 +448,7 @@ def list_work_orders(status: str | None = None,
     # 会让人误以为"没有这类工单"（与 sort_by 静默回退同类问题）
     allowed = {"pending", "in_progress", "completed", "lost", "cancelled"}
     if status and status not in allowed:
-        raise ValueError("无效工单状态，不会退回全量查询")
+        raise ToolArgumentError("无效工单状态，不会退回全量查询")
 
     d = _get("/api/work-orders", page=1, page_size=limit,
              status=status, assignee=assignee, customer_id=customer_id)
@@ -326,7 +504,13 @@ def propose_create_work_order(customer_id: str,
     ⚠ 这是**写操作**，必须经用户确认。不要在回答里声称"已经建好了"。
     """
     # 先查客户，确认存在并取回建单所需字段 —— 避免开出无法执行的空单
-    d = _get(f"/api/customers/{urllib.parse.quote(str(customer_id))}")
+    try:
+        d = _get(f"/api/customers/{urllib.parse.quote(str(customer_id))}")
+    except BusinessRejected as exc:
+        if exc.code == "NOT_FOUND":
+            raise BusinessRejected(f"客户 {customer_id} 不存在，请核对编号。",
+                                   code="CUSTOMER_NOT_FOUND") from exc
+        raise
     payload = {
         "customer_id": d.get("customer_id"),
         "customer_name": d.get("surname"),
@@ -343,7 +527,11 @@ def propose_create_work_order(customer_id: str,
         "expected_value_snapshot": d.get("expected_value"),
     }
     if d.get("exited") != 0 or d.get("has_active_order"):
-        raise ValueError("客户已流失或已有在途工单，不能准备挽留建单")
+        raise BusinessRejected(
+            "该客户已流失或已有在途工单，请先处理现有工单。" if d.get("has_active_order")
+            else "该客户已流失，不能准备挽留建单。",
+            code="ACTIVE_ORDER_EXISTS" if d.get("has_active_order") else "CUSTOMER_EXITED",
+            details={"customer_id": payload.get("customer_id")})
     if not note:
         try:
             sn = _get(f"/api/customers/{urllib.parse.quote(str(customer_id))}/suggested-note")
@@ -387,9 +575,10 @@ def propose_create_work_orders_batch(customer_ids: list[str],
     seen: set[str] = set()
     ids = [c for c in ids if not (c in seen or seen.add(c))]
     if not ids:
-        return {"__error__": "customer_ids 不能为空"}
+        raise ToolArgumentError("customer_ids 不能为空")
     if len(ids) > 50:
-        return {"__error__": "单份名单最多50位，请明确拆分请求"}
+        raise BusinessRejected("单份名单最多50位，请明确拆分请求。",
+                               code="BATCH_LIMIT_EXCEEDED")
     requested_ids = list(ids)
     remaining_ids = ids[20:]
     ids = ids[:20]  # 显式分批，剩余对象随提议返回，下一批仍需确认。
@@ -399,14 +588,20 @@ def propose_create_work_orders_batch(customer_ids: list[str],
     for cid in ids:
         try:
             d = _get(f"/api/customers/{urllib.parse.quote(cid)}")
-        except Exception as e:
-            failed.append({"customer_id": cid, "reason": f"查询失败：{e}"})
+        except ToolError as exc:
+            # ⚠ 只记**安全原因**：原始异常文本可能带内网地址或上游响应
+            failed.append({"customer_id": cid, "reason": _reason_text(exc),
+                           "error_code": exc.code})
             continue
         if not d or not d.get("customer_id"):
-            failed.append({"customer_id": cid, "reason": "客户不存在"})
+            failed.append({"customer_id": cid, "reason": "客户不存在",
+                           "error_code": "CUSTOMER_NOT_FOUND"})
             continue
         if d.get("exited") != 0 or d.get("has_active_order"):
-            failed.append({"customer_id": cid, "reason": "已流失或已有在途工单"})
+            failed.append({"customer_id": cid,
+                           "reason": "已有在途工单" if d.get("has_active_order") else "已流失",
+                           "error_code": ("ACTIVE_ORDER_EXISTS" if d.get("has_active_order")
+                                          else "CUSTOMER_EXITED")})
             continue
         item = {
             "customer_id": d.get("customer_id"),
@@ -433,15 +628,22 @@ def propose_create_work_orders_batch(customer_ids: list[str],
             pass   # 理由生成失败不阻断提议
         items.append(item)
 
-    if not items and not remaining_ids:
-        return {"__error__": "没有任何可建单的客户："
-                             + "；".join(f"{f['customer_id']}({f['reason']})"
-                                        for f in failed[:3])}
+    if not items:
+        # 本批无一可建：**不能**返回空确认单，也不能丢掉剩余名单。
+        # 以业务拒绝的形式把逐项原因与剩余批次带回，由 graph 生成确定性说明。
+        summary = "；".join(f"{f['customer_id']}（{f['reason']}）" for f in failed[:5])
+        raise BusinessRejected(
+            "这一批没有可建单的客户：" + (summary or "无有效客户编号"),
+            code="BATCH_NO_ITEMS",
+            details={"failed": failed,
+                     "remaining_customer_ids": remaining_ids,
+                     "requested_customer_ids": requested_ids})
 
     return {
         "__pending_action__": True,
         "action": "create_work_order_batch",
-        "summary": f"为 {len(items)} 位客户批量创建挽留工单"
+        # 逐项失败必须显式进摘要 —— 只报"已准备 N 位"会让用户以为整批都过了
+        "summary": f"可准备 {len(items)} 位、不可准备 {len(failed)} 位"
                    + (f"，负责人 {assignee}" if assignee else ""),
         "items": items,
         "failed": failed,
@@ -472,21 +674,23 @@ def propose_update_work_order(order_id: int,
     """
     d = _get(f"/api/work-orders/{int(order_id)}")
     if not customer_id or d.get("customer_id") != customer_id.upper():
-        raise ValueError("工单不属于指定客户，已拦截")
+        raise BusinessRejected("工单不属于指定客户，已拦截。", code="TARGET_MISMATCH")
     if status == "cancelled" and d.get("status") not in ("pending", "in_progress"):
-        raise ValueError("只能取消待处理或处理中的工单")
+        raise BusinessRejected("只能取消待处理或处理中的工单。", code="INVALID_STATUS")
     allowed_statuses = {"pending", "in_progress", "completed", "lost", "cancelled"}
     if status is not None and status not in allowed_statuses:
-        raise ValueError("工单状态无效")
+        raise ToolArgumentError("工单状态无效")
     if result is not None and result not in ("retained", "lost"):
-        raise ValueError("挽留结果必须为 retained（挽留成功）或 lost（流失）")
+        raise ToolArgumentError("挽留结果必须为 retained（挽留成功）或 lost（流失）")
     if status == "completed" and result is None:
-        raise ValueError("完成工单必须明确填写挽留结果：挽留成功或流失；请补充结果或到工单页面填写。")
+        raise BusinessRejected(
+            "完成工单必须明确填写挽留结果：挽留成功或流失；请补充结果或到工单页面填写。",
+            code="RESULT_REQUIRED")
     effective_status = status if status is not None else d.get("status")
     if result is not None and effective_status not in ("completed", "lost"):
-        raise ValueError("未结案工单不能填写挽留结果")
+        raise BusinessRejected("未结案工单不能填写挽留结果。", code="INVALID_STATUS")
     if effective_status == "lost" and result not in (None, "lost"):
-        raise ValueError("已流失状态必须对应流失结果")
+        raise BusinessRejected("已流失状态必须对应流失结果。", code="INVALID_STATUS")
     return {
         "__pending_action__": True,
         "action": "update_work_order",
@@ -526,7 +730,7 @@ def propose_delete_work_order(order_id: int, customer_id: str | None = None) -> 
     """
     d = _get(f"/api/work-orders/{int(order_id)}")
     if not customer_id or d.get("customer_id") != customer_id.upper():
-        raise ValueError("工单不属于指定客户，已拦截")
+        raise BusinessRejected("工单不属于指定客户，已拦截。", code="TARGET_MISMATCH")
     return {
         "__pending_action__": True,
         "action": "delete_work_order",
@@ -635,25 +839,117 @@ def call_tool(name: str, args: dict) -> dict:
     """执行一个工具。write 类工具**不会真正写库**，只返回待确认动作。
 
     返回形状统一为：
-      成功  {ok: True,  ...工具返回值}
-      失败  {ok: False, error: "..."}
-    统一形状让上层（verify / 前端）无需按工具分支处理。
+
+      成功  {"ok": True,  "result": {...}}
+      失败  {"ok": False, "error": "<安全文案>", "error_code": "...",
+             "retryable": bool, "details": {...}}
+
+    ⚠ 旧实现把工具自己返回的 `{"__error__": ...}` 包成 `ok=True` ——
+      失败变成了"成功拿到一个错误对象"，下游的待确认分支、事实收集、
+      批量数量统计全部被污染。现在一律走同一契约（E01）。
     """
     spec = TOOL_SPECS.get(name)
     if spec is None:
-        return {"ok": False, "error": f"未知工具 {name}"}
+        return _fail("UNKNOWN_TOOL", f"未知工具 {name}", False)
     try:
         result = spec["fn"](**(args or {}))
-        return {"ok": True, "result": result}
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode()[:200]
-        except Exception:
-            pass
-        return {"ok": False, "error": f"HTTP {e.code}: {body}"}
-    except TypeError as e:
-        # 参数名/类型不对 —— 这是 LLM 抽槽出错，需明确告知以便它重试
-        return {"ok": False, "error": f"参数错误：{e}"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    except ToolError as exc:
+        return _fail(exc.code, exc.message, exc.retryable, exc.details)
+    except TypeError as exc:
+        # 参数名/类型不对 —— 这是模型抽槽出错，可改正后重试
+        logger.info("agent tool %s bad args: %s", name, exc)
+        return _fail("INVALID_ARGUMENT", "工具参数不合法，请按参数表重新调用。", True)
+    except Exception as exc:                      # noqa: BLE001
+        # 未预料的编程错误：可观测但不外泄细节，也不冒充业务拒绝
+        logger.exception("agent tool %s internal error", name)
+        return _fail("INTERNAL_ERROR", "工具执行出现内部错误，请稍后重试或换一种问法。", False)
+
+    if isinstance(result, dict) and "__error__" in result:
+        # 兼容历史形状：任何工具若仍返回 __error__，按失败处理而不是成功
+        logger.warning("agent tool %s returned legacy __error__", name)
+        return _fail(str(result.get("__error_code__") or "BUSINESS_REJECTED"),
+                     str(result.get("__error__") or "工具拒绝了本次操作。"), False)
+    if result is None:
+        return _fail("EMPTY_TOOL_RESULT", "工具没有返回任何数据，请换一种查询方式。", True)
+    return {"ok": True, "result": result}
+
+
+def _fail(code: str, message: str, retryable: bool, details: dict | None = None) -> dict:
+    out = {"ok": False, "error": message or _SAFE_TEXT.get(code, "操作未成功。"),
+           "error_code": code or "TOOL_ERROR", "retryable": bool(retryable)}
+    if details:
+        out["details"] = details
+    return out
+
+
+# 错误码 → 面向用户的安全说明（工具自带 message 时以 message 为准）
+_SAFE_TEXT = {
+    "UNKNOWN_TOOL": "不支持的操作。",
+    "INVALID_ARGUMENT": "查询条件不合法，请调整后重试。",
+    "BUSINESS_REJECTED": "该操作不符合业务规则。",
+    "PERMISSION_DENIED": "当前账号无权执行该操作。",
+    "TIMEOUT": "查询超时，请稍后重试。",
+    "UPSTREAM_UNAVAILABLE": "系统服务暂时不可用，请稍后重试。",
+    "UPSTREAM_ERROR": "查询失败，请稍后重试。",
+    "IDENTITY_REQUIRED": "缺少可信身份，已拒绝执行。",
+    "INTERNAL_ERROR": "系统内部错误，请稍后重试。",
+}
+
+
+def _reason_text(exc: ToolError) -> str:
+    """把失败压缩成给用户看的短原因（批量逐项用）。"""
+    return {
+        "ACTIVE_ORDER_EXISTS": "已有在途工单",
+        "CUSTOMER_EXITED": "已流失",
+        "CUSTOMER_NOT_FOUND": "客户不存在",
+        "NOT_FOUND": "不存在",
+        "PERMISSION_DENIED": "无权访问",
+        "TIMEOUT": "查询超时",
+        "UPSTREAM_UNAVAILABLE": "服务不可用",
+    }.get(exc.code, "查询失败")
+
+
+# ══════════════════════════════════════════════════════════
+# 待确认动作的形状校验（E01.8）
+# ══════════════════════════════════════════════════════════
+
+PENDING_ACTIONS = {"create_work_order", "create_work_order_batch",
+                   "update_work_order", "delete_work_order"}
+
+
+def validate_pending(result: Any) -> tuple[bool, str]:
+    """校验一个工具结果是否真的是**可执行的**待确认动作。
+
+    ⚠ 仅 `ok=True` 不足以证明其有效：错误对象、空批次、畸形 payload
+      都可能被误当成待确认动作，从而签发确认凭据（用户点下去必然失败）。
+      这里对形状做确定性校验，不通过就当失败处理，绝不进 pending 分支。
+    """
+    if not isinstance(result, dict):
+        return False, "待确认动作不是对象"
+    if result.get("__pending_action__") is not True:
+        return False, "缺少待确认标记"
+    if result.get("requires_confirmation") is not True:
+        return False, "缺少人工确认要求"
+    action = result.get("action")
+    if action not in PENDING_ACTIONS:
+        return False, "未知的操作类型"
+    if action == "create_work_order_batch":
+        items = result.get("items")
+        if not isinstance(items, list) or not items:
+            return False, "批量建单没有可准备项"
+        if any(not isinstance(it, dict) or not it.get("customer_id") for it in items):
+            return False, "批量建单存在缺少客户编号的项"
+        return True, ""
+    payload = result.get("payload")
+    if not isinstance(payload, dict) or not payload:
+        return False, "待确认动作缺少 payload"
+    if action in ("update_work_order", "delete_work_order"):
+        oid = payload.get("order_id")
+        if isinstance(oid, bool) or not isinstance(oid, int) or oid <= 0:
+            return False, "工单操作缺少有效工单编号"
+        if not payload.get("customer_id"):
+            return False, "工单操作缺少客户编号"
+        return True, ""
+    if not payload.get("customer_id"):
+        return False, "建单动作缺少客户编号"
+    return True, ""

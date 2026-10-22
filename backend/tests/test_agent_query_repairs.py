@@ -23,11 +23,14 @@ def displayed_context(size=50):
 
 
 def proposal(name, args):
+    """替身必须遵守**真实工具契约**（E01 起新增 __pending_action__ 形状校验）。"""
     if name == "propose_create_work_orders_batch":
-        return {"ok": True, "result": {"action": "create_work_order_batch",
+        return {"ok": True, "result": {"__pending_action__": True,
+            "action": "create_work_order_batch",
             "items": [{"customer_id": cid, "customer_name": "Fixture"}
                       for cid in args["customer_ids"]], "requires_confirmation": True}}
-    return {"ok": True, "result": {"action": "create_work_order", "payload": {
+    return {"ok": True, "result": {"__pending_action__": True,
+        "action": "create_work_order", "payload": {
         "customer_id": args["customer_id"], "customer_name": "Fixture"},
         "requires_confirmation": True}}
 

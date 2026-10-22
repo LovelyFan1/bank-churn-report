@@ -42,13 +42,35 @@ DeepSeek 的上下文缓存是自动的（前缀命中即折扣）。system prom
 
 from __future__ import annotations
 
+import math
 import re
+import time
 from typing import Any
 
 # 实体栈上限 —— 溢出淘汰最旧。20 条约 360 token，恒定。
 # 取舍：用"无限回溯"换"成本恒定"。真需要回溯更早的对象，就得重新查。
 MAX_ENTITIES = 20
 MAX_DISPLAYED = 50
+
+# ── 可信历史事实的容量与时效（E03.5）────────────────────────
+#
+# 为什么要有独立的上限：历史事实是"上一次查询留下的数值"，它解决的是
+# 「刚才那个客户的风险资产评分是多少」这类追问。但它同时是一个**可信池**——
+# 池子越大，模型把旧值当现值的风险越高。故按"回答批次 + 总条数 + 时间"
+# 三重限制，全部用命名常量记录，边界可测。
+MAX_FACT_ANSWERS = 10        # 最近 10 个回答
+MAX_FACTS = 200              # 合计最多 200 条
+FACT_TTL_SECONDS = 900       # 单条最多 15 分钟；且不超过会话有效期
+
+# 首期只保留这三类数值 —— 风险等级、工单状态、列表总数等
+# 必须来自当前可信结果，不能因为历史数字相同就放行（E03.1）。
+_HISTORY_METRICS = {
+    "probability": "fraction",
+    "balance": "yuan",
+    "expected_value": "yuan",
+}
+# 允许产生历史事实的工具 —— 只有"按客户查询"的只读工具。
+_FACT_SOURCES = {"get_customer_risk", "list_customers"}
 
 # 注入时最多渲染几条明细。超出只给条数提示。
 # 分界线取 10，与 tools.list_customers 的默认 limit 对齐（不拍脑袋）。
@@ -65,7 +87,8 @@ _ID_RE = re.compile(r"(?<![A-Za-z0-9])C\d{4,}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def empty() -> dict:
-    return {"customers": [], "orders": [], "displayed_customer_ids": []}
+    return {"customers": [], "orders": [], "displayed_customer_ids": [],
+            "facts": []}
 
 
 def explicit_ids(text: str) -> list[str]:
@@ -133,12 +156,18 @@ def resolve_create_targets(question: str, ctx: dict | None) -> list[str]:
     raise ValueError("当前建单对象不唯一，请指定一个序号、客户编号或完整名单。")
 
 
-def normalize(raw: Any) -> dict:
-    """校验并裁剪前端回传的上下文。
+def normalize(raw: Any, *, trusted: bool = False) -> dict:
+    """校验并裁剪上下文。
 
     ⚠ 这是**不可信输入**：前端可被篡改，用户也能直接改 localStorage。
       故每个字段都校验类型与长度，非法项静默丢弃而不是报错 ——
       上下文坏了不该让整轮对话失败（与前端 loadSession 的容错同理）。
+
+    ⚠ `trusted` 只对**服务端自己写出再读回**的上下文为真（数据库里的
+      session.context）。客户端回传的上下文一律 trusted=False ——
+      历史事实是核验白名单的一部分，若能由客户端注入，等于给提示词注入
+      开了一个"数字随便写"的后门（E03.6）。第一轮同样防，不能只在
+      version>0 时防。
     """
     if not isinstance(raw, dict):
         return empty()
@@ -200,6 +229,15 @@ def normalize(raw: Any) -> dict:
         result["list_query"]["seen_customer_ids"] = list(dict.fromkeys(
             cid.upper() for cid in seen_ids[:500]
             if isinstance(cid, str) and _CID_RE.fullmatch(cid)))
+    now = time.time()
+    facts: list[dict] = []
+    if trusted:
+        raw_facts = raw.get("facts")
+        for item in (raw_facts if isinstance(raw_facts, list) else [])[:MAX_FACTS]:
+            valid = _valid_fact(item, now)
+            if valid:
+                facts.append(valid)
+    result["facts"] = _trim_facts(facts, now)
     return result
 
 
@@ -221,7 +259,119 @@ def _cust(d: dict) -> dict | None:
     }
 
 
-def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
+def _valid_fact(raw: Any, now: float) -> dict | None:
+    """校验一条历史事实 —— 形状、指标白名单、单位、来源、时效。"""
+    if not isinstance(raw, dict):
+        return None
+    metric = raw.get("metric")
+    if metric not in _HISTORY_METRICS:
+        return None
+    value = raw.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    entity = raw.get("entity_id")
+    if not isinstance(entity, str) or not _CID_RE.fullmatch(entity.strip()):
+        return None
+    observed = raw.get("observed_at")
+    if isinstance(observed, bool) or not isinstance(observed, (int, float)):
+        return None
+    observed = float(observed)
+    # 客户端时间不能延长有效期：以**服务端当前时间**判断（E03.5）
+    if observed > now + 5 or now - observed > FACT_TTL_SECONDS:
+        return None
+    if raw.get("source") not in _FACT_SOURCES:
+        return None
+    unit = raw.get("unit") or _HISTORY_METRICS[metric]
+    if unit != _HISTORY_METRICS[metric]:
+        return None
+    version = raw.get("model_version")
+    return {
+        "entity_type": "customer",
+        "entity_id": entity.strip().upper(),
+        "metric": metric,
+        "value": value,
+        "unit": unit,
+        "source": raw["source"],
+        "observed_at": observed,
+        "model_version": version if isinstance(version, str) else None,
+    }
+
+
+def _trim_facts(facts: list[dict], now: float | None = None) -> list[dict]:
+    """按"最近 10 个回答 / 合计 200 条 / 单条 15 分钟"裁剪。"""
+    now = time.time() if now is None else now
+    valid = [f for f in (facts or []) if isinstance(f, dict)
+             and now - float(f.get("observed_at") or 0) <= FACT_TTL_SECONDS]
+    groups = sorted({int(float(f["observed_at"])) for f in valid}, reverse=True)
+    keep = set(groups[:MAX_FACT_ANSWERS])
+    valid = [f for f in valid if int(float(f["observed_at"])) in keep]
+    valid.sort(key=lambda f: float(f["observed_at"]), reverse=True)
+    # 同一 (实体, 指标) 只留最新一条 —— 旧值不该与新值同池共存（E03.7）
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for fact in valid:
+        key = (fact.get("entity_id"), fact.get("metric"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fact)
+        if len(out) >= MAX_FACTS:
+            break
+    return out
+
+
+def history_facts(ctx: dict | None, now: float | None = None) -> list[dict]:
+    """本轮可引用的可信历史事实（已裁剪，附带可展示的时间）。"""
+    now = time.time() if now is None else now
+    facts = _trim_facts((ctx or {}).get("facts") or [], now)
+    for fact in facts:
+        try:
+            fact["observed_at_iso"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(float(fact["observed_at"])))
+        except (TypeError, ValueError, OSError):
+            fact["observed_at_iso"] = ""
+    return facts
+
+
+def _facts_from_record(tr: dict, observed_at: float) -> list[dict]:
+    """从**本轮成功的只读工具结果**里抽事实（服务端产物，可信）。"""
+    tool = tr.get("tool")
+    if tool not in _FACT_SOURCES or not tr.get("ok"):
+        return []
+    data = tr.get("data") or {}
+    version = data.get("model_version")
+    rows = data.get("items") if tool == "list_customers" else [data]
+    out: list[dict] = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("customer_id"):
+            continue
+        for metric, unit in _HISTORY_METRICS.items():
+            value = row.get(metric)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if not math.isfinite(float(value)):
+                continue
+            out.append({
+                "entity_type": "customer",
+                "entity_id": str(row["customer_id"]).upper(),
+                "metric": metric,
+                "value": float(value),
+                "unit": unit,
+                "source": tool,
+                "observed_at": observed_at,
+                "model_version": version if isinstance(version, str) else None,
+            })
+    return out
+
+
+def extract(tool_results: list[dict], pending_action: dict | None,
+            observed_at: float | None = None) -> dict:
     """从**本轮**工具结果里抽出实体，供合并进上下文。
 
     ⚠ `replace_*` 标记的语义很重要，它对齐的是**界面**：
@@ -236,11 +386,15 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
     focus_customer_id = None
     focus_changed = False
 
+    observed_at = time.time() if observed_at is None else observed_at
+    facts: list[dict] = []
+
     for tr in tool_results or []:
         if not tr.get("ok"):
             continue
         data = tr.get("data") or {}
         tool = tr.get("tool")
+        facts.extend(_facts_from_record(tr, observed_at))
 
         if tool == "list_customers":
             replace_customers = True
@@ -317,6 +471,7 @@ def extract(tool_results: list[dict], pending_action: dict | None) -> dict:
     return {
         "customers": customers,
         "orders": orders,
+        "facts": facts,
         "replace_customers": replace_customers,
         "replace_orders": replace_orders,
         "focus_changed": focus_changed,
@@ -367,7 +522,12 @@ def merge(prev: dict, cur: dict) -> dict:
         ords = list(cur.get("orders") or []) + list(prev.get("orders") or [])
     ords = _dedup(ords, "order_id")[:MAX_ENTITIES]
 
-    return {"customers": cus, "orders": ords,
+    # 历史事实：本轮新值优先；同 (实体, 指标) 只留最新的一条。
+    # ⚠ 事实与展示名单**分开保存** —— 保存 A 的历史值不会把 A 插回
+    #   当前 B 的名单，也不改变"第几个"的写目标（E03.4）。
+    facts = _trim_facts(list(cur.get("facts") or []) + list(prev.get("facts") or []))
+
+    return {"customers": cus, "orders": ords, "facts": facts,
             "displayed_customer_ids": cur.get("displayed_customer_ids")
                 if cur.get("displayed_customer_ids") is not None
                 else prev.get("displayed_customer_ids", [c["id"] for c in cus]),
@@ -438,6 +598,14 @@ def render(ctx: dict | None) -> str:
         "回答涉及具体数值时**必须重新调用工具查询**。"
         "若用户的问题与上面的对象无关，请忽略本段。"
     )
+    facts = (ctx or {}).get("facts") or []
+    if facts:
+        lines.append(
+            "上一次查询留下的可信数值（仅可用于回答「刚才/上次」这类问题；"
+            "用户问「现在/最新」时必须重新查询）：")
+        for fact in facts[:6]:
+            lines.append(f"   {fact.get('entity_id')} {fact.get('metric')}"
+                         f"={fact.get('value')}（{fact.get('unit')}）")
     return "\n".join(lines)
 
 

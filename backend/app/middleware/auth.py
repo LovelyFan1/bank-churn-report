@@ -83,23 +83,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         authz = request.headers.get("authorization") or ""
 
-        # ── 服务间内部调用（Agent 工具层回调自身接口）─────────────
-        # ⚠ 必须放在用户令牌校验之前，且**令牌 + 回环来源**双重校验。
-        #   仅凭令牌可被重放；仅凭来源则容器内任意进程都能绕过鉴权。
+        # ── 内部服务令牌：显式拒绝（E05.6）───────────────────────────
+        # ⚠ 这里曾经把内部令牌换成 admin 身份，Agent 工具层就借它做"自调"。
+        #   那是一条**万能 admin 通道**：任何能发出该令牌的代码都能访问
+        #   全部接口，且 Agent 的查询会绕开按用户的数据范围。
+        #   现在工具层改为透传真实用户的 Bearer，因此这里不再需要放行；
+        #   保留提示性日志，便于发现仍在用旧令牌的调用方。
         if authz.lower().startswith("bearer "):
             maybe = authz.split(" ", 1)[1].strip()
             client_host = request.client.host if request.client else ""
             if auth.is_internal_request(maybe, client_host):
-                # 内部调用不对应具体行员；写操作另经 /confirm 由用户令牌触发
-                request.state.auth_user = {
-                    "username": "__internal__",
-                    "display_name": "系统内部调用",
-                    "role": "admin",
-                    "id": 0,
-                    "totp_enabled": 0,
-                }
-                request.state.ip = client_host
-                return await call_next(request)
+                logger.warning("auth: 拒绝服务级内部令牌访问 %s（应改用用户令牌）", path)
+                return _unauthorized("服务级令牌不再被接受，请使用登录令牌")
 
         if not authz.lower().startswith("bearer "):
             return _unauthorized("未登录或缺少令牌")

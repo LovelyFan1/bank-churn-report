@@ -87,6 +87,41 @@ def _mentions_name(name, clause):
     return re.search(pattern, clause) is not None
 
 
+def _history_facts(extra_sources) -> list:
+    """把上下文里的**结构化历史事实**转成 Fact。
+
+    ⚠ 只接受明确形状（实体/指标/值/单位/来源/时间齐全）。浮点数列表、
+      `{"probability": .8}` 这类字典一律忽略 —— 否则"历史上出现过这个数"
+      就成了核验白名单，等于把校验器关掉（E03.8）。
+    """
+    if not isinstance(extra_sources, (list, tuple)):
+        return []
+    history_metrics = {"probability": "fraction", "balance": "yuan", "expected_value": "yuan"}
+    out = []
+    for item in extra_sources:
+        if not isinstance(item, dict):
+            continue
+        metric = item.get("metric")
+        if metric not in history_metrics:
+            continue
+        entity = item.get("entity_id")
+        if not isinstance(entity, str) or not _CID_RE.fullmatch(entity.strip()):
+            continue
+        value = item.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(float(value)):
+            continue
+        if (item.get("unit") or history_metrics[metric]) != history_metrics[metric]:
+            continue
+        if item.get("source") not in ("get_customer_risk", "list_customers"):
+            continue
+        version = item.get("model_version")
+        out.append(Fact("customer", entity.strip().upper(), None, metric, float(value),
+                        history_metrics[metric], "history", version if isinstance(version, str) else None))
+    return out
+
+
 def verify(draft: str, tool_results: list[dict], extra_sources=None, question="") -> tuple[bool, list[str]]:
     if not draft or not draft.strip():
         return True, []
@@ -97,6 +132,11 @@ def verify(draft: str, tool_results: list[dict], extra_sources=None, question=""
             facts.extend(_facts(record.get("data"), source=source))
             for entity, rows in _entities(record.get("data"), source).items():
                 entities.setdefault(entity, []).extend(rows)
+    # 历史事实只贡献"数值出处 + 实体存在"，不贡献姓名/等级/状态
+    # —— 那些必须来自当前可信结果（见 E03.2）。
+    for fact in _history_facts(extra_sources):
+        facts.append(fact)
+        entities.setdefault(fact.entity_id, [])
     errors = []
     main = answer_builder.select_primary(tool_results, question)
     main_data = (main or {}).get("data") or {}

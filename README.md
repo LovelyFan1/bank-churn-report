@@ -238,7 +238,7 @@ docker compose -f docker-compose.yml -f docker-compose.deploy.yml ps
 
 从已有环境更新时，先备份数据卷与模型，再拉取代码并执行以上命令。前后端一起更新，避免Nginx上游地址和接口版本不一致。发布配置不会替换原开发配置，也不会自动重训。
 
-本机2026-10-23已部署 `deployment-20261023`，保留原数据库卷、模型和Redis。发布检查、备份与回退说明见[部署记录](docs/DEPLOYMENT_2026-10-23.md)。
+本机2026-10-23已部署 `deployment-20261023b`（智能体 E01–E06 修复），保留原数据库卷、模型和Redis；上一版 `deployment-20261023` 镜像仍保留可回退。发布检查、备份与回退说明见[部署记录](docs/DEPLOYMENT_2026-10-23B.md)与[SQLite 并发口径](docs/SQLITE_CONCURRENCY_2026-10-23.md)。
 
 开发模式仍使用 `docker compose up -d --build`。只改后端源码可重启开发后端；修改训练代码同时重启Celery。修改 `.env` 后应重新创建容器，仅restart不会重新加载Compose环境变量。
 
