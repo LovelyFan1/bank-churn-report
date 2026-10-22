@@ -334,7 +334,13 @@ async function clearSession() {
 const BASIS = {
   llm_verified: { label: '系统数据 · 模型解读需复核', cls: 'b-verified' },
   system_data: { label: '系统数据 · 确定性查询', cls: 'b-verified' },
-  llm_partial_dropped: { label: '模型解读含未溯源数字 · 已丢弃该段，数据不受影响', cls: 'b-fallback' },
+  // ⚠ 口径说明（2026-10-23 调整）：模型写的解读没通过核验时，界面上**只剩纯系统数据**
+  //   （卡片、数字、标题全部由 Python 从工具结果构造，没有一句模型措辞）。
+  //   原先这里显示"模型解读含未溯源数字 · 已丢弃该段"，描述的其实是系统内部动作，
+  //   用户看到的却像一个故障 —— 首次查询就可能出现，演示误导性很强。
+  //   现在：徽章按**实际展示内容**标为"系统数据"；省略这件事收进「依据」面板，
+  //   `basis` 仍保留 llm_partial_dropped 供日志与追溯，不改变接口语义。
+  llm_partial_dropped: { label: '系统数据 · 确定性查询', cls: 'b-verified' },
   // system_meta = 系统模板直接回答（你是谁/能做什么/技术栈）。
   // 与 LLM 无关，因此不存在幻觉可能，但也不是"数据查询"。
   system_meta: { label: '系统信息 · 确定性回答', cls: 'b-meta' },
@@ -1114,6 +1120,11 @@ function warnClass(level) {
                   {{ c.ok ? '成功' : '失败' + (c.error ? '：' + c.error : '') }}
                 </span>
               </div>
+              <!-- 被核验拦下的模型解读：只在这里说明，不挂在结论下方当告警。
+                   数据来源是接口里的 verify_failed（非空即说明有解读被省略）。 -->
+              <div v-if="t.verifyFailed?.length" class="ev-row ev-note">
+                模型写的一句解读未通过数值/实体核对，已省略；上方数据未受影响。
+              </div>
             </div>
           </div>
         </div>
@@ -1339,6 +1350,8 @@ function warnClass(level) {
 .ev-ok { margin-left: 8px; }
 .ev-ok.yes { color: #0f766e; }
 .ev-ok.no { color: #b91c1c; }
+/* 被省略的模型解读 —— 只在「依据」里说明，用中性灰，不用告警色 */
+.ev-note { margin-top: 4px; color: #5b6b83; font-style: italic; }
 
 .thinking { font-size: 12.5px; color: #5b6b83; display: flex; align-items: center; gap: 8px; }
 .spinner { width: 12px; height: 12px; border: 2px solid #e5e9f0; border-top-color: #1d4ed8;
