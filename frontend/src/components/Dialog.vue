@@ -68,7 +68,7 @@ onBeforeUnmount(release)
 
 <style scoped>
 .audit-dialog-mask { position:fixed; inset:0; z-index:1000; background:#17335c66; display:flex; align-items:center; justify-content:center; padding:16px; }
-.audit-dialog-panel { min-width:0; max-width:100%; max-height:calc(100dvh - 32px); outline:0; }
+.audit-dialog-panel { display:flex; flex-direction:column; min-width:0; min-height:0; max-width:100%; max-height:100%; outline:0; }
 .audit-dialog-panel :deep(.idle-box) { max-width:100%; box-sizing:border-box; }
 .audit-dialog-panel :deep(.modal-card), .audit-dialog-panel :deep(.modal), .audit-dialog-panel :deep(.dispatch-card), .audit-dialog-panel :deep(.mc-confirm), .audit-dialog-panel :deep(.cc-confirm) { display:flex; flex-direction:column; max-width:100%; max-height:calc(100dvh - 32px); overflow:hidden; }
 .audit-dialog-panel :deep(.modal-body), .audit-dialog-panel :deep(.mc-confirm-body), .audit-dialog-panel :deep(.cc-confirm-body) { min-height:0; overflow-y:auto; overscroll-behavior:contain; }

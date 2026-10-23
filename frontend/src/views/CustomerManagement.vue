@@ -2,8 +2,11 @@
   <div class="space-y-5">
     <!-- Page Header -->
     <div>
-      <h1 class="text-2xl font-bold">👥 客户管理</h1>
-      <p class="text-gray-400 text-sm mt-1">全量客户浏览 · 风险排序 · 一键创建干预工单</p>
+      <h1 class="text-2xl font-bold">选择要跟进的客户<InfoTip>
+        <b class="tip-hd">本页怎么用</b>
+        先看优先客户，查看原因后再准备跟进；创建前会核对负责人和渠道。
+        <span class="tip-row"><b>跟进四步</b>：① 找客户　② 看原因　③ 确认跟进　④ 记录结果</span>
+      </InfoTip></h1>
     </div>
 
     <p v-if="route.query.source === 'test_matrix'" class="text-sm text-slate-700 bg-blue-50 p-3 rounded-lg">
@@ -47,19 +50,20 @@
       <!-- 口径说明：后端 risk_scoring 用的是**原始概率的分位数边界**（P95/P70/P35），
            不是固定阈值；当前评分未校准，不能当作经验证的真实概率。
            riskInfo.calibrated 只是「引擎已就绪」的标记，不代表概率经过校准。 -->
-      <div v-if="riskInfo?.calibrated && riskInfo.thresholds" class="risk-banner">
+      <details v-if="riskInfo?.calibrated && riskInfo.thresholds" class="risk-banner">
+        <summary>查看模型风险分级口径</summary>
         <span>🎯 风险分级口径：按概率分位数 P95 / P70 / P35 划四级（{{ riskInfo.model }} · 漏检/误报成本比 1:{{ riskInfo.cost_ratio }}）：</span>
         <span class="risk-banner-item" :style="{ color: riskColor('CRITICAL') }">极高 ≥ {{ fmtPercent(riskInfo.thresholds.critical) }}</span>
         <span class="risk-banner-item" :style="{ color: riskColor('HIGH') }">高危 ≥ {{ fmtPercent(riskInfo.thresholds.high) }}</span>
         <span class="risk-banner-item" :style="{ color: riskColor('MEDIUM') }">中等 ≥ {{ fmtPercent(riskInfo.thresholds.medium) }}</span>
         <span class="risk-banner-item" :style="{ color: riskColor('LOW') }">其余低风险</span>
-      </div>
+      </details>
 
       <!-- Toolbar -->
       <div class="flex flex-wrap items-center gap-3">
         <input
           v-model="searchText"
-          placeholder="搜索客户编号 / 姓名..."
+          aria-label="搜索客户编号或姓名" placeholder="搜索客户编号 / 姓名..."
           class="search-input"
           @input="onSearch"
         />
@@ -70,42 +74,57 @@
             @click="setRisk(t.key)"
           >{{ t.label }}</button>
         </div>
-        <select v-model="geoFilter" class="select" @change="onFilter">
+        <!-- 次要筛选折叠；生效条件始终在下方显示，避免隐藏筛选影响结果。 -->
+        <details class="customer-more-filters">
+          <summary>更多筛选</summary>
+          <div class="customer-filter-fields">
+        <label>地区<select aria-label="地区" v-model="geoFilter" class="select" @change="onFilter">
           <option value="">全部地区</option>
           <option value="France">France</option>
           <option value="Germany">Germany</option>
           <option value="Spain">Spain</option>
-        </select>
-        <select v-model="currentTier" class="select" @change="onFilter">
+        </select></label>
+        <label>客户价值层<select aria-label="客户价值层" v-model="currentTier" class="select" @change="onFilter">
           <option value="">全部价值层</option>
           <option value="HIGH">高价值</option>
           <option value="LOW">中低价值</option>
           <option value="ZERO">零余额</option>
-        </select>
-        <select v-model="exitedFilter" class="select" @change="onFilter">
+        </select></label>
+        <label>历史流失状态<select aria-label="历史流失状态" v-model="exitedFilter" class="select" @change="onFilter">
           <option value="">全部客户</option>
           <option value="1">已流失</option>
           <option value="0">未流失</option>
-        </select>
+        </select></label>
+        <label>在途工单状态<select aria-label="在途工单状态" v-model="hasOrderFilter" class="select" @change="onFilter">
+          <option value="">全部工单状态</option><option value="0">无在途工单</option><option value="1">已有在途工单</option>
+        </select></label>
+          </div>
+        </details>
         <!-- 脱敏时不显示导出：后端对该角色直接 403，留着按钮只会让用户点了报错 -->
-        <button v-if="!masked" class="btn btn-outline btn-sm" @click="exportCsv">⬇ 导出</button>
+        <button v-if="!masked && auth.can('data:export')" class="btn btn-outline btn-sm" @click="exportCsv">⬇ 导出</button>
         <span class="flex-1"></span>
-        <select v-model="sortBy" class="select" @change="onFilter">
+        <select aria-label="排序方式" v-model="sortBy" class="select" @change="onFilter">
           <option value="expected_value">按风险资产评分 ↓</option>
           <option value="probability">按流失概率 ↓</option>
           <option value="balance">按余额 ↓</option>
           <option value="age">按年龄 ↑</option>
         </select>
-        <select v-model="pageSize" class="select" @change="onFilter">
+        <select aria-label="每页条数" v-model="pageSize" class="select" @change="onFilter">
           <option :value="10">每页 10 条</option>
           <option :value="20">每页 20 条</option>
           <option :value="50">每页 50 条</option>
         </select>
       </div>
 
+      <div class="active-filters" aria-label="当前筛选条件">
+        <span>当前匹配 {{ total }} 位</span>
+        <button v-for="item in activeFilters" :key="item.key" class="filter-chip" @click="removeFilter(item.key)">{{ item.label }} ×</button>
+        <button v-if="activeFilters.length || searchText" class="flow-link" @click="resetFilters">重置筛选</button>
+      </div>
+
       <!-- 批量操作条 —— 仅在选中时出现，避免常态占用工具栏空间 -->
-      <div v-if="selected.size" class="batch-bar">
-        <span class="text-sm text-gray-300">已选 <b class="text-white">{{ selected.size }}</b> 位客户</span>
+      <div v-if="selected.size && auth.can('order:write')" class="batch-bar">
+        <span class="text-sm text-slate-700">已选 <b class="text-slate-900">{{ selected.size }}</b> 位客户</span>
         <span class="text-xs text-gray-500">
           逐张确认派给谁、为什么建（渠道按各客户价值层自动决定）
         </span>
@@ -145,29 +164,29 @@
         <table class="w-full">
           <thead>
             <tr>
-              <th v-if="!masked" style="width:36px">
+              <th v-if="!masked && auth.can('order:write')" style="width:36px">
                 <!-- indeterminate 是 DOM 属性不是 HTML 特性，必须用 .prop 绑定，
                      否则 Vue 会写成 attribute 而无效 -->
-                <input type="checkbox" :checked="allSelected"
+                <input type="checkbox" aria-label="选择本页可跟进客户" :checked="allSelected"
                        :indeterminate.prop="someSelected && !allSelected"
                        :disabled="!selectableRows.length"
                        @change="toggleAll" />
               </th>
               <th>{{ masked ? '客户（匿名）' : '客户' }}</th>
               <th>风险等级</th>
-              <th v-if="!masked">流失概率</th>
+              <th v-if="!masked">模型风险评分</th>
               <th v-if="!masked">余额</th>
               <th>价值层</th>
               <th v-if="!masked">产品 / 活跃</th>
               <th v-if="!masked">工单状态</th>
-              <th v-if="!masked" class="text-right">操作</th>
+              <th v-if="!masked && auth.can('order:write')" class="text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="customers.length === 0">
-              <td :colspan="masked ? 3 : 9" class="text-center py-16 text-gray-500">
+              <td :colspan="masked ? 3 : auth.can('order:write') ? 9 : 7" class="text-center py-16 text-gray-500">
                 <div class="text-4xl mb-2">🔍</div>
-                <p>没有匹配的客户，换个筛选条件试试</p>
+                <p>没有匹配的客户，可移除筛选条件后再试</p><button class="flow-link mt-3" @click="resetFilters">重置筛选</button>
               </td>
             </tr>
             <!-- ⚠ 脱敏模式：行不可点进详情（详情接口对该角色返回 403），
@@ -175,9 +194,9 @@
             <tr v-for="c in customers" :key="c.id ?? c.seq"
                 :class="masked ? '' : 'row-clickable'"
                 @click="masked ? null : openDetail(c)">
-              <td v-if="!masked" @click.stop>
+              <td v-if="!masked && auth.can('order:write')" @click.stop>
                 <!-- 已建单的客户不可再选（后端也会 409 拒掉） -->
-                <input type="checkbox" :checked="selected.has(c.customer_id)"
+                <input type="checkbox" :aria-label="`选择客户 ${c.surname} ${c.customer_id}`" :checked="selected.has(c.customer_id)"
                        :disabled="c.has_active_order || c.exited !== 0" @change="toggleRow(c.customer_id)" />
               </td>
               <td>
@@ -192,7 +211,7 @@
                       {{ c.surname?.charAt(0)?.toUpperCase() }}
                     </div>
                     <div>
-                      <div class="font-semibold text-sm">{{ c.surname }}</div>
+                      <RouterLink class="font-semibold text-sm flow-link" :to="{ path: `/customers/${c.customer_id}`, query: { from: route.fullPath } }" @click.stop>{{ c.surname }}</RouterLink>
                       <div class="text-xs text-gray-500">{{ c.customer_id }} · {{ c.geography }}</div>
                     </div>
                   </div>
@@ -224,10 +243,10 @@
                 <span v-if="c.has_active_order" class="tag-mini tag-order">已建单</span>
                 <span v-else class="text-gray-600">—</span>
               </td>
-              <td v-if="!masked" class="text-right">
+              <td v-if="!masked && auth.can('order:write')" class="text-right">
                 <button v-if="c.exited !== 0" class="btn-disabled" disabled>已流失</button>
                 <button v-else-if="c.has_active_order" class="btn-disabled" disabled>已建单</button>
-                <button v-else class="btn btn-primary btn-sm" @click.stop="openCreate(c)">＋ 创建工单</button>
+                <button v-else class="btn btn-primary btn-sm" @click.stop="openCreate(c)">准备跟进</button>
               </td>
             </tr>
           </tbody>
@@ -375,135 +394,8 @@
       </div>
     </Dialog>
 
-    <!-- Modal -->
-    <Dialog :open="!!modalOpen" title="创建工单" :busy="submitting" @close="closeModal">
-      <div class="modal">
-        <div class="modal-header">
-          <h2>创建工单 · {{ form.customer_id }}</h2>
-          <button class="modal-close" @click="closeModal">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-grid">
-            <div class="form-group">
-              <label>客户编号</label>
-              <input v-model="form.customer_id" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>客户姓名</label>
-              <input v-model="form.customer_name" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>地区</label>
-              <input v-model="form.geography" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>风险等级</label>
-              <input :value="riskLabel(form.risk_level) + ' (' + form.risk_level + ')'" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>流失概率</label>
-              <input :value="fmtPercent(form.probability)" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>客户余额</label>
-              <input :value="fmtMoney(form.balance)" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>价值层</label>
-              <input :value="valueTierLabel(form.value_tier_snapshot)" readonly class="readonly" />
-            </div>
-            <div class="form-group full">
-              <label>风险因素（模型自动识别）</label>
-              <div class="flex flex-wrap gap-1.5">
-                <span v-for="f in form.risk_factors" :key="f" class="risk-tag">{{ f }}</span>
-                <span v-if="!form.risk_factors || form.risk_factors.length === 0" class="text-gray-500 text-xs">暂无明显风险因素</span>
-              </div>
-            </div>
-            <div class="form-group full">
-              <label>触达渠道</label>
-              <!-- 预填后端推荐值；频道由价值层硬定，改选须填原因（后端亦会校验） -->
-              <select v-model="form.channel">
-                <option value="relationship">客户经理 1 对 1</option>
-                <option value="outbound">主动外呼</option>
-                <option value="automated">APP 推送 / 短信</option>
-              </select>
-              <p v-if="channelOverridden" class="text-xs text-amber-400 mt-1">
-                ⚠ 已偏离该价值层的推荐渠道（{{ channelLabel(recommendedChannel) }}），需填写原因
-              </p>
-            </div>
-            <div v-if="channelOverridden" class="form-group full">
-              <label>覆盖原因 <span class="text-red-400">*</span></label>
-              <textarea v-model="form.override_reason" rows="2"
-                        placeholder="例如：客户在本行资产为 0，但他行有高净值，主管特批"></textarea>
-            </div>
-            <div class="form-group full">
-              <label>推荐动作（后端统一策略）</label>
-              <!-- 只读：动作由后端 recommend_action(价值层, 风险等级) 产出，
-                   与干预策略页矩阵、客户列表 strategy 字段同源。
-                   此前这里是写死的 8 项下拉，构成第三套说法。 -->
-              <input :value="recommendedAction" readonly class="readonly" />
-            </div>
-            <div class="form-group">
-              <label>负责人 <span class="text-red-400">*</span></label>
-              <!-- 改为下拉：取值 = 行员工号。
-                   旧实现是自由文本，导致 seed 名单里的虚构人名被写进工单
-                   （派给了查无此人），且无法关联回账号做"我的工单"。
-                   降级：名单拉不到时退化为只读文本（显示当前登录人），
-                   仍可建单 —— 后端会以会话身份兜底。 -->
-              <select v-if="canAssign && assignees.length" v-model="form.assignee">
-                <option value="" disabled>请选择负责人</option>
-                <option v-for="a in assignees" :key="a.username" :value="a.username">
-                  {{ a.display_name }}（{{ a.username }}·{{ a.department }}）
-                </option>
-              </select>
-              <input v-else :value="assigneeName(form.assignee)" readonly class="readonly"
-                     title="行员名单不可用，将按当前登录人建单" />
-            </div>
-            <div class="form-group full">
-              <label>备注</label>
-              <textarea v-model="form.note" placeholder="添加备注信息..." rows="4"></textarea>
-              <!-- 建议理由：系统按当前客户实时数据生成，可自由修改。
-                   生成逻辑见 backend/app/services/note_service.py ——
-                   确定性模板拼装，非 LLM，句中每个数字都有出处。 -->
-              <div class="note-assist">
-                <div class="note-assist-head">
-                  <span class="note-assist-title">
-                    🤖 建议理由
-                    <span class="note-assist-badge">系统生成 · 可修改</span>
-                  </span>
-                  <button type="button" class="note-assist-btn"
-                          :disabled="noteLoading || noteFailed"
-                          @click="regenerateNote">
-                    {{ noteLoading ? '生成中…' : '重新生成' }}
-                  </button>
-                </div>
-                <p v-if="noteLoading" class="note-assist-hint">正在读取该客户实时打分结果…</p>
-                <p v-else-if="noteFailed" class="note-assist-hint note-assist-err">
-                  生成失败：{{ noteFailed }}
-                  <button type="button" class="note-assist-link" @click="regenerateNote">重试</button>
-                </p>
-                <template v-else-if="suggestion">
-                  <div :class="['note-assist-verdict', verdictClass(suggestion.worthiness.verdict)]">
-                    <strong>{{ verdictLabel(suggestion.worthiness.verdict) }}</strong>
-                    <span class="note-assist-num">
-                      个体净收益 {{ fmtSignedYuan(suggestion.worthiness.net) }}
-                      · 盈亏平衡点 {{ fmtYuan(suggestion.worthiness.breakeven) }}
-                    </span>
-                  </div>
-                  <p class="note-assist-hint">
-                    系统已把上述内容写入备注框，可直接编辑或清空后自行填写。
-                  </p>
-                </template>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-outline" @click="closeModal">取消</button>
-          <p v-if="submitError" role="alert" class="text-red-700">{{ submitError }}</p><button class="btn btn-primary" :disabled="submitting || !form.customer_name || !form.assignee" @click="submitOrder">确认创建</button>
-        </div>
-      </div>
-    </Dialog>
+    <PrepareOrderDialog :open="!!preparingCustomerId" :customer-id="preparingCustomerId"
+                        @close="preparingCustomerId = ''" @created="fetchCustomers" />
 
     <!-- Toast -->
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
@@ -512,10 +404,13 @@
 
 <script setup>
 import Dialog from '../components/Dialog.vue'
+import PrepareOrderDialog from '../components/PrepareOrderDialog.vue'
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
 import api from '../api'
 import { useRequestScope } from '../api/useRequestScope'
+import InfoTip from '../components/InfoTip.vue'
 import { riskLabel, riskColor, riskBadgeClass, probColor, fmtPercent, valueTierLabel, valueTierColor, channelLabel } from '../utils/risk'
 import {
   assignees, canAssign, loadAssignees, defaultAssignee, assigneeName,
@@ -531,13 +426,12 @@ import {
  *   描述的「实测峰值 46 个在途请求」的成因之一。
  */
 const scope = useRequestScope()
+const auth = useAuthStore()
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
 const listLoading = ref(false)
 const listError = ref('')
-const submitting = ref(false)
-const submitError = ref('')
 const customers = ref([])
 const summary = reactive({ total_customers: 0, high_risk: 0, exited: 0, active_orders: 0 })
 const modelUsed = ref('')
@@ -573,41 +467,7 @@ const riskTabs = [
   { key: 'LOW', label: '🟢 低风险' },
 ]
 
-const modalOpen = ref(false)
-// 建议理由的生成状态 —— 与 note 文本框配合：
-//   suggestion 非空时把 note 预填进去，人可自由改写
-//   noteLoading  首次打开弹窗需请求后端（数百毫秒），期间给提示
-//   noteFailed   生成失败不阻塞建单，只提示并允许手写
-const noteLoading = ref(false)
-const noteFailed = ref('')
-const suggestion = ref(null)
-// 每次打开弹窗自增，用于丢弃过期响应 —— 快速连点不同客户时，
-// 先发的请求可能后返回，会把 A 客户的理由写到 B 客户的弹窗里
-let noteToken = 0
-
-const form = reactive({
-  customer_id: '', customer_name: '', geography: '',
-  risk_level: 'MEDIUM', probability: 0, balance: 0,
-  risk_factors: [], strategy: '', assignee: '', note: '',
-  // 阈值快照 —— 与 Dashboard 建单一致，供事后审计分级依据
-  thresholds_snapshot: null, model_used: null,
-  // 价值层快照 —— 与 risk_level 快照配套，见 models/work_order.py
-  value_tier_snapshot: null, expected_value_snapshot: null,
-  // 渠道 —— 由价值层预填推荐值；改选需填 override_reason
-  channel: 'outbound', override_reason: '',
-})
-
-// 该客户所属价值层的推荐渠道 —— 用于判断当前选择是否已偏离推荐
-const recommendedChannel = computed(() => {
-  const t = form.value_tier_snapshot
-  if (t === 'ZERO') return 'automated'
-  if (t === 'HIGH') return 'relationship'
-  return 'outbound'
-})
-const channelOverridden = computed(() => form.channel !== recommendedChannel.value)
-const recommendedAction = computed(
-  () => form.strategy || '—',
-)
+const preparingCustomerId = ref('')
 
 const toastMsg = ref('')
 let toastTimer = null
@@ -657,6 +517,23 @@ function setRisk(r) {
   currentRisk.value = r
   onFilter()
 }
+const activeFilters = computed(() => [
+  { key: 'risk', label: currentRisk.value !== 'all' ? riskLabel(currentRisk.value) : '' },
+  { key: 'tier', label: currentTier.value ? valueTierLabel(currentTier.value) : '' },
+  { key: 'geo', label: geoFilter.value },
+  { key: 'exited', label: exitedFilter.value === '0' ? '尚未流失' : exitedFilter.value === '1' ? '历史已流失' : '' },
+  { key: 'order', label: hasOrderFilter.value === '0' ? '无在途工单' : hasOrderFilter.value === '1' ? '已有在途工单' : '' },
+  { key: 'search', label: searchText.value.trim() ? `搜索：${searchText.value.trim()}` : '' },
+].filter(item => item.label))
+function removeFilter(key) {
+  const fields = { risk: currentRisk, tier: currentTier, geo: geoFilter, exited: exitedFilter, order: hasOrderFilter, search: searchText }
+  fields[key].value = key === 'risk' ? 'all' : ''
+  onFilter()
+}
+function resetFilters() {
+  currentRisk.value = 'all'; currentTier.value = ''; geoFilter.value = ''; exitedFilter.value = ''; hasOrderFilter.value = ''; searchText.value = ''
+  onFilter()
+}
 function onSearch() {
   clearTimeout(searchTimer)
   searchTimer = setTimeout(onFilter, 300)
@@ -674,7 +551,7 @@ function goPage(p) {
 
 /** 点行进详情页 */
 function openDetail(c) {
-  router.push(`/customers/${c.customer_id}`)
+  router.push({ path: `/customers/${c.customer_id}`, query: { from: route.fullPath } })
 }
 
 // ── 批量建单（卡片翻页式派单）────────────────────────────
@@ -790,6 +667,7 @@ function clearSelection() {
  *   （与工单表的 thresholds_snapshot / value_tier_snapshot 同一道理）。
  */
 async function openDispatch() {
+  if (!auth.can('order:write')) return
   const ids = [...selected.value]
   if (!ids.length) return
   batchResult.value = null
@@ -923,6 +801,7 @@ function restoreCurrent() {
  *      的心理模型一致（循环调用会留 N 条）
  */
 async function submitDispatch() {
+  if (!auth.can('order:write')) return
   const pending = dispatchItems.value.filter((it) => !it.skipped)
   const skipped = dispatchItems.value.length - pending.length
 
@@ -1081,119 +960,7 @@ async function fetchCustomers() {
   } finally { if (token === loadToken && scope.isActive()) listLoading.value = false }
 }
 
-function openCreate(c) {
-  Object.assign(form, {
-    customer_id: c.customer_id || '',
-    customer_name: c.surname || '',
-    geography: c.geography || '',
-    risk_level: c.risk_level || 'MEDIUM',
-    probability: c.probability || 0,
-    balance: c.balance || 0,
-    risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
-    strategy: c.strategy || '',
-    // ⚠ 预填**当前登录人**，而不是留空。
-    //   留空是旧实现的行为，后果：建单人每次都要手打自己的名字，
-    //   批量入口干脆没有这个框，于是建出一堆无负责人的工单。
-    //   默认派给自己是银行业务里最自然的起点（"我建的我自己跟"），
-    //   要转给别人再从下拉里换。
-    assignee: defaultAssignee(),
-    note: '',
-    thresholds_snapshot: riskInfo.value?.thresholds || null,
-    model_used: riskInfo.value?.model || null,
-    value_tier_snapshot: c.value_tier || null,
-    expected_value_snapshot: c.expected_value ?? null,
-    // 渠道预填该客户价值层的推荐值；strategy 直接用后端产出的动作
-    channel: c.channel || 'outbound',
-    override_reason: '',
-  })
-  modalOpen.value = true
-  fetchSuggestedNote(c.customer_id)
-}
-
-/**
- * 取「建议理由」并预填到备注框。
- *
- * 设计取舍：**失败不阻塞建单**。理由只是辅助信息，若接口挂了就让人自己写，
- * 不能因此拦住业务。故 catch 里只记错误、不弹 toast、不禁用「确认创建」。
- *
- * 覆盖行为：仅在备注框为空时预填。若用户已手工输入，重新生成**不覆盖** ——
- * 否则点一下按钮就把人写的东西冲掉了。
- */
-async function fetchSuggestedNote(customerId) {
-  const token = ++noteToken
-  noteLoading.value = true
-  noteFailed.value = ''
-  suggestion.value = null
-  try {
-    const { data } = await scope.get(`/customers/${customerId}/suggested-note`)
-    if (token !== noteToken) return      // 过期响应：客户已切换，丢弃
-    suggestion.value = data
-    if (!form.note.trim()) form.note = data.note || ''
-  } catch (e) {
-    if (token !== noteToken) return
-    noteFailed.value = e.response?.data?.detail || e.message
-  } finally {
-    if (token === noteToken) noteLoading.value = false
-  }
-}
-
-/** 「重新生成」按钮 —— 强制覆盖当前备注（用户主动点的，覆盖是预期行为） */
-async function regenerateNote() {
-  if (!form.customer_id) return
-  noteLoading.value = true
-  noteFailed.value = ''
-  const token = ++noteToken
-  try {
-    const { data } = await scope.get(`/customers/${form.customer_id}/suggested-note`)
-    if (token !== noteToken) return
-    suggestion.value = data
-    form.note = data.note || ''
-  } catch (e) {
-    if (token !== noteToken) return
-    noteFailed.value = e.response?.data?.detail || e.message
-  } finally {
-    if (token === noteToken) noteLoading.value = false
-  }
-}
-
-function closeModal() {
-  if (submitting.value) return
-  modalOpen.value = false
-  // 作废在途请求并清空生成态 —— 否则下次打开会先闪出上一客户的理由
-  noteToken++
-  noteLoading.value = false
-  noteFailed.value = ''
-  suggestion.value = null
-}
-
-async function submitOrder() {
-  if (submitting.value) return
-  submitError.value = ''
-  if (!form.customer_id || !form.customer_name) {
-    showToast('请填写客户信息')
-    return
-  }
-  // 负责人必填（后端也会校验 422，这里提前拦一道给出即时反馈）
-  if (!String(form.assignee || '').trim()) {
-    showToast('请选择负责人（工单必须有人负责）')
-    return
-  }
-  // 与后端同一条规则：偏离推荐渠道必须留原因（后端也会校验，这里提前拦一道）
-  if (channelOverridden.value && !form.override_reason.trim()) {
-    showToast('已偏离推荐渠道，请填写覆盖原因')
-    return
-  }
-  try {
-    submitting.value = true
-    await api.post('/work-orders', { ...form })
-    showToast('工单创建成功 · ' + form.customer_id + ' ' + form.customer_name)
-    submitting.value = false
-    closeModal()
-    fetchCustomers()
-  } catch (e) {
-    submitError.value = e.response?.data?.detail || e.message
-  } finally { submitting.value = false }
-}
+function openCreate(c) { if (auth.can('order:write')) preparingCustomerId.value = c.customer_id }
 
 function showToast(msg) {
   toastMsg.value = msg
@@ -1221,10 +988,10 @@ onBeforeUnmount(() => {
 // 浏览器前进/后退时同步筛选状态（syncUrl 用的是 replace，不会与这里形成循环）
 watch(() => route.query, () => {
   const before = JSON.stringify([currentRisk.value, currentTier.value, geoFilter.value,
-    exitedFilter.value, searchText.value, sortBy.value, page.value])
+    exitedFilter.value, hasOrderFilter.value, searchText.value, sortBy.value, page.value, pageSize.value])
   readUrl()
   const after = JSON.stringify([currentRisk.value, currentTier.value, geoFilter.value,
-    exitedFilter.value, searchText.value, sortBy.value, page.value])
+    exitedFilter.value, hasOrderFilter.value, searchText.value, sortBy.value, page.value, pageSize.value])
   if (before !== after) fetchCustomers()
 })
 </script>
@@ -1232,11 +999,19 @@ watch(() => route.query, () => {
 <style scoped>
 /* ── 风险分级标准 ── */
 .risk-banner {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  line-height:1.8;
   padding: 10px 16px; border-radius: 8px; font-size: 12px; color: #1d4ed8;
   background: #eef3fb; border: 1px solid #c7d6ee;
 }
+.risk-banner summary { cursor:pointer; font-weight:600; }
+.risk-banner[open] summary { margin-bottom:8px; }
 .risk-banner-item { font-weight: 700; }
+.customer-more-filters summary { cursor:pointer; border:1px solid var(--bank-border); border-radius:8px; padding:8px 12px; background:var(--bank-surface); font-size:13px; }
+.customer-more-filters[open] { flex-basis:100%; order:2; }
+.customer-filter-fields { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; padding:16px 0 4px; }
+.customer-filter-fields label { display:grid; gap:6px; font-size:13px; color:var(--bank-muted); }
+.customer-filter-fields .select { width:100%; }
+@media(max-width:767px) { .customer-filter-fields { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 
 /* ── 建议理由辅助区（建单弹窗内）── */
 /* 与备注框紧邻，视觉上属于同一组：上方是文本框，下方是系统的建议与出处 */

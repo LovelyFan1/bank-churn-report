@@ -17,7 +17,7 @@ const routes = [
     path: '/dashboard',
     name: 'Dashboard',
     component: () => import('../views/Dashboard.vue'),
-    meta: { title: '数据概览', icon: 'dashboard' }
+    meta: { title: '工作台', icon: 'dashboard' }
   },
   {
     path: '/customers',
@@ -26,7 +26,7 @@ const routes = [
     // ⚠ permission: 'insight:view' —— 客户专员（staff）没有全行洞察授权，
     //   直接输网址进来会被守卫弹回。他在这个页面看到的所有按钮
     //   （建单 / 批量派单 / 导出）都会 403，不如明确拒绝。
-    meta: { title: '客户管理', icon: 'customers', permission: 'insight:view' }
+    meta: { title: '客户名单', icon: 'customers', permission: 'insight:view' }
   },
   {
     // 客户详情 —— 从列表点行进入，看 SHAP 归因 / 推荐动作 / 历史工单。
@@ -40,31 +40,31 @@ const routes = [
     path: '/eda',
     name: 'EdaAnalysis',
     component: () => import('../views/EdaAnalysis.vue'),
-    meta: { title: 'EDA分析', icon: 'eda', permission: 'insight:view' }
+    meta: { title: '数据洞察', icon: 'eda', permission: 'insight:view' }
   },
   {
     path: '/clustering',
     name: 'CustomerClustering',
     component: () => import('../views/CustomerClustering.vue'),
-    meta: { title: '客户分群', icon: 'clustering', permission: 'insight:view' }
+    meta: { title: '客群洞察', icon: 'clustering', permission: 'insight:view' }
   },
   {
     path: '/models',
     name: 'ModelComparison',
     component: () => import('../views/ModelComparison.vue'),
-    meta: { title: '模型对比', icon: 'models', permission: 'insight:view' }
+    meta: { title: '模型效果', icon: 'models', permission: 'insight:view' }
   },
   {
     path: '/intervention',
     name: 'InterventionStrategy',
     component: () => import('../views/InterventionStrategy.vue'),
-    meta: { title: '干预策略', icon: 'intervention', permission: 'insight:view' }
+    meta: { title: '分层跟进策略', icon: 'intervention', permission: 'insight:view' }
   },
   {
     path: '/work-orders',
     name: 'WorkOrders',
     component: () => import('../views/WorkOrders.vue'),
-    meta: { title: '工单管理', icon: 'work-orders' }
+    meta: { title: '跟进工单', icon: 'work-orders' }
   },
   {
     // 智能助手：读取数据、恢复服务端任务状态，并显式确认写操作。
@@ -74,7 +74,7 @@ const routes = [
     // ⚠ permission 与后端一致：staff（客户专员）没有 agent:use，
     //   直接输网址进来会被守卫弹回工作台 —— 否则页面能打开、
     //   一发消息就 403，比明确拒绝更让人困惑。
-    meta: { title: '智能助手', icon: 'assistant', badge: 'Beta', permission: 'agent:use' }
+    meta: { title: '超级智能体', icon: 'assistant', badge: 'Beta', permission: 'agent:use' }
   },
   {
     // 操作审计 —— 4A 的 Audit 环节。仅管理员可见（见下方守卫）。

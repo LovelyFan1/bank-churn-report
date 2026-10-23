@@ -15,10 +15,22 @@
  *   指标（text-align:center），这些会继承进来。不重置就会得到粗体居中的
  *   说明文字。
  */
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, useId, onMounted, onBeforeUnmount } from 'vue'
+
+/* 三种形态，交互完全一致（悬停/聚焦/点击都开同一个浮层）：
+     · 默认        圆圈感叹号
+     · label       胶囊按钮（带文字，例：助手能帮你做什么）
+     · icon='gear' 图标按钮（齿轮）——用于和旁边的 ⓘ 并排、不抢宽度
+   `label` 同时作为无障碍名称，所以图标形态也请传 label。 */
+defineProps({
+  label: { type: String, default: '' },
+  icon: { type: String, default: '' },
+})
 
 const open = ref(false)
 const btn = ref(null)
+const popup = ref(null)
+const popupId = `info-${useId()}`
 const pos = ref({ top: 0, left: 0, below: true, w: 400 })
 let closeTimer = null
 
@@ -56,19 +68,30 @@ function hide() {
   closeTimer = setTimeout(() => { open.value = false }, 140)
 }
 
-function toggle() { open.value ? hide() : show() }
-
 function onViewportChange() { if (open.value) place() }
+function dismiss(event) {
+  if (event.type === 'keydown') {
+    if (event.key !== 'Escape' || !open.value) return
+    event.stopImmediatePropagation()
+    event.preventDefault()
+  } else if (btn.value?.contains(event.target) || popup.value?.contains(event.target)) return
+  if (closeTimer) clearTimeout(closeTimer)
+  open.value = false
+}
 
 onMounted(() => {
   window.addEventListener('resize', onViewportChange)
   window.addEventListener('scroll', onViewportChange, true)
+  document.addEventListener('pointerdown', dismiss)
+  document.addEventListener('keydown', dismiss, true)
 })
 
 onBeforeUnmount(() => {
   if (closeTimer) clearTimeout(closeTimer)
   window.removeEventListener('resize', onViewportChange)
   window.removeEventListener('scroll', onViewportChange, true)
+  document.removeEventListener('pointerdown', dismiss)
+  document.removeEventListener('keydown', dismiss, true)
 })
 </script>
 
@@ -78,18 +101,27 @@ onBeforeUnmount(() => {
       ref="btn"
       type="button"
       class="itip-btn"
-      :class="{ on: open }"
-      aria-label="口径说明"
+      :class="{ on: open, pill: !!label && !icon, icon: !!icon }"
+      :aria-label="label || '口径说明'"
+      :aria-expanded="open"
+      :aria-describedby="open ? popupId : undefined"
       @mouseenter="show"
       @mouseleave="hide"
       @focus="show"
       @blur="hide"
-      @click.stop="toggle"
-    >!</button>
+      @click.stop="show"
+    ><svg v-if="icon === 'gear'" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+      </svg><template v-else>{{ label || '!' }}</template></button>
 
     <Teleport to="body">
       <div
         v-if="open"
+        ref="popup"
+        :id="popupId"
+        role="tooltip"
         class="itip-pop"
         :class="{ above: !pos.below }"
         :style="{ top: pos.top + 'px', left: pos.left + 'px', width: pos.w + 'px' }"
@@ -112,9 +144,9 @@ onBeforeUnmount(() => {
 
 /* 感叹号圆圈 —— 与页面同色系（#7c8aa5 次要文字 / #1d4ed8 主色） */
 .itip-btn {
-  width: 15px;
-  height: 15px;
-  flex: 0 0 15px;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
   padding: 0;
   border-radius: 50%;
   border: 1px solid #b9c4d4;
@@ -143,6 +175,29 @@ onBeforeUnmount(() => {
   outline-offset: 1px;
 }
 
+/* 胶囊形态：用于带文字的入口（例：助手能帮你做什么） */
+.itip-btn.pill {
+  width: auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 12px;
+  border-radius: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+/* 图标形态：与圆圈同尺寸，齿轮略小，避免和相邻的 ⓘ 挤在一起 */
+.itip-btn.icon {
+  padding: 0;
+}
+.itip-btn.icon svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
 /* 浮层 —— Teleport 到 body，故用 position: fixed（坐标为视口坐标） */
 .itip-pop {
   position: fixed;
@@ -165,6 +220,10 @@ onBeforeUnmount(() => {
   text-transform: none;
   white-space: normal;
   color: #4b5563;
+
+  /* 内容可能较长（例：能力清单）：限高并内部滚动，避免浮层超出视口 */
+  max-height: min(70vh, 420px);
+  overflow-y: auto;
 }
 .itip-pop.above {
   transform: translateX(-50%) translateY(-100%);

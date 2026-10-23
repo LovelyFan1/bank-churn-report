@@ -20,6 +20,20 @@ function toggleNav() {
 watch(() => route.path, () => { mobileOpen.value = false })
 onMounted(() => window.addEventListener('resize', resizeLayout))
 onBeforeUnmount(() => window.removeEventListener('resize', resizeLayout))
+const mainEl = ref(null)
+let mainObserver = null
+let chartResizeTimer = null
+let previousMainWidth = 0
+onMounted(() => {
+  mainObserver = new ResizeObserver(([entry]) => {
+    if (entry.contentRect.width === previousMainWidth) return
+    previousMainWidth = entry.contentRect.width
+    clearTimeout(chartResizeTimer)
+    chartResizeTimer = setTimeout(() => window.dispatchEvent(new Event('resize')), 80)
+  })
+  if (mainEl.value) mainObserver.observe(mainEl.value)
+})
+onBeforeUnmount(() => { mainObserver?.disconnect(); clearTimeout(chartResizeTimer) })
 const idleWarn = ref(false)         // 即将因无操作退出
 
 // ── 一级导航：业务工作流（看大盘 → 找客户 → 办工单 → 定策略 → 智能助手）──
@@ -43,9 +57,9 @@ const idleWarn = ref(false)         // 即将因无操作退出
 const navItems = [
   { path: '/dashboard', title: '工作台', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4' },
   { path: '/customers', title: '客户名单', permission: 'insight:view', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
-  { path: '/work-orders', title: '挽留工单', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
-  { path: '/intervention', title: '干预策略', permission: 'insight:view', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
-  { path: '/assistant', title: '智能助手', badge: 'Beta', permission: 'agent:use', icon: 'M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-4 4v-4z' },
+  { path: '/work-orders', title: '跟进工单', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
+  { path: '/intervention', title: '分层跟进策略', permission: 'insight:view', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+  { path: '/assistant', title: '超级智能体', badge: 'Beta', permission: 'agent:use', icon: 'M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-4 4v-4z' },
 ]
 
 // 一级导航同样按权限过滤（与下方 visibleAdmin 同一判据）
@@ -206,7 +220,7 @@ function stayActive() {
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" :d="item.icon" />
           </svg>
           <transition name="fade">
-            <span v-if="!collapsed" class="whitespace-nowrap flex-1">{{ item.title }}</span>
+            <span v-if="!collapsed" class="whitespace-normal min-w-0 flex-1">{{ item.title }}</span>
           </transition>
           <transition name="fade">
             <span v-if="!collapsed && item.badge" class="nav-badge">{{ item.badge }}</span>
@@ -219,7 +233,7 @@ function stayActive() {
                侧边栏会出现一个**下面什么都没有的分组标题** —— 看起来像加载失败。 -->
         <template v-if="visibleAdmin.length">
           <div v-if="!collapsed" class="nav-divider">
-            <span class="nav-divider-text">系统管理</span>
+            <span class="nav-divider-text">分析与治理</span>
           </div>
           <div v-else class="nav-divider-collapsed"></div>
         </template>
@@ -260,7 +274,7 @@ function stayActive() {
     </aside>
 
     <!-- Main Content -->
-    <main
+    <main ref="mainEl"
       :class="[
         'flex-1 min-w-0 transition-all duration-300 min-h-screen',
         mobile ? 'ml-0' : collapsed ? 'ml-[68px]' : 'ml-[220px]'
@@ -269,6 +283,7 @@ function stayActive() {
     >
       <!-- 顶栏：登录人 + 角色 + 登出 -->
       <header class="topbar">
+        <span v-if="!mobile" class="environment-label">仿真业务环境 · 数据与结果用于演示</span>
         <button v-if="mobile" class="btn-logout nav-menu" @click="toggleNav" aria-label="打开导航" :aria-expanded="mobileOpen">☰ 导航</button>
         <div class="topbar-right">
           <span class="role-chip">{{ auth.roleLabel || '未登录' }}</span>
@@ -304,6 +319,7 @@ function stayActive() {
 </template>
 
 <style scoped>
+.environment-label { color:var(--bank-muted); font-size:12px; margin-right:auto; }
 /* ── 面包屑（仅二级页）── */
 .breadcrumb {
   display: flex; align-items: center; gap: 7px;

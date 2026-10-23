@@ -2,10 +2,18 @@
   <div class="space-y-5">
     <!-- Page Header -->
     <div>
-      <h1 class="text-2xl font-bold">📋 工单管理</h1>
-      <p class="text-gray-400 text-sm mt-1">流失预警客户干预工单 · 跟踪挽留执行全流程</p>
+      <h1 class="text-2xl font-bold">处理挽留工单<InfoTip>
+        <b class="tip-hd">本页怎么用</b>
+        先找到待办，打开工单查看下一步；线下联系客户后，在这里记录结果。
+        <span class="tip-row"><b>跟进四步</b>：① 找客户　② 看原因　③ 确认跟进　④ 记录结果（本页是第 4 步）</span>
+      </InfoTip></h1>
     </div>
 
+    <div v-if="focusedId || customerFilter" class="active-filters">
+      <span>{{ focusedId ? `当前定位工单 #${focusedId}` : `仅显示客户 ${customerFilter} 的跟进记录` }}</span>
+      <button class="flow-link" @click="clearContext">查看全部可见工单</button>
+    </div>
+    <p v-if="createdReceipt" class="flow-hint" role="status">工单 #{{ createdReceipt.id }} 已创建。<RouterLink class="flow-link" :to="orderLocation(createdReceipt)">打开这张工单</RouterLink></p>
     <!-- Loading -->
     <div v-if="loading" class="flex items-center justify-center py-20">
       <div class="animate-spin rounded-full h-10 w-10 border-2 border-indigo-400 border-t-transparent"></div>
@@ -16,8 +24,8 @@
       <p v-if="actionError" role="alert" class="text-red-700">操作失败：{{ actionError }}</p>
       <p v-if="ordersLoading" role="status">正在刷新工单…</p>
       <!-- Stats Cards -->
-      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-        <div class="glass-card p-5" v-for="s in statsCards" :key="s.key">
+      <div class="order-state-strip">
+        <div class="order-state-item" v-for="s in statsCards" :key="s.key">
           <div class="text-xs text-gray-400 mb-1">{{ s.label }}</div>
           <div class="text-3xl font-bold" :style="{ color: s.color }">{{ s.value }}</div>
         </div>
@@ -29,10 +37,10 @@
           v-for="f in filters" :key="f.key"
           class="btn btn-outline btn-sm"
           :class="{ active: currentFilter === f.key }"
-          @click="setFilter(f.key)"
+          :disabled="!!focusedId" @click="setFilter(f.key)"
         >{{ f.label }}</button>
         <span class="flex-1"></span>
-        <select v-model="assigneeFilter" class="select" @change="onFilterChange">
+        <select aria-label="按负责人筛选" :disabled="!!focusedId" v-model="assigneeFilter" class="select" @change="onFilterChange">
           <option value="">全部负责人</option>
           <!-- ⚠ value 保持**数据库里的原值**（可能是工号，也可能是历史姓名），
                只把显示文本映射成姓名 —— 若把 value 也换成工号，
@@ -40,12 +48,13 @@
           <option v-for="a in stats.assignees" :key="a" :value="a">{{ assigneeName(a) }}</option>
         </select>
         <input
-          v-model="searchText"
+          v-model="searchText" :disabled="!!focusedId" aria-label="搜索工单客户姓名或编号"
           placeholder="搜索客户姓名 / 编号..."
           class="search-input"
           @input="onSearchInput"
         />
-        <button v-if="auth.can('order:write')" class="btn btn-primary btn-sm" @click="openCreate()">＋ 创建工单</button>
+        <RouterLink v-if="auth.can('order:write') && auth.can('insight:view')" class="btn btn-primary btn-sm" :to="{ path: '/customers', query: { exited: '0', has_order: '0' } }">选择客户准备跟进</RouterLink>
+        <button v-if="auth.can('order:write')" class="btn btn-outline btn-sm" @click="openCreate()">按编号新建</button>
       </div>
 
       <!-- 脱敏提示：说明"为什么看不到客户信息" -->
@@ -59,12 +68,12 @@
              展开的详情面板在该滚动容器内，可正常滚动查看。 -->
       <div class="glass-card">
         <div class="table-scroll">
-        <table class="w-full">
+        <table class="w-full work-orders-table" :class="{ 'orders-masked': masked }">
           <thead>
             <tr>
               <th>{{ masked ? '客户（匿名）' : '客户' }}</th>
               <th>风险等级</th>
-              <th v-if="!masked">流失概率</th>
+              <th v-if="!masked">模型风险评分</th>
               <th>触达渠道</th>
               <th v-if="!masked">风险资产评分</th>
               <th>工单状态</th>
@@ -83,10 +92,11 @@
             <template v-for="o in orders" :key="o.id">
               <tr class="cursor-pointer" :class="{ expanded: expandedId === o.id }" @click="toggleDetail(o)">
                 <td>
+                  <div class="order-customer">
                   <!-- 展开指示箭头 —— 此前**完全没有**视觉线索，面板只能靠
                        "点整行任意位置"打开（实测行内 hasChevronOrIcon=false）。
                        补上箭头并随展开旋转，让"这行可以点开"变得显然。 -->
-                  <span class="chev" :class="{ open: expandedId === o.id }">▸</span>
+                  <button class="chev" :class="{ open: expandedId === o.id }" :aria-label="`展开工单 ${o.id} 的详情`" :aria-expanded="expandedId === o.id" :aria-controls="`order-detail-${o.id}`" @click.stop="toggleDetail(o)">▸</button>
                   <!-- 脱敏：只显示序号，不显示姓名/编号/地区 -->
                   <template v-if="masked">
                     <div>
@@ -103,6 +113,7 @@
                       <div class="text-xs text-gray-500">{{ o.customer_id }} · {{ o.geography }}</div>
                     </div>
                   </div>
+                  </div>
                 </td>
                 <td><span class="risk-badge" :class="riskBadgeClass(o.risk_level)">{{ riskLabel(o.risk_level) }}</span></td>
                 <td v-if="!masked">
@@ -113,7 +124,7 @@
                     <span class="text-xs font-semibold" :style="{ color: probColor(o.probability, o.thresholds_snapshot) }">{{ fmtPercent(o.probability) }}</span>
                   </div>
                 </td>
-                <td>
+                <td class="order-channel">
                   <!-- 渠道由价值层硬定，覆盖过的标出来（覆盖原因见展开详情） -->
                   <span class="text-xs text-gray-300">{{ o.channel ? channelLabel(o.channel) : '—' }}</span>
                   <span v-if="o.channel_overridden" class="text-amber-400 ml-1 text-xs" title="人工覆盖了推荐渠道">⚠</span>
@@ -148,7 +159,7 @@
                   <span v-if="displayAssignee(o.assignee).legacy"
                         class="legacy-tag" title="该负责人不在当前行员名单中（历史数据或已停用账号）">历史</span>
                 </td>
-                <td class="text-gray-500 text-xs">{{ fmtDate(o.created_at) }}</td>
+                <td class="text-gray-500 text-xs whitespace-nowrap">{{ fmtDate(o.created_at) }}</td>
                 <td v-if="!masked" @click.stop>
                   <button class="btn btn-outline btn-xs" :aria-label="'编辑工单 ' + o.id" @click="openEdit(o)">✎</button>
                   <!-- ⚠ 删除仅 order:write（经理及以上）可见。专员没有该权限，
@@ -158,9 +169,9 @@
                 </td>
               </tr>
               <!-- Detail Panel -->
-              <tr v-if="expandedId === o.id">
+              <tr v-if="expandedId === o.id" :id="`order-detail-${o.id}`">
                 <td :colspan="masked ? 7 : 9" class="p-0">
-                  <div class="detail-panel">
+                  <div class="detail-panel"><p class="flow-next-step"><strong>下一步：</strong>{{ nextStep(o) }}</p>
                     <div class="grid grid-cols-2 gap-4">
                       <!-- 脱敏：风险因素/推荐策略/备注都会复述客户画像，故隐藏 -->
                       <div v-if="!masked"><dt>风险因素</dt><dd><span v-for="f in o.risk_factors" :key="f" class="risk-tag">{{ f }}</span></dd></div>
@@ -450,11 +461,14 @@
 
 <script setup>
 import Dialog from '../components/Dialog.vue'
+import { useRoute, useRouter } from 'vue-router'
+import { focusedOrderId as parseOrderId, orderLocation } from '../utils/workflow'
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useRequestScope } from '../api/useRequestScope'
 import { riskLabel, riskBadgeClass, riskColor, probColor, fmtPercent, valueTierLabel, channelLabel, fmtWan } from '../utils/risk'
+import InfoTip from '../components/InfoTip.vue'
 // ⚠ 别名导入：本页已有一个 `assignees`（"按负责人筛选"下拉的**实际取值**列表，
 //   来自 /work-orders/stats，可能含历史姓名）。这里要的是**可选行员**列表
 //   （来自 /api/users/assignable，取值是工号）—— 两者用途不同，不能合并：
@@ -469,6 +483,16 @@ import {
 // ⚠ 写操作（POST/PUT/DELETE）**不经 scope** —— 已提交的请求不能因离开页面而中断。
 const scope = useRequestScope()
 const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
+const focusedId = computed(() => parseOrderId(route.query.order_id))
+const customerFilter = computed(() => typeof route.query.customer_id === 'string' && /^C\d{4,}$/.test(route.query.customer_id) ? route.query.customer_id : '')
+const createdReceipt = ref(null)
+function clearContext() { router.replace({ path: '/work-orders' }) }
+function applyRouteStatus() { currentFilter.value = STATUS_OPTIONS.includes(route.query.status) ? route.query.status : 'all' }
+function nextStep(order) {
+  return { pending: '先开始处理，再联系客户并记录实际沟通情况。', in_progress: '完成联系后记录反馈；需要继续跟进时保留处理中，确认观察结果后再结案。', completed: '本单已完成，可核对处理结果和观察依据。', lost: '本单已记录流失结果，可复核观察依据。', cancelled: '已停止跟进，记录保留；需要重新处理时核对重开资格。' }[order.status] || '核对当前记录后再进行操作。'
+}
 
 // ── State ──────────────────────────────────────────
 const loading = ref(true)
@@ -647,20 +671,20 @@ const statsCards = computed(() => [
     value: stats.total,
     color: '#17335c',
   },
-  { key: 'pending', label: '⏳ 待处理', value: stats.pending, color: '#92400e' },
-  { key: 'in_progress', label: '🔄 处理中', value: stats.in_progress, color: '#1d4ed8' },
-  { key: 'completed', label: '✅ 已完成', value: stats.completed, color: '#0f766e' },
-  { key: 'lost', label: '❌ 已流失', value: stats.lost, color: '#b91c1c' },
-  { key: 'cancelled', label: '⏹ 已取消', value: stats.cancelled, color: '#5b6b83' },
+  { key: 'pending', label: '待处理', value: stats.pending, color: '#92400e' },
+  { key: 'in_progress', label: '处理中', value: stats.in_progress, color: '#1d4ed8' },
+  { key: 'completed', label: '已完成', value: stats.completed, color: '#0f766e' },
+  { key: 'lost', label: '已流失', value: stats.lost, color: '#b91c1c' },
+  { key: 'cancelled', label: '已取消', value: stats.cancelled, color: '#5b6b83' },
 ])
 
 const filters = [
   { key: 'all', label: '全部' },
-  { key: 'pending', label: '⏳ 待处理' },
-  { key: 'in_progress', label: '🔄 处理中' },
-  { key: 'completed', label: '✅ 已完成' },
-  { key: 'lost', label: '❌ 已流失' },
-  { key: 'cancelled', label: '⏹ 已取消' },
+  { key: 'pending', label: '待处理' },
+  { key: 'in_progress', label: '处理中' },
+  { key: 'completed', label: '已完成' },
+  { key: 'lost', label: '已流失' },
+  { key: 'cancelled', label: '已取消' },
 ]
 
 // ── Methods ─────────────────────────────────────────
@@ -947,7 +971,8 @@ async function submitOrder() {
       })
       showToast('工单已更新')
     } else {
-      await api.post('/work-orders', { ...form })
+      const { data } = await api.post('/work-orders', { ...form })
+      createdReceipt.value = data
       showToast('工单创建成功')
     }
     submitting.value = false
@@ -1019,7 +1044,15 @@ async function fetchOrders() {
   const request = ++orderRequest
   ordersLoading.value = true; ordersError.value = ''
   try {
+    if (focusedId.value) {
+      const { data } = await scope.get(`/work-orders/${focusedId.value}`)
+      if (request !== orderRequest || !scope.isActive()) return
+      orders.value = [data]; totalPages.value = 1; expandedId.value = data.id
+      masked.value = !!data.masked; maskNotice.value = data.mask_notice || ''
+      return
+    }
     const params = { page: page.value, page_size: 20 }
+    if (customerFilter.value) params.customer_id = customerFilter.value
     if (currentFilter.value !== 'all') params.status = currentFilter.value
     if (assigneeFilter.value) params.assignee = assigneeFilter.value
     if (searchText.value) params.search = searchText.value
@@ -1045,9 +1078,12 @@ function showToast(msg) {
 onMounted(async () => {
   // 行员名单与工单数据并发拉取：名单用于新建/改派时选人，
   // 也是把工单里的工号渲染成姓名的依据 —— 晚到会让列表先显示工号再跳成姓名。
+  applyRouteStatus()
   await Promise.all([fetchStats(), fetchOrders(), loadAssignees()])
   loading.value = false
 })
+
+watch(() => route.fullPath, () => { applyRouteStatus(); page.value = 1; expandedId.value = null; fetchOrders() })
 
 // 卸载时清理：toast 定时器 + 搜索防抖定时器（此前都残留）
 onBeforeUnmount(() => {
@@ -1061,6 +1097,13 @@ defineExpose({ openCreate })
 </script>
 
 <style scoped>
+.order-state-strip { display:flex; flex-wrap:wrap; gap:0; border-block:1px solid var(--bank-border); background:var(--bank-surface); padding:14px 0; }
+.order-state-item { flex:1 1 120px; padding:4px 20px; }
+.order-state-item .text-3xl { font-size:24px; }
+.flow-next-step { margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--bank-border); line-height:1.7; color:var(--bank-text); }
+.chev { min-width:32px; min-height:32px; cursor:pointer; }
+@media(max-width:767px) { .order-state-item { flex-basis:33%; padding:8px 12px; } }
+
 /* ── 建议理由辅助区（建单弹窗内）—— 与客户管理页/首页同名同类 ── */
 .note-assist {
   margin-top: 8px; padding: 10px 12px;
@@ -1115,6 +1158,11 @@ defineExpose({ openCreate })
 
 /* ── Table ── */
 table { width: 100%; border-collapse: collapse; }
+.work-orders-table { min-width:1080px; }
+.work-orders-table.orders-masked { min-width:800px; }
+.work-orders-table th, .order-channel { white-space:nowrap; }
+.order-customer { display:flex; align-items:center; gap:8px; min-width:190px; }
+.order-customer .chev { flex:0 0 32px; }
 thead th {
   text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 600;
   color: #5b6b83; text-transform: uppercase; letter-spacing: .5px;

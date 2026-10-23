@@ -400,8 +400,10 @@ onBeforeUnmount(() => {
   <div class="space-y-6">
     <div class="flex items-center justify-between">
       <div>
-        <h1 class="page-title">模型对比</h1>
-        <p class="page-subtitle">5种ML模型训练与性能评估</p>
+        <h1 class="page-title">模型对比<InfoTip>
+          <b class="tip-hd">本页说明</b>
+          5种ML模型训练与性能评估
+        </InfoTip></h1>
       </div>
       <div class="flex items-center gap-3">
         <span v-if="training" class="text-xs text-indigo-300">{{ trainingMessage }}</span>
@@ -618,7 +620,7 @@ onBeforeUnmount(() => {
   border-radius: 8px; padding: 9px 11px;
   color: #92400e !important; font-size: 12.5px !important;
 }
-.mc-dim { color: #9aa7bd !important; font-size: 12px !important; }
+.mc-dim { color: #52647f !important; font-size: 12px !important; }
 .mc-confirm-foot {
   display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;
 }

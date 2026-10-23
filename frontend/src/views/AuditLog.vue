@@ -11,6 +11,7 @@
  */
 import { ref, onMounted, computed } from 'vue'
 import { useRequestScope } from '../api/useRequestScope'
+import InfoTip from '../components/InfoTip.vue'
 const scope = useRequestScope()
 let loadVersion = 0
 
@@ -39,7 +40,7 @@ const actionCn = (a) => ACTION_CN[a] || a
 
 // 来源 → 展示标签。agent 来源是本次改造的重点
 function sourceTag(s) {
-  if (s === 'agent') return { text: '智能助手', cls: 'src-agent' }
+  if (s === 'agent') return { text: '超级智能体', cls: 'src-agent' }
   return { text: '页面', cls: 'src-ui' }
 }
 
@@ -114,10 +115,10 @@ onMounted(load)
   <div>
     <div class="page-head">
       <div>
-        <h2 class="page-title">操作审计</h2>
-        <p class="page-sub">
+        <h2 class="page-title">操作审计<InfoTip>
+          <b class="tip-hd">本页说明</b>
           共 {{ total }} 条记录 · 谁、何时、做了什么、成没成
-        </p>
+        </InfoTip></h2>
       </div>
       <button class="btn-refresh" @click="load" :disabled="loading">
         {{ loading ? '加载中…' : '刷新' }}

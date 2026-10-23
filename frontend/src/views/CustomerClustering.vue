@@ -8,6 +8,7 @@ const auth = useAuthStore()
 const canTrain = computed(() => auth.can('model:train'))
 import { useRequestScope } from '../api/useRequestScope'
 import { pollTask } from '../api/taskPoller'
+import InfoTip from '../components/InfoTip.vue'
 
 // 页面级请求作用域：本页两个接口都是重接口（各含一次 10 万行全量加载），
 // 卸载时取消，避免它们离开页面后仍占着连接槽。
@@ -271,7 +272,7 @@ function renderScatter(scatterData, profilesData, colorBy) {
     legend: {
       top: 0, left: 'center',
       itemWidth: 10, itemHeight: 10, itemGap: 10,
-      textStyle: { color: '#9ca3af', fontSize: 11 },
+      textStyle: { color: '#52647f', fontSize: 11 },
       data: series.map(s => s.name)
     },
     // grid.top 由 20 增至 34：为置顶图例让出高度，否则图例会压住轴名（t-SNE 1/2）
@@ -284,14 +285,14 @@ function renderScatter(scatterData, profilesData, colorBy) {
     //   按后端给的 [0.5%, 99.5%] 分位裁剪后，实测只切掉 1% 的点，视图立刻清晰。
     //   （裁剪只改显示范围，不动数据。）
     xAxis: {
-      type: 'value', name: axisName(0), nameTextStyle: { color: '#9ca3af', fontSize: 11 },
+      type: 'value', name: axisName(0), nameTextStyle: { color: '#52647f', fontSize: 11 },
       min: axisRange('x', 0), max: axisRange('x', 1),
       splitLine: { lineStyle: { color: 'rgba(75,85,99,0.15)' } },
       axisLabel: { color: '#6b7280', fontSize: 10 },
       axisLine: { lineStyle: { color: '#d5dce8' } },
     },
     yAxis: {
-      type: 'value', name: axisName(1), nameTextStyle: { color: '#9ca3af', fontSize: 11 },
+      type: 'value', name: axisName(1), nameTextStyle: { color: '#52647f', fontSize: 11 },
       min: axisRange('y', 0), max: axisRange('y', 1),
       splitLine: { lineStyle: { color: 'rgba(75,85,99,0.15)' } },
       axisLabel: { color: '#6b7280', fontSize: 10 },
@@ -358,7 +359,7 @@ async function initCompare(profilesData) {
 
   chart.setOption({
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-    legend: { bottom: 0, textStyle: { color: '#9ca3af', fontSize: 11 } },
+    legend: { bottom: 0, textStyle: { color: '#52647f', fontSize: 11 } },
     grid: { left: 12, right: 12, top: 30, bottom: 40, containLabel: true },
     xAxis: {
       type: 'category', data: names,
@@ -366,7 +367,7 @@ async function initCompare(profilesData) {
       axisLabel: { color: '#5b6b83', ...categoryLabelStyle(el, names.length) },
     },
     yAxis: [
-      { type: 'value', name: '金额(万)', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#9ca3af', formatter: v => (v/10000).toFixed(0) } },
+      { type: 'value', name: '金额(万)', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#52647f', formatter: v => (v/10000).toFixed(0) } },
       { type: 'value', name: '数量/%', splitLine: { show: false }, axisLabel: { color: '#5b6b83' } },
     ],
     series: [
@@ -410,7 +411,7 @@ async function initChurnDist(profilesData) {
       data: clusters.map(c => c.name || `C${c.cluster_id}`),
       axisLine: { lineStyle: { color: '#d5dce8' } },
       axisLabel: {
-        color: '#9ca3af',
+        color: '#52647f',
         ...categoryLabelStyle(el, clusters.length),
       },
     },
@@ -429,7 +430,7 @@ async function initChurnDist(profilesData) {
           }
         })),
         label: {
-          show: true, position: 'top', color: '#9ca3af', fontSize: 11,
+          show: true, position: 'top', color: '#52647f', fontSize: 11,
           formatter: (p) => {
             const c = clusters[p.dataIndex]
             return `${c.count}\n${c.churn_rate}%`
@@ -629,8 +630,10 @@ onBeforeUnmount(() => {
   <div class="space-y-6">
     <div class="flex items-center justify-between">
       <div>
-        <h1 class="page-title">客户分群</h1>
-        <p class="page-subtitle">K-Means聚类分析 - 客群画像与特征对比</p>
+        <h1 class="page-title">客户分群<InfoTip>
+          <b class="tip-hd">本页说明</b>
+          K-Means聚类分析 - 客群画像与特征对比
+        </InfoTip></h1>
       </div>
       <div class="flex items-center gap-3">
         <label class="text-sm text-gray-400">K值:</label>

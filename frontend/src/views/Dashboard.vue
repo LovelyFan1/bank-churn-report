@@ -1,5 +1,5 @@
 <script setup>
-import Dialog from '../components/Dialog.vue'
+import PrepareOrderDialog from '../components/PrepareOrderDialog.vue'
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import { echarts } from '../utils/charts'
 import api, { isCanceled } from '../api'
@@ -38,6 +38,7 @@ const modelWarning = computed(() => (riskInfo.value?.probability_note || '')
 const modelMetrics = ref(null)
 const modelMetricsLoading = ref(true)
 const modelMetricsError = ref('')
+const taskStats = ref(null)
 
 // Chart refs
 const riskChart = shallowRef(null)
@@ -75,7 +76,9 @@ const confRows = ref([])
 // 否则读者无从判断这些数字是在哪条判定线下得出的
 const metricBasis = ref('')
 
-onMounted(async () => {
+async function loadDashboard() {
+  chartInstances.splice(0).forEach(chart => chart.dispose())
+  loading.value = true; pageError.value = ''; secondaryErrors.value = []; modelMetricsLoading.value = true
   // ── 分两批加载：核心 4 个先渲染骨架，次要 4 个后台异步补齐 ──
   //
   // 为什么拆批（实测数据）：
@@ -141,6 +144,7 @@ onMounted(async () => {
   } catch (e) {
     if (isCanceled(e) || !scope.isActive()) return
     pageError.value = e.response?.data?.detail || e.message
+    modelMetricsLoading.value = false
     loading.value = false
     return
   }
@@ -149,14 +153,16 @@ onMounted(async () => {
   loadSecondaryData()
 
   async function loadSecondaryData() {
-    const [insightsRes, activeRes, comparisonRes, retentionRes] = await Promise.all([
+    const [insightsRes, activeRes, comparisonRes, retentionRes, taskRes] = await Promise.all([
       withFallback(scope.get('/eda/key-insights'), { insights: [] }),
       withFallback(scope.get('/work-orders/active-customers'), { customer_ids: [] }),
       withFallback(scope.get('/model/comparison'), null),
       withFallback(scope.get('/cost-benefit/retention-summary'), null),
+      withFallback(scope.get('/work-orders/stats'), null),
     ])
     if (!scope.isActive()) return
 
+    taskStats.value = taskRes.data
     insights.value = insightsRes.data?.insights || []
     activeCustomerIds.value = new Set(activeRes.data?.customer_ids || [])
 
@@ -196,15 +202,14 @@ onMounted(async () => {
     // 挽留战报：只在有真实工单数据时展示
     retention.value = retentionRes.data?.has_data ? retentionRes.data : null
   }
-})
+}
+onMounted(loadDashboard)
 
 /**
  * 等待某个 ref 对应的元素真正挂载且具有非零尺寸。
  *
  * ⚠ 这修的是「图表有概率画不出来」的竞态：
- *   图表容器写在 <div v-else-if="pageError" role="alert" class="glass-card p-6 text-red-700">工作台加载失败：{{ pageError }}。请刷新重试。</div>
-    <template v-else>
-      <p v-if="secondaryErrors.length" role="alert" class="text-red-700">部分区块加载失败：{{ secondaryErrors.join('；') }}</p> 里，由 v-if="loading" 控制。
+ *   图表容器在加载完成后才挂载，由 loading 条件控制。
  *   旧代码是 loading=false 后 `await nextTick()` 一次就 echarts.init()，
  *   但 Vue 的 DOM 补丁不保证一次 tick 就完成，且 ECharts 在尺寸为 0 的
  *   容器上初始化会得到一张空白画布（且不会自己恢复）。
@@ -214,18 +219,19 @@ onMounted(async () => {
  */
 async function waitForEl(refObj, timeout = 1000) {
   const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
+  while (scope.isActive() && Date.now() < deadline) {
     const el = refObj.value
     if (el && el.clientWidth > 0 && el.clientHeight > 0) return el
     await nextTick()
     await new Promise((r) => requestAnimationFrame(r))
   }
-  return refObj.value && refObj.value.clientWidth > 0 ? refObj.value : null
+  return scope.isActive() && refObj.value && refObj.value.clientWidth > 0 ? refObj.value : null
 }
 
 /** 逐图容错初始化：一张图失败不影响其余两张 */
 async function initOne(refObj, label, initFn) {
   const el = await waitForEl(refObj)
+  if (!scope.isActive()) return
   if (!el) {
     console.warn(`[Dashboard] ${label} 容器未就绪，跳过渲染`)
     return
@@ -279,143 +285,9 @@ function initRiskChart(el) {
   chartInstances.push(chart)
 }
 
-// ── 创建工单 Modal ──
-const orderModalOpen = ref(false)
-const orderForm = ref({
-  customer_id: '', customer_name: '', geography: '',
-  risk_level: 'MEDIUM', probability: 0, balance: 0,
-  risk_factors: [], strategy: '', assignee: '', note: '',
-  // 阈值快照：记录该等级是「用哪套阈值、哪个模型」判出来的。
-  // 模型重训后分位数边界会整体位移，但工单里已冻结的等级不应随之改变 ——
-  // 存下快照才能在事后审计「这个高危当年是怎么判的」。
-  thresholds_snapshot: null, model_used: null,
-  // 价值层快照 —— 与 risk_level 快照配套，见 models/work_order.py
-  value_tier_snapshot: null, expected_value_snapshot: null,
-  // 渠道 —— 由价值层预填推荐值；改选需填 override_reason
-  channel: 'outbound', override_reason: '',
-})
-
-// 该客户所属价值层的推荐渠道 —— 用于判断当前选择是否已偏离推荐
-const orderRecommendedChannel = computed(() => {
-  const t = orderForm.value.value_tier_snapshot
-  if (t === 'ZERO') return 'automated'
-  if (t === 'HIGH') return 'relationship'
-  return 'outbound'
-})
-const orderChannelOverridden = computed(
-  () => orderForm.value.channel !== orderRecommendedChannel.value,
-)
-const orderToast = ref('')
-let orderToastTimer = null
-
-// 建议理由生成态 —— 与客户管理页同一机制、同一后端接口。
-// 失败不阻塞建单：理由只是辅助信息，接口挂了就让人自己写。
-const orderNoteLoading = ref(false)
-const orderNoteFailed = ref('')
-const orderSuggestion = ref(null)
-let orderNoteToken = 0
-
-function fmtYuan(v) {
-  if (v == null || !isFinite(v)) return '—'
-  return '¥' + Math.round(v).toLocaleString()
-}
-function fmtSignedYuan(v) {
-  if (v == null || !isFinite(v)) return '—'
-  return (v >= 0 ? '+' : '−') + '¥' + Math.abs(Math.round(v)).toLocaleString()
-}
-function verdictLabel(v) {
-  return {
-    worth: '值得投入', marginal: '盈亏边界 · 建议人工判断',
-    not_worth: '不建议投入人工', no_asset: '无可挽回资产',
-  }[v] || v
-}
-
-function openCreateOrder(c) {
-  orderForm.value = {
-    customer_id: c.customer_id || c.id || '',
-    customer_name: c.surname || c.name || '',
-    geography: c.geography || '',
-    risk_level: c.risk_level || 'MEDIUM',
-    probability: c.probability || 0,
-    balance: c.balance || 0,
-    risk_factors: Array.isArray(c.risk_factors) ? c.risk_factors : [],
-    strategy: c.strategy || '',
-    assignee: '',
-    note: '',
-    thresholds_snapshot: riskInfo.value?.thresholds || null,
-    model_used: riskInfo.value?.model || null,
-    value_tier_snapshot: c.value_tier || null,
-    expected_value_snapshot: c.expected_value ?? null,
-    // 渠道预填该客户价值层的推荐值；strategy 直接用后端产出的动作
-    channel: c.channel || 'outbound',
-    override_reason: '',
-  }
-  orderModalOpen.value = true
-  fetchOrderNote(orderForm.value.customer_id)
-}
-
-/** 取建议理由并预填（仅在备注为空时，避免冲掉用户已写的内容） */
-async function fetchOrderNote(customerId) {
-  const token = ++orderNoteToken
-  orderNoteLoading.value = true
-  orderNoteFailed.value = ''
-  orderSuggestion.value = null
-  try {
-    const { data } = await scope.get(`/customers/${customerId}/suggested-note`)
-    if (token !== orderNoteToken) return
-    orderSuggestion.value = data
-    if (!orderForm.value.note.trim()) orderForm.value.note = data.note || ''
-  } catch (e) {
-    if (token !== orderNoteToken) return
-    orderNoteFailed.value = e.response?.data?.detail || e.message
-  } finally {
-    if (token === orderNoteToken) orderNoteLoading.value = false
-  }
-}
-
-/** 「重新生成」—— 用户主动点击，覆盖是预期行为 */
-async function regenOrderNote() {
-  if (!orderForm.value.customer_id) return
-  orderNoteLoading.value = true
-  orderNoteFailed.value = ''
-  const token = ++orderNoteToken
-  try {
-    const { data } = await scope.get(`/customers/${orderForm.value.customer_id}/suggested-note`)
-    if (token !== orderNoteToken) return
-    orderSuggestion.value = data
-    orderForm.value.note = data.note || ''
-  } catch (e) {
-    if (token !== orderNoteToken) return
-    orderNoteFailed.value = e.response?.data?.detail || e.message
-  } finally {
-    if (token === orderNoteToken) orderNoteLoading.value = false
-  }
-}
-
-async function submitOrder() {
-  if (!orderForm.value.customer_id) {
-    showOrderToast('请填写客户信息')
-    return
-  }
-  // 与后端同一条规则：偏离推荐渠道必须留原因
-  if (orderChannelOverridden.value && !orderForm.value.override_reason.trim()) {
-    showOrderToast('已偏离推荐渠道，请填写覆盖原因')
-    return
-  }
-  try {
-    await api.post('/work-orders', orderForm.value)
-    showOrderToast('工单创建成功')
-    orderModalOpen.value = false
-  } catch (e) {
-    showOrderToast('创建失败: ' + (e.response?.data?.detail || e.message))
-  }
-}
-
-function showOrderToast(msg) {
-  orderToast.value = msg
-  clearTimeout(orderToastTimer)
-  orderToastTimer = setTimeout(() => { orderToast.value = '' }, 2500)
-}
+const preparingCustomerId = ref('')
+function openCreateOrder(c) { if (can('order:write')) preparingCustomerId.value = c.customer_id }
+function resizeReport(event) { if (event.target.open) requestAnimationFrame(handleResize) }
 </script>
 
 <template>
@@ -425,10 +297,20 @@ function showOrderToast(msg) {
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
     </div>
 
+    <div v-else-if="pageError" class="glass-card p-6" role="alert">
+      <h1 class="page-title">工作台数据未能加载</h1><p class="flow-error">{{ pageError }}</p>
+      <p class="flow-hint my-3">当前风险和金额尚未取得，不能据此判断为零。请重新加载。</p>
+      <div class="flow-actions"><button class="btn btn-primary" @click="loadDashboard">重新加载工作台</button><RouterLink class="btn btn-outline" to="/work-orders">先查看挽留工单</RouterLink></div>
+    </div>
     <template v-else>
-      <p v-if="modelWarning" class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-        {{ modelWarning }}
-      </p>
+      <div class="workflow-heading">
+        <!-- 欢迎语直接用顶栏那一份身份信息（角色 + 姓名），不额外请求接口 -->
+        <p class="welcome-text">{{ auth.roleLabel || '客户经理' }} <b>{{ auth.displayName }}</b>，欢迎回来</p>
+        <div class="flow-actions">
+          <RouterLink v-if="can('agent:use')" class="btn btn-primary" :to="{ path: '/assistant', query: { question: '帮我调出挽回价值最高的3个客户' } }">让助手整理优先名单</RouterLink>
+          <RouterLink class="btn btn-outline" :to="{ path: '/work-orders', query: { status: 'pending' } }">处理待办工单</RouterLink>
+        </div>
+      </div>
       <!-- Hero Summary -->
       <div class="hero-banner">
         <div class="hero-label">客户流失概览</div>
@@ -534,28 +416,19 @@ function showOrderToast(msg) {
         </div>
       </div>
 
+      <div class="flow-task-summary">
+        <span><strong>{{ taskStats?.pending ?? '—' }}</strong>待处理工单</span><span><strong>{{ taskStats?.in_progress ?? '—' }}</strong>正在跟进</span><span><strong>{{ topCustomers.length }}</strong>位优先展示客户</span>
+      </div>
+      <p v-if="secondaryErrors.length" class="flow-warning" role="status">部分辅助信息暂未取得，已加载的客户仍可查看。</p>
+      <p v-if="modelWarning" class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+        {{ modelWarning }}
+      </p>
       <!-- Key Insights + Top Customers -->
-      <div class="grid grid-cols-1 lg:grid-cols-10 gap-5">
-        <!-- Left: Key Insights (30%) -->
-        <div class="lg:col-span-3 glass-card p-5">
-          <div class="section-title">关键发现</div>
-          <div class="insight-list">
-            <div v-for="(item, i) in insights" :key="i" class="insight-item">
-              <div class="insight-icon" :style="{ background: item.bg }">{{ item.icon }}</div>
-              <div class="insight-body">
-                <div class="insight-title">{{ item.title }}</div>
-                <div class="insight-value">{{ item.value }}</div>
-                <div class="insight-sub">{{ item.sub }}</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Right: Top Customers (70%) -->
-        <div class="lg:col-span-7 glass-card p-5">
+      <div class="grid grid-cols-1 gap-5">
+        <div class="glass-card p-5">
           <div class="section-title">
             <span>
-              优先干预 Top 10 <span class="badge">按风险资产评分排序</span>
+              高流失客户名单 <span class="badge">按风险资产评分排序</span>
               <span class="info-tip" title="风险资产评分 = 流失概率 × 余额。高风险客户概率趋同，此时余额决定干预优先级。">ⓘ</span>
             </span>
             <!-- ⚠ 「查看全部」指向客户名单页，而该页要求 insight:view。
@@ -584,11 +457,11 @@ function showOrderToast(msg) {
                 <tr>
                   <th>{{ masked ? '客户（匿名）' : '客户' }}</th>
                   <th>风险</th>
-                  <th v-if="!masked">流失概率</th>
+                  <th v-if="!masked">模型风险评分</th>
                   <th v-if="!masked">余额</th>
                   <th v-if="!masked">风险资产评分</th>
                   <th v-if="!masked">风险因素</th>
-                  <th v-if="!masked">操作</th>
+                  <th v-if="!masked && can('order:write')">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -599,7 +472,7 @@ function showOrderToast(msg) {
                       <div class="cust-id">身份信息已隐藏</div>
                     </template>
                     <template v-else>
-                      <div class="cust-name">{{ c.surname }}</div>
+                      <RouterLink class="cust-name flow-link" :to="{ path: `/customers/${c.customer_id}`, query: { from: '/dashboard' } }">{{ c.surname }}</RouterLink>
                       <div class="cust-id">{{ c.customer_id }} · {{ c.geography }}</div>
                     </template>
                   </td>
@@ -625,7 +498,7 @@ function showOrderToast(msg) {
                       <span v-for="f in c.risk_factors" :key="f" class="factor-tag">{{ f }}</span>
                     </div>
                   </td>
-                  <td v-if="!masked">
+                  <td v-if="!masked && can('order:write')">
                     <button
                       v-if="activeCustomerIds.has(c.customer_id)"
                       class="btn-action-done"
@@ -635,7 +508,7 @@ function showOrderToast(msg) {
                       v-else
                       class="btn-action"
                       @click="openCreateOrder(c)"
-                    >创建工单</button>
+                    >准备跟进</button>
                   </td>
                 </tr>
               </tbody>
@@ -643,6 +516,24 @@ function showOrderToast(msg) {
           </div>
         </div>
       </div>
+
+      <details class="flow-details reporting-details" open @toggle="resizeReport">
+        <summary>风险分布、模型依据与历史统计</summary>
+        <!-- Left: Key Insights (30%) -->
+        <div class="lg:col-span-3 glass-card p-5">
+          <div class="section-title">关键发现</div>
+          <div class="insight-list">
+            <div v-for="(item, i) in insights" :key="i" class="insight-item">
+              <div class="insight-icon" :style="{ background: item.bg }">{{ item.icon }}</div>
+              <div class="insight-body">
+                <div class="insight-title">{{ item.title }}</div>
+                <div class="insight-value">{{ item.value }}</div>
+                <div class="insight-sub">{{ item.sub }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
 
       <!-- Charts Row：风险分布（真实数据）+ 模型可信度（真实指标） -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
@@ -686,123 +577,20 @@ function showOrderToast(msg) {
           </div>
         </div>
       </div>
+      </details>
     </template>
   </div>
 
-  <!-- 创建工单 Modal -->
-  <Dialog :open="orderModalOpen" title="创建工单" @close="orderModalOpen = false">
-    <div class="modal-card">
-      <div class="modal-header">
-        <h2>创建工单</h2>
-        <button class="modal-close" @click="orderModalOpen = false">✕</button>
-      </div>
-      <div class="modal-body">
-        <div class="form-grid">
-          <div class="form-group">
-            <label>客户编号</label>
-            <input :value="orderForm.customer_id" readonly class="readonly" />
-          </div>
-          <div class="form-group">
-            <label>客户姓名</label>
-            <input :value="orderForm.customer_name" readonly class="readonly" />
-          </div>
-          <div class="form-group">
-            <label>地区</label>
-            <input :value="orderForm.geography" readonly class="readonly" />
-          </div>
-          <div class="form-group">
-            <label>风险等级</label>
-            <select v-model="orderForm.risk_level">
-              <option value="CRITICAL">🔴 极高 CRITICAL</option>
-              <option value="HIGH">🟠 高危 HIGH</option>
-              <option value="MEDIUM">🟡 中等 MEDIUM</option>
-              <option value="LOW">🟢 低风险 LOW</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>流失概率</label>
-            <input :value="(orderForm.probability * 100).toFixed(1) + '%'" readonly class="readonly" />
-          </div>
-          <div class="form-group">
-            <label>客户余额</label>
-            <input :value="'¥' + (orderForm.balance || 0).toLocaleString()" readonly class="readonly" />
-          </div>
-          <div class="form-group">
-            <label>风险因素</label>
-            <input :value="(orderForm.risk_factors || []).join(', ')" readonly class="readonly" />
-          </div>
-          <div class="form-group">
-            <label>负责人</label>
-            <input v-model="orderForm.assignee" placeholder="输入负责人姓名" />
-          </div>
-          <div class="form-group" style="grid-column: 1 / -1">
-            <label>触达渠道</label>
-            <!-- 预填后端推荐值（由价值层硬定）；改选须填原因，后端亦会校验 -->
-            <select v-model="orderForm.channel">
-              <option value="relationship">客户经理 1 对 1</option>
-              <option value="outbound">主动外呼</option>
-              <option value="automated">APP 推送 / 短信</option>
-            </select>
-            <p v-if="orderChannelOverridden" class="text-xs text-amber-400 mt-1">
-              ⚠ 已偏离该价值层的推荐渠道（{{ channelLabel(orderRecommendedChannel) }}），需填写原因
-            </p>
-          </div>
-          <div v-if="orderChannelOverridden" class="form-group" style="grid-column: 1 / -1">
-            <label>覆盖原因 <span class="text-red-400">*</span></label>
-            <textarea v-model="orderForm.override_reason" rows="2"
-                      placeholder="例如：客户在本行资产为 0，但他行有高净值，主管特批"></textarea>
-          </div>
-          <div class="form-group" style="grid-column: 1 / -1">
-            <label>推荐动作（后端统一策略）</label>
-            <input :value="orderForm.strategy || '—'" readonly class="readonly" />
-          </div>
-          <div class="form-group" style="grid-column: 1 / -1">
-            <label>备注</label>
-            <textarea v-model="orderForm.note" placeholder="添加备注..." rows="4"></textarea>
-            <!-- 建议理由 —— 与客户管理页同一机制、同一来源
-                 （GET /api/customers/{id}/suggested-note）。
-                 两处若各写一套，就又是本项目一直在消除的"同一件事两种行为"。 -->
-            <div class="note-assist">
-              <div class="note-assist-head">
-                <span class="note-assist-title">
-                  🤖 建议理由
-                  <span class="note-assist-badge">系统生成 · 可修改</span>
-                </span>
-                <button type="button" class="note-assist-btn"
-                        :disabled="orderNoteLoading || orderNoteFailed"
-                        @click="regenOrderNote">
-                  {{ orderNoteLoading ? '生成中…' : '重新生成' }}
-                </button>
-              </div>
-              <p v-if="orderNoteLoading" class="note-assist-hint">正在读取该客户实时打分结果…</p>
-              <p v-else-if="orderNoteFailed" class="note-assist-hint note-assist-err">
-                生成失败：{{ orderNoteFailed }}
-              </p>
-              <p v-else-if="orderSuggestion" class="note-assist-hint">
-                经济性判定：
-                <b :class="'v-' + orderSuggestion.worthiness.verdict">
-                  {{ verdictLabel(orderSuggestion.worthiness.verdict) }}
-                </b>
-                · 个体净收益 {{ fmtSignedYuan(orderSuggestion.worthiness.net) }}
-                · 盈亏平衡点 {{ fmtYuan(orderSuggestion.worthiness.breakeven) }}
-                <br />已写入备注框，可直接编辑或清空后自行填写。
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button class="modal-btn-cancel" @click="orderModalOpen = false">取消</button>
-        <button class="modal-btn-submit" @click="submitOrder">确认创建</button>
-      </div>
-    </div>
-  </Dialog>
-
-  <!-- Toast -->
-  <div v-if="orderToast" class="dash-toast">{{ orderToast }}</div>
+  <PrepareOrderDialog :open="!!preparingCustomerId" :customer-id="preparingCustomerId"
+                      @close="preparingCustomerId = ''" @created="loadDashboard" />
 </template>
 
 <style scoped>
+/* 顶部欢迎语：角色 + 姓名，直接取 auth store（与顶栏同源） */
+.welcome-text { margin: 0; font-size: 15px; font-weight: 600; color: #17335c; line-height: 1.6; }
+.welcome-text b { font-weight: 700; }
+.reporting-details { display:grid; gap:20px; }
+.reporting-details > summary { padding:2px 0; }
 /* ── 建议理由辅助区（建单弹窗内）—— 与客户管理页同名同类，样式各自 scoped ── */
 .note-assist {
   margin-top: 8px; padding: 10px 12px;

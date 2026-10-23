@@ -11,9 +11,13 @@
  */
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import PrepareOrderDialog from '../components/PrepareOrderDialog.vue'
+import { useAuthStore } from '../stores/auth'
+import { customerReturn, orderLocation } from '../utils/workflow'
 import { useRequestScope } from '../api/useRequestScope'
 import { statusLabel, resultLabel } from '../utils/workOrders'
 import { assigneeName, loadAssignees } from '../utils/assignees'
+import InfoTip from '../components/InfoTip.vue'
 import {
   riskLabel, riskBadgeClass, probColor, fmtPercent, fmtWan,
   valueTierLabel, valueTierColor, channelLabel,
@@ -21,6 +25,12 @@ import {
 
 const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
+const preparing = ref(false)
+const createdOrder = ref(null)
+const backTo = computed(() => customerReturn(route.query.from))
+const canPrepare = computed(() => auth.can('order:write') && c.value && c.value.exited === 0 && !c.value.has_active_order && !createdOrder.value)
+function onCreated(order) { createdOrder.value = order; c.value.has_active_order = true; loadOrders(route.params.id) }
 
 // 页面级请求作用域：本页有 3 处 GET（客户详情/风险口径/工单）。
 // 卸载时取消在途请求 —— 此前未接入，快速进出详情页会留下飞行中的请求。
@@ -116,8 +126,7 @@ const shapBars = computed(() => {
 
 function back() {
   // 有来源就回来源，直接打开则回列表
-  if (window.history.length > 1) router.back()
-  else router.push('/customers')
+  router.push(backTo.value)
 }
 </script>
 
@@ -125,7 +134,11 @@ function back() {
   <div class="space-y-6">
     <div class="flex items-center gap-3">
       <button class="btn btn-outline btn-sm" @click="back">‹ 返回</button>
-      <h1 class="page-title" style="margin:0">客户详情</h1>
+      <h1 class="page-title" style="margin:0">客户详情<InfoTip>
+        <b class="tip-hd">跟进四步</b>
+        ① 找客户　② 看原因　③ 确认跟进　④ 记录结果
+        <span class="tip-row">本页是第 2 步：看清这个人为什么可能流失、值不值得投入，再决定要不要准备跟进。</span>
+      </InfoTip></h1>
     </div>
 
     <div v-if="loading" class="glass-card p-16 text-center text-gray-500">加载中…</div>
@@ -135,6 +148,15 @@ function back() {
     </div>
 
     <template v-else-if="c">
+      <div class="workflow-heading">
+        <div><h2 class="text-xl font-semibold">先判断原因，再决定怎么跟进</h2><p>核对当前客户的风险、建议动作和已有工单，确认后再联系。</p></div>
+        <div class="flow-actions">
+          <button v-if="canPrepare" class="btn btn-primary" @click="preparing = true">为此客户准备工单</button>
+          <RouterLink v-else-if="c.has_active_order || createdOrder" class="btn btn-primary" :to="createdOrder ? orderLocation(createdOrder) : { path: '/work-orders', query: { customer_id: c.customer_id } }">查看当前跟进</RouterLink>
+          <RouterLink v-if="auth.can('agent:use')" class="btn btn-outline" :to="{ path: '/assistant', query: { question: `请分析客户 ${c.customer_id} 的风险原因和建议跟进方式` } }">让助手整理建议</RouterLink>
+        </div>
+      </div>
+      <p v-if="c.exited === 1" class="flow-warning">该客户为历史流失样本，可查看归因和记录，不能创建挽留工单。</p>
       <!-- 头部：身份 + 两个正交维度 -->
       <div class="glass-card p-6">
         <div class="flex items-start justify-between flex-wrap gap-4">
@@ -157,7 +179,7 @@ function back() {
 
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6">
           <div class="stat">
-            <div class="stat-label">流失概率</div>
+            <div class="stat-label">模型风险评分</div>
             <div class="stat-val" :style="{ color: probColor(c.probability, riskInfo?.thresholds) }">
               {{ fmtPercent(c.probability) }}
             </div>
@@ -245,7 +267,7 @@ function back() {
       <div class="glass-card p-6">
         <div class="flex items-center justify-between mb-4">
           <h3 class="text-sm font-medium text-slate-600">历史工单</h3>
-          <router-link to="/work-orders" class="view-all-link">工单管理 →</router-link>
+          <router-link :to="{ path: '/work-orders', query: { customer_id: c.customer_id } }" class="view-all-link">工单管理 →</router-link>
         </div>
         <div v-if="ordersError" class="empty-state" role="alert">
           工单查询失败：{{ ordersError }}
@@ -269,7 +291,7 @@ function back() {
           </thead>
           <tbody>
             <tr v-for="o in orders" :key="o.id" class="border-b border-[#f0f3f8] last:border-0">
-              <td class="py-2 text-slate-600">#{{ o.id }}</td>
+              <td class="py-2 text-slate-600"><RouterLink class="flow-link" :to="orderLocation(o)">#{{ o.id }}</RouterLink></td>
               <td class="py-2 text-slate-700">{{ statusLabel(o.status) }}</td>
               <td class="py-2 text-slate-600">
                 {{ channelLabel(o.channel) }}
@@ -282,6 +304,7 @@ function back() {
         </table>
       </div>
     </template>
+    <PrepareOrderDialog :open="preparing" :customer-id="String(route.params.id)" @close="preparing = false" @created="onCreated" />
   </div>
 </template>
 

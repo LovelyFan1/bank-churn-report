@@ -23,6 +23,7 @@
 import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
 import { echarts } from '../utils/charts'
 import { useRequestScope } from '../api/useRequestScope'
+import InfoTip from '../components/InfoTip.vue'
 
 const loading = ref(true)
 // 页面级请求作用域：离开本页时自动取消在途请求，避免抢占连接槽
@@ -158,7 +159,7 @@ function optionChurnByGender(data) {
   const d = data.data
   return {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-    legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
+    legend: { bottom: 0, textStyle: { color: '#52647f' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
     xAxis: { type: 'category', data: d.map((item) => item.gender), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
     yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
@@ -173,7 +174,7 @@ function optionChurnByGeo(data) {
   const d = data.data
   return {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-    legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
+    legend: { bottom: 0, textStyle: { color: '#52647f' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
     xAxis: { type: 'category', data: d.map((item) => item.geography), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
     yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
@@ -190,7 +191,7 @@ function optionProductOverload(data) {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
     grid: { left: 12, right: 12, top: 30, bottom: 24, containLabel: true },
     xAxis: { type: 'category', data: d.map((item) => item.num_products + '个产品'), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
-    yAxis: { type: 'value', axisLabel: { color: '#9ca3af', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#eef1f6' } } },
+    yAxis: { type: 'value', axisLabel: { color: '#52647f', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#eef1f6' } } },
     series: [{
       type: 'bar',
       data: d.map((item) => ({
@@ -208,7 +209,7 @@ function optionSatisfaction(data) {
   const d = data.data
   return {
     tooltip: { trigger: 'axis', backgroundColor: '#ffffff', borderColor: '#d5dce8', textStyle: { color: '#1f2937' } },
-    legend: { bottom: 0, textStyle: { color: '#9ca3af' } },
+    legend: { bottom: 0, textStyle: { color: '#52647f' } },
     grid: { left: 12, right: 12, top: 10, bottom: 36, containLabel: true },
     xAxis: { type: 'category', data: d.map((item) => '评分' + item.satisfaction_score), axisLine: { lineStyle: { color: '#d5dce8' } }, axisLabel: { color: '#5b6b83' } },
     yAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } }, axisLabel: { color: '#5b6b83' } },
@@ -328,8 +329,10 @@ onBeforeUnmount(() => {
   <div class="space-y-6">
     <div class="flex items-start justify-between">
       <div>
-        <h1 class="page-title">EDA分析</h1>
-        <p class="page-subtitle">探索性数据分析 - 相关性、分布、流失对比</p>
+        <h1 class="page-title">EDA分析<InfoTip>
+          <b class="tip-hd">本页说明</b>
+          探索性数据分析 - 相关性、分布、流失对比
+        </InfoTip></h1>
       </div>
       <button v-if="!loading" class="btn-refresh" @click="loadAll">↻ 刷新</button>
     </div>

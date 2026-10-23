@@ -167,7 +167,7 @@ async function loadAll() {
             markLine: marks.length ? {
               silent: true, symbol: 'none',
               lineStyle: { color: '#a855f7', type: 'dashed', width: 1.5 },
-              label: { color: '#c4b5fd', fontSize: 10, position: 'insideEndTop' },
+              label: { color: '#6d28d9', fontSize: 10, position: 'insideEndTop' },
               data: marks,
             } : undefined,
           }
@@ -212,12 +212,114 @@ onBeforeUnmount(() => {
 <template>
   <div class="space-y-6">
     <div>
-      <h1 class="page-title">干预策略</h1>
-      <p class="page-subtitle">价值层 × 风险等级的分层响应策略 —— 成本收益分析</p>
+      <h1 class="page-title">分层跟进策略<InfoTip>
+        <b class="tip-hd">本页怎么用</b>
+        先选择一类客户，查看建议动作，再进入名单逐位核对；统计与阈值分析保留在下方。
+      </InfoTip></h1>
     </div>
 
     <div v-if="loading" class="flex items-center justify-center h-32">
       <div class="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+
+    <!-- 价值层 × 风险等级 矩阵 -->
+    <div class="glass-card p-6">
+      <div class="flex items-start justify-between mb-4">
+        <h3 class="text-sm font-medium text-gray-400">
+          价值层 × 风险等级 —— 该优先做什么
+          <InfoTip>
+            <b class="tip-hd">口径说明</b>
+            风险等级来自模型（会不会跑），价值层来自余额（跑了值多少）。
+            同样一个「高危」，高价值客户要客户经理上门，零余额客户一条 APP 推送即可。
+            <span class="tip-row">
+              人数 / 历史流失率 / 平均余额 / 可挽回金额均为测试集实测
+              （描述性统计，不外推未来收益）。
+              覆盖历史资产 = 该格内真实流失且被决策线触达的客户余额合计。
+              金额用于解释历史覆盖，不代表挽回利润；格内命中率与全局召回率分别统计。
+            </span>
+            <span class="tip-row">
+              历史流失率 = 格内历史流失人数 ÷ 格内样本数；实际比例见各格，随模型和样本变化。
+              点击格子查看当前未流失且无在途工单的可行动名单，人数与测试统计范围不同。
+            </span>
+            <span class="tip-row">
+              「建议动作」取自后端统一策略规则（与客户列表、建单弹窗同源），
+              非实测结果；上方统计量为测试集实测。
+            </span>
+          </InfoTip>
+        </h3>
+        <span v-if="matrix" class="text-xs text-gray-600">
+          测试集 {{ matrixTotals.testSize.toLocaleString() }} 人 · 模型 {{ matrix.model }}
+        </span>
+      </div>
+
+      <div v-if="matrixError" class="empty-state">
+        <div class="text-2xl mb-2">🧠</div>
+        <p class="text-sm text-red-300">{{ matrixError }}</p>
+        <p class="text-xs text-gray-600 mt-1">
+          矩阵依赖已训练模型；模型未就绪时无法给出分层策略。
+          若刚点过训练，稍等片刻后刷新。
+        </p>
+        <button class="btn-retry" @click="reloadAll">↻ 刷新</button>
+      </div>
+
+      <div v-else-if="!matrix" class="empty-state">
+        <p class="text-sm text-gray-400">矩阵加载中…</p>
+      </div>
+
+      <template v-else>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm strategy-matrix">
+            <thead>
+              <tr class="text-xs text-gray-500 border-b border-[#e5e9f0]">
+                <th class="text-left py-2 pr-3 font-medium">价值层</th>
+                <th v-for="lv in LEVEL_ORDER" :key="lv" class="text-left py-2 px-3 font-medium">
+                  {{ LEVEL_TITLES[lv] }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in matrixRows" :key="row.tier" class="border-b border-[#e5e9f0] last:border-0">
+                <!-- 价值层 + 渠道 -->
+                <td class="py-3 pr-3 align-top whitespace-nowrap">
+                  <div class="font-medium" :style="{ color: row.color }">{{ row.label }}</div>
+                  <div class="text-xs text-gray-600 mt-0.5">{{ row.channel }}</div>
+                </td>
+
+                <!-- 4 个等级格 —— 可点击下钻到筛选后的客户列表 -->
+                <td v-for="c in row.cells" :key="c.level"
+                    class="py-3 px-3 align-top cell-link"
+                    @click="drillDown(row.tier, c.level)"
+                    :title="`查看「${row.label} × ${c.levelTitle}」的 ${c.count} 位客户`">
+                  <button class="matrix-open text-base font-semibold text-[#17335c] leading-tight"
+                          :aria-label="`查看${row.label}、${c.levelTitle}的客户名单`" @click.stop="drillDown(row.tier, c.level)">
+                    {{ c.count.toLocaleString() }}<span class="text-xs text-gray-500 font-normal ml-0.5">人 · 查看名单</span>
+                  </button>
+
+                  <!-- 样本不足：只给人数，统计量显式留白 -->
+                  <template v-if="c.sufficient">
+                    <div class="text-xs text-gray-400 mt-1">
+                      历史流失 <span class="text-orange-400">{{ fmtPercent(c.churnRate) }}</span>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-0.5">
+                      均余额 {{ fmtWan(c.avgBalance) }}
+                    </div>
+                    <div class="text-xs text-emerald-400 mt-1">
+                      可挽回 ≈ {{ fmtWan(c.recoverable) }}
+                    </div>
+                  </template>
+                  <div v-else class="text-xs text-gray-600 mt-1 italic">
+                    样本不足（&lt;{{ matrix.min_cell_sample }}），不给统计量
+                  </div>
+
+                  <div class="text-xs text-gray-500 mt-2 pt-2 border-t border-[#e5e9f0]">
+                    {{ c.action }}
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
     </div>
 
     <!-- Business Summary Cards -->
@@ -380,105 +482,6 @@ onBeforeUnmount(() => {
       <div v-show="!thresholdError" ref="thresholdChart" class="w-full h-[320px]"></div>
     </div>
 
-    <!-- 价值层 × 风险等级 矩阵 -->
-    <div class="glass-card p-6">
-      <div class="flex items-start justify-between mb-4">
-        <h3 class="text-sm font-medium text-gray-400">
-          价值层 × 风险等级 —— 该优先做什么
-          <InfoTip>
-            <b class="tip-hd">口径说明</b>
-            风险等级来自模型（会不会跑），价值层来自余额（跑了值多少）。
-            同样一个「高危」，高价值客户要客户经理上门，零余额客户一条 APP 推送即可。
-            <span class="tip-row">
-              人数 / 历史流失率 / 平均余额 / 可挽回金额均为测试集实测
-              （描述性统计，不外推未来收益）。
-              覆盖历史资产 = 该格内真实流失且被决策线触达的客户余额合计。
-              金额用于解释历史覆盖，不代表挽回利润；格内命中率与全局召回率分别统计。
-            </span>
-            <span class="tip-row">
-              历史流失率 = 格内历史流失人数 ÷ 格内样本数；实际比例见各格，随模型和样本变化。
-              点击格子查看当前未流失且无在途工单的可行动名单，人数与测试统计范围不同。
-            </span>
-            <span class="tip-row">
-              「建议动作」取自后端统一策略规则（与客户列表、建单弹窗同源），
-              非实测结果；上方统计量为测试集实测。
-            </span>
-          </InfoTip>
-        </h3>
-        <span v-if="matrix" class="text-xs text-gray-600">
-          测试集 {{ matrixTotals.testSize.toLocaleString() }} 人 · 模型 {{ matrix.model }}
-        </span>
-      </div>
-
-      <div v-if="matrixError" class="empty-state">
-        <div class="text-2xl mb-2">🧠</div>
-        <p class="text-sm text-red-300">{{ matrixError }}</p>
-        <p class="text-xs text-gray-600 mt-1">
-          矩阵依赖已训练模型；模型未就绪时无法给出分层策略。
-          若刚点过训练，稍等片刻后刷新。
-        </p>
-        <button class="btn-retry" @click="reloadAll">↻ 刷新</button>
-      </div>
-
-      <div v-else-if="!matrix" class="empty-state">
-        <p class="text-sm text-gray-400">矩阵加载中…</p>
-      </div>
-
-      <template v-else>
-        <div class="overflow-x-auto">
-          <table class="w-full text-sm">
-            <thead>
-              <tr class="text-xs text-gray-500 border-b border-[#e5e9f0]">
-                <th class="text-left py-2 pr-3 font-medium">价值层</th>
-                <th v-for="lv in LEVEL_ORDER" :key="lv" class="text-left py-2 px-3 font-medium">
-                  {{ LEVEL_TITLES[lv] }}
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in matrixRows" :key="row.tier" class="border-b border-[#e5e9f0] last:border-0">
-                <!-- 价值层 + 渠道 -->
-                <td class="py-3 pr-3 align-top whitespace-nowrap">
-                  <div class="font-medium" :style="{ color: row.color }">{{ row.label }}</div>
-                  <div class="text-xs text-gray-600 mt-0.5">{{ row.channel }}</div>
-                </td>
-
-                <!-- 4 个等级格 —— 可点击下钻到筛选后的客户列表 -->
-                <td v-for="c in row.cells" :key="c.level"
-                    class="py-3 px-3 align-top cell-link"
-                    @click="drillDown(row.tier, c.level)"
-                    :title="`查看「${row.label} × ${c.levelTitle}」的 ${c.count} 位客户`">
-                  <div class="text-base font-semibold text-[#17335c] leading-tight">
-                    {{ c.count.toLocaleString() }}<span class="text-xs text-gray-500 font-normal ml-0.5">人</span>
-                  </div>
-
-                  <!-- 样本不足：只给人数，统计量显式留白 -->
-                  <template v-if="c.sufficient">
-                    <div class="text-xs text-gray-400 mt-1">
-                      历史流失 <span class="text-orange-400">{{ fmtPercent(c.churnRate) }}</span>
-                    </div>
-                    <div class="text-xs text-gray-500 mt-0.5">
-                      均余额 {{ fmtWan(c.avgBalance) }}
-                    </div>
-                    <div class="text-xs text-emerald-400 mt-1">
-                      可挽回 ≈ {{ fmtWan(c.recoverable) }}
-                    </div>
-                  </template>
-                  <div v-else class="text-xs text-gray-600 mt-1 italic">
-                    样本不足（&lt;{{ matrix.min_cell_sample }}），不给统计量
-                  </div>
-
-                  <div class="text-xs text-gray-500 mt-2 pt-2 border-t border-[#e5e9f0]">
-                    {{ c.action }}
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </template>
-    </div>
-
     <!-- Cost-Benefit Summary -->
     <div v-if="businessSummary" class="glass-card p-6">
       <h3 class="text-sm font-medium text-gray-400 mb-4">
@@ -530,6 +533,9 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.strategy-matrix { min-width:760px; }
+.matrix-open { min-height:32px; text-align:left; cursor:pointer; }
+.matrix-open:hover { color:var(--bank-action); text-decoration:underline; }
 /* 口径来源标注 —— 说明收进 InfoTip 后只剩一行标签 */
 .src-line {
   display: flex; align-items: center; gap: 4px;

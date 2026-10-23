@@ -28,7 +28,7 @@ services:
       - ./../模拟仿真客户数据:/data-source:ro
 
   frontend:
-    image: bank-churn-report-frontend:deployment-20261023b
+    image: bank-churn-report-frontend:dashboard-welcome-20261023-182246
     build:
       dockerfile: Dockerfile.production
     ports: !override

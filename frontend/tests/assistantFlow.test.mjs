@@ -11,15 +11,15 @@ import { reconcileAgentSession } from '../src/utils/agentSession.js'
 const source = readFileSync(new URL('../src/views/Assistant.vue', import.meta.url), 'utf8')
 const { descriptor } = parse(source)
 const setup = descriptor.scriptSetup.content.replace(/^import .+$/gm, '')
-const instantiate = new Function('deps', `const { ref, computed, onMounted, nextTick, watch,
+const instantiate = new Function('deps', `const { ref, computed, onMounted, nextTick, watch, useRoute,
   api, staffList, canAssign, loadAssignees, defaultAssignee, batchPlan,
   reconcileAgentSession, riskLabel, statusLabel } = deps;
   ${setup}
   return { turns, agentContext, sessionId, sessionVersion, openBatch, submitBatch,
-    confirmAction, cancelAction, clearSession, closeBatch, openCancel, send, sessionBusy };`)
+    confirmAction, cancelAction, clearSession, closeBatch, openCancel, send, sessionBusy, question, onComposerKeydown };`)
 
 function page(post) {
-  const app = instantiate({ ref, computed, onMounted() {}, watch() {},
+  const app = instantiate({ ref, computed, onMounted() {}, watch() {}, useRoute: () => ({ query: {} }),
     nextTick: () => Promise.resolve(), api: { post }, staffList: ref([]), canAssign: ref(true),
     loadAssignees() {}, defaultAssignee: () => 'tester', batchPlan, reconcileAgentSession,
     riskLabel: value => value, statusLabel: value => value })
@@ -144,4 +144,17 @@ test('a cross-window clear during a partial batch clears context while preservin
   assert.equal(turn.batch.result.succeeded, 1)
   assert.equal(turn.batch.result.created[0].id, 57)
   assert.equal(turn.batch.result.failed_count, 1)
+})
+
+
+test('Chinese IME confirmation and Shift+Enter do not accidentally send a question', async () => {
+  let requests = 0, prevented = 0
+  const app = page(async () => { requests++; return { data: {} } })
+  app.question.value = '核对客户'
+  app.onComposerKeydown({ key: 'Enter', isComposing: true, preventDefault() { prevented++ } })
+  app.onComposerKeydown({ key: 'Enter', shiftKey: true, preventDefault() { prevented++ } })
+  assert.equal(requests, 0)
+  assert.equal(prevented, 0)
+  assert.equal(app.question.value, '核对客户')
+  assert.equal(app.turns.value.length, 0)
 })

@@ -21,6 +21,8 @@
  */
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import api from '../api'
+import { useRoute } from 'vue-router'
+import { orderLocation } from '../utils/workflow'
 import InfoTip from '../components/InfoTip.vue'
 import { AGENT_KEY_PREFIX, KEY_USER, agentKeyFor } from '../utils/userStorage'
 import { assignees as staffList, canAssign, loadAssignees, defaultAssignee } from '../utils/assignees'
@@ -55,6 +57,9 @@ import { reconcileAgentSession } from '../utils/agentSession'
  *                  各人读各自的键，互不干扰，且**各自的历史都保留**。
  *      详见 loadSession / persistSession。
  */
+const route = useRoute()
+const carriedQuestion = typeof route.query.question === 'string' ? route.query.question.slice(0, 500) : ''
+
 const MAX_TURNS = 60          // 上限，防止 localStorage 无限膨胀（约 5MB 配额）
 
 /**
@@ -177,6 +182,7 @@ const samples = [
 ]
 
 onMounted(async () => {
+  if (carriedQuestion) question.value = carriedQuestion
   // ── 先恢复会话，再拉能力清单（避免恢复的内容被覆盖）──
   const saved = loadSession()
   if (saved?.sessionId) sessionId.value = saved.sessionId
@@ -358,10 +364,10 @@ function failureTurn(e) {
   const status = e.response?.status
   const detail = e.response?.data?.detail
   if (status === 401) {
-    return { basis: 'unauthorized', headline: '登录已失效', text: '请重新登录后再使用智能助手。' }
+    return { basis: 'unauthorized', headline: '登录已失效', text: '请重新登录后再使用超级智能体。' }
   }
   if (status === 403) {
-    return { basis: 'forbidden', headline: '无使用权限', text: detail || '当前角色无权使用智能助手。' }
+    return { basis: 'forbidden', headline: '无使用权限', text: detail || '当前角色无权使用超级智能体。' }
   }
   if (status === 409) {
     return { basis: 'conflict', headline: '会话已更新',
@@ -385,6 +391,7 @@ async function send(text) {
   const q = (text ?? question.value).trim()
   if (!q || sessionBusy.value) return
   question.value = ''
+  nextTick(autoGrow)          // 清空后把输入框收回到一行
   turns.value.push({ role: 'user', text: q })
   sending.value = true
   await scrollToEnd()
@@ -466,7 +473,7 @@ async function send(text) {
     })
   } finally {
     sending.value = false
-    await scrollToEnd()
+    await revealTurn(turns.value.length - 1)
   }
 }
 
@@ -474,6 +481,42 @@ async function scrollToEnd() {
   await nextTick()
   if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight
 }
+
+async function revealTurn(index, selector = '.ans-headline') {
+  await nextTick()
+  const chat = listEl.value
+  const turn = chat?.querySelector(`[data-turn-index="${index}"]`)
+  const target = turn?.querySelector(selector) || turn
+  if (!chat || !target) return
+  chat.scrollTop += target.getBoundingClientRect().top - chat.getBoundingClientRect().top - 16
+  if (selector !== '.ans-headline') target.focus({ preventScroll: true })
+}
+async function revealAction(turn) {
+  await revealTurn(turns.value.indexOf(turn), turn.batch?.result ? '.batch-result' : turn.batch?.open ? '.batch-head' : turn.confirmed ? '.done' : '.pending-head')
+}
+function evidenceSummary(turn) {
+  const successful = (turn.toolCalls || []).filter(call => call.ok).length
+  const count = turn.answer.entities?.length || 0
+  const unit = turn.answer.kind === 'workorder_list' ? '张工单' : '位客户'
+  return `${count ? `本轮展示 ${count} ${unit} · ` : ''}${successful} 次平台调用成功；可展开查看核对详情。`
+}
+function onComposerKeydown(event) {
+  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return
+  event.preventDefault()
+  send()
+}
+
+/* 输入框随内容长高 —— 原来是固定 2 行，长问题看不到自己写了什么。
+   上限 176px（约 7 行）后转为内部滚动，避免把对话区挤没。 */
+const composerEl = ref(null)
+const COMPOSER_MAX = 176
+function autoGrow() {
+  const el = composerEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = Math.min(el.scrollHeight, COMPOSER_MAX) + 'px'
+}
+onMounted(() => autoGrow())
 
 /** 打开批量确认面板（方案 A 第一步：先看清楚要建什么，再确认） */
 async function openBatch(turn, action) {
@@ -498,6 +541,7 @@ async function openBatch(turn, action) {
     error: '',
   }
   await prepareBatch(turn)
+  await revealAction(turn)
 }
 
 async function nextBatch(turn) {
@@ -511,6 +555,7 @@ async function nextBatch(turn) {
   b.items = []
   b.failed = []
   await prepareBatch(turn)
+  await revealAction(turn)
 }
 
 async function prepareBatch(turn) {
@@ -534,6 +579,7 @@ async function prepareBatch(turn) {
     b.error = e.response?.data?.detail || e.message
   } finally {
     b.running = false
+    await revealAction(turn)
   }
 }
 
@@ -589,6 +635,7 @@ async function openCancel(turn, action) {
     b.error = e.response?.data?.detail || e.message
   } finally {
     b.running = false
+    await revealAction(turn)
   }
 }
 
@@ -666,6 +713,7 @@ async function submitBatch(turn) {
     b.error = e.response?.data?.detail || e.message
   } finally {
     b.running = false
+    await revealAction(turn)
   }
 }
 
@@ -697,6 +745,7 @@ async function confirmAction(turn) {
     turn.confirmError = e.response?.data?.detail || e.message
   } finally {
     turn.confirming = false
+    await revealAction(turn)
   }
 }
 
@@ -794,15 +843,17 @@ function warnClass(level) {
   <div class="agent-page">
     <div class="agent-head">
       <div>
-        <h1 class="agent-title">智能助手</h1>
-        <p class="agent-sub">
-          基于系统真实数据的任务型助手
-          <InfoTip>
-            <b class="tip-hd">说明</b>
-            数字全部来自系统计算，<b>不经过模型推算</b>；
-            建单等写操作需你确认后执行。
-          </InfoTip>
-        </p>
+        <h1 class="agent-title">超级智能体<InfoTip>
+          <b class="tip-hd">本页怎么用</b>
+          查客户、看依据，核对后再执行跟进。
+          <span class="tip-row"><b>跟进四步</b>：① 找客户　② 看原因　③ 确认跟进　④ 记录结果</span>
+          <span class="tip-row"><b>数字来源</b>：全部由系统计算，不经过模型推算；建单等写操作需你确认后执行。</span>
+        </InfoTip><InfoTip v-if="caps" icon="gear" label="助手能帮你做什么">
+          <b class="tip-hd">能帮你做什么</b>
+          <span v-for="t in caps.tools" :key="t.name" class="tip-tool">
+            {{ t.label || t.description }}<i v-if="t.write" class="tip-write">（需确认后执行）</i>
+          </span>
+        </InfoTip></h1>
       </div>
       <div class="agent-status">
         <button v-if="turns.length" class="btn-clear" @click="clearSession"
@@ -813,27 +864,11 @@ function warnClass(level) {
       </div>
     </div>
 
+    <p v-if="carriedQuestion && !turns.length" class="flow-hint">已带入客户问题。核对后发送，助手会重新查询平台数据。</p>
+    <p class="sr-only" role="status" aria-live="polite">{{ sending ? '正在查询并整理建议' : turns.length ? '本轮内容已更新，可查看结论与下一步操作' : '可以选择示例或输入问题' }}</p>
     <p v-if="sessionError" role="alert" class="err">{{ sessionError }}</p>
-    <!-- 能力范围：只列「能做什么」。
-         ⚠ 按用户要求**不展示"答不了"那一栏**。
-           边界拦截逻辑本身不受影响（guard_rules 仍在调模型前拦下三类问题），
-           只是不把它摆在能力面板上。 -->
-    <details v-if="caps" class="caps">
-      <summary>
-        能力范围：{{ caps.tools.length }} 个可查项
-      </summary>
-      <div class="caps-body">
-        <div class="caps-col">
 
-          <ul>
-            <li v-for="t in caps.tools" :key="t.name">
-              <code>{{ t.name }}</code>
-              <span v-if="t.write" class="write-tag">需确认</span> — {{ t.label || t.description }}
-            </li>
-          </ul>
-        </div>
-      </div>
-    </details>
+    <div class="dialog">
 
     <div ref="listEl" class="chat">
       <!-- 恢复提示：让用户知道这些是本地缓存，不是本次新问的 -->
@@ -845,21 +880,21 @@ function warnClass(level) {
       </div>
 
       <div v-if="!turns.length" class="empty">
-        <div class="empty-icon">🤖</div>
-        <p class="empty-title">问点什么？</p>
-        <p class="empty-hint">我只回答系统里有数据的问题。所有数字都可追溯到具体接口。</p>
+        <svg class="empty-symbol" aria-hidden="true" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 3h8v4H8zM6 5H4v16h16V5h-2M8 12h8M8 16h5" /></svg>
+        <p class="empty-title">先找到值得跟进的客户</p>
+        <p class="empty-hint">选择一个问题开始。先看客户和推荐原因，准备好后再确认工单。</p>
         <div class="samples">
           <button v-for="s in samples" :key="s" class="sample-chip"
                   :disabled="!health?.available" @click="send(s)">{{ s }}</button>
         </div>
       </div>
 
-      <div v-for="(t, i) in turns" :key="i" :class="['turn', t.role]">
+      <div v-for="(t, i) in turns" :key="i" :data-turn-index="i" :class="['turn', t.role]">
         <div v-if="t.role === 'user'" class="bubble user-bubble">{{ t.text }}</div>
 
         <div v-else class="bubble agent-bubble">
           <!-- ① 结论 -->
-          <h2 v-if="t.answer.headline" class="ans-headline">{{ plain(t.answer.headline) }}</h2>
+          <h2 v-if="t.answer.headline" class="ans-headline" tabindex="-1">{{ plain(t.answer.headline) }}</h2>
 
           <!-- ② 警示 —— 紧跟结论，不放文末。这条会改变用户的行动判断 -->
           <div v-if="t.answer.warning" :class="['warn', warnClass(t.answer.warning.level)]">
@@ -895,8 +930,13 @@ function warnClass(level) {
                 </div>
               </div>
               <div class="e-foot">
-                <span class="e-action">→ {{ e.action }}</span>
-                <span v-if="!e.can_create_order && !e.order_id" class="e-blocked">已有进行中的工单</span>
+                <span class="e-action">{{ e.action }}</span>
+                <div class="entity-actions">
+                  <RouterLink class="flow-link" :to="{ path: `/customers/${e.customer_id}`, query: { from: '/assistant' } }">查看客户与原因</RouterLink>
+                  <RouterLink v-if="e.order_id" class="flow-link" :to="orderLocation({ order_id: e.order_id, customer_id: e.customer_id })">查看这张工单</RouterLink>
+                  <button v-else-if="['customer_list', 'customer_detail'].includes(t.answer.kind) && e.can_create_order" class="btn-action" :disabled="sessionBusy" @click="openBatch(t, { targets: [e.customer_id] })">准备跟进</button>
+                </div>
+                <span v-if="['customer_list', 'customer_detail'].includes(t.answer.kind) && !e.can_create_order && !e.order_id" class="e-blocked">{{ e.has_active_order ? '已有进行中的工单' : '当前客户暂不可建单，请查看客户与原因。' }}</span>
               </div>
             </div>
           </div>
@@ -952,13 +992,14 @@ function warnClass(level) {
                  同样产出 entities/facts（见 graph.node_verify），
                  所以"要确认的是什么"是看得见的，不是只有两个按钮。 -->
           <div v-if="t.pending" class="pending">
-            <div v-if="!t.confirmed && !t.cancelled" class="pending-head">⏸ 此操作尚未执行，需要你确认</div>
+            <div v-if="!t.confirmed && !t.cancelled" class="pending-head" tabindex="-1">此操作尚未执行，请核对后确认</div>
             <div class="pending-actions">
               <template v-if="t.confirmed">
-                <div class="done">
+                <div class="done" tabindex="-1" role="status">
                   {{ receiptLabel(t) }}
                   <span v-if="t.confirmResult?.id"> #{{ t.confirmResult.id }}</span>
                   <span v-if="t.confirmResult?.customer_id"> · {{ t.confirmResult.customer_id }} {{ t.confirmResult.customer_name }}</span>
+                  <RouterLink v-if="t.confirmResult?.id && t.pending.action !== 'delete_work_order'" class="flow-link receipt-link" :to="orderLocation(t.confirmResult)">查看这张工单</RouterLink>
                 </div>
               </template>
               <template v-else-if="t.cancelled">
@@ -985,7 +1026,7 @@ function warnClass(level) {
             <p v-for="(r, idx) in (t.batch.previousResults || [])" :key="idx">
               第{{ idx + 1 }}批：成功{{ r.succeeded }}，失败{{ r.failed_count || 0 }}，跳过{{ r.skipped_count || 0 }}。
             </p>
-            <div class="batch-head">
+            <div class="batch-head" tabindex="-1">
               {{ t.batch.kind === 'cancel' ? '取消工单确认' : '批量建单确认' }}
               <span class="batch-count">{{ t.batch.kind === 'cancel' ? t.batch.targets.length : (t.batch.items?.length || 0) }} 张</span>
             </div>
@@ -1028,9 +1069,9 @@ function warnClass(level) {
                   </li>
                 </ul>
                 <div class="batch-assignee">
-                  <label>负责人（必选，默认派给发起人）</label>
+                  <label :for="`batch-assignee-${i}`">负责人（默认派给发起人）</label>
                   <!-- 与页面建单同一份行员名单、同一接口 —— 三处入口行为一致 -->
-                  <select v-if="canAssign && staffList.length" v-model="t.batch.assignee"
+                  <select :id="`batch-assignee-${i}`" v-if="canAssign && staffList.length" v-model="t.batch.assignee"
                           :disabled="sessionBusy" @change="prepareBatch(t)">
                     <option value="" disabled>请选择负责人</option>
                     <option v-for="a in staffList" :key="a.username" :value="a.username">
@@ -1040,7 +1081,7 @@ function warnClass(level) {
                   <!-- ⚠ 名单拉取失败时的兜底。若这里显示为空且不可选，
                        用户会认为"系统不给选负责人"，实际是接口没回来。
                        故明确提示原因，而不是给一个静默的只读框。 -->
-                  <input v-else v-model="t.batch.assignee" readonly
+                  <input :id="`batch-assignee-${i}`" v-else v-model="t.batch.assignee" readonly
                          :title="canAssign
                            ? '行员名单加载中或获取失败，将按当前登录人建单'
                            : '当前角色无派单权限'" />
@@ -1066,7 +1107,7 @@ function warnClass(level) {
             </div>
 
             <!-- 结果：成功与失败都要列清楚，不合并成一句"部分成功" -->
-            <div v-else class="batch-result">
+            <div v-else class="batch-result" tabindex="-1" role="status">
               <div class="br-line ok">
                 ✅ {{ t.batch.kind === 'cancel' ? '成功取消' : '成功' }}
                 {{ t.batch.result.succeeded }} 条
@@ -1074,7 +1115,7 @@ function warnClass(level) {
               <ul class="br-list">
                 <li v-for="c in t.batch.result.created" :key="c.id">
                   工单 #{{ c.id }} · {{ c.customer_id }} {{ c.customer_name }}
-                  <span v-if="c.assignee">（{{ c.assignee }}）</span>
+                  <span v-if="c.assignee">（{{ c.assignee }}）</span> <RouterLink class="flow-link" :to="orderLocation(c)">查看工单</RouterLink>
                 </li>
                 <li v-for="d in (t.batch.result.deleted || [])" :key="'d' + d.order_id">
                   已取消工单 #{{ d.order_id }}
@@ -1102,10 +1143,13 @@ function warnClass(level) {
 
           <!-- ⑩ 依据 -->
           <div v-if="t.toolCalls?.length" class="evidence">
-            <button class="ev-toggle" @click="t.showEvidence = !t.showEvidence">
+            <p class="flow-hint">{{ evidenceSummary(t) }}</p>
+            <button class="ev-toggle" :aria-expanded="t.showEvidence" :aria-controls="`evidence-${i}`" @click="t.showEvidence = !t.showEvidence">
               {{ t.showEvidence ? '▾' : '▸' }} 依据（{{ t.toolCalls.length }} 次查询）
             </button>
-            <div v-if="t.showEvidence" class="ev-body">
+            <div v-if="t.showEvidence" :id="`evidence-${i}`" class="ev-body">
+              <p>结论中的数字来自平台查询。客户范围和限制以上方提示为准。</p>
+              <details><summary>技术查询详情</summary>
               <div v-for="(c, ci) in t.toolCalls" :key="ci" class="ev-row">
                 <code>{{ c.name }}</code>
                 <span class="ev-args">{{ JSON.stringify(c.args) }}</span>
@@ -1113,6 +1157,7 @@ function warnClass(level) {
                   {{ c.ok ? '成功' : '失败' + (c.error ? '：' + c.error : '') }}
                 </span>
               </div>
+              </details>
               <!-- 被核验拦下的模型解读：只在这里说明，不挂在结论下方当告警。
                    数据来源是接口里的 verify_failed（非空即说明有解读被省略）。 -->
               <div v-if="t.verifyFailed?.length" class="ev-row ev-note">
@@ -1124,24 +1169,38 @@ function warnClass(level) {
       </div>
 
       <div v-if="sending" class="thinking">
-        <span class="spinner"></span> 正在查询系统数据…
+        <span class="spinner"></span> 正在查询并整理跟进建议…
       </div>
     </div>
 
-    <div class="composer">
-      <textarea v-model="question" rows="2" :disabled="!health?.available"
-                placeholder="问一个系统里有数据的问题，例如：挽回价值最高的3个客户"
-                @keydown.enter.exact.prevent="send()"></textarea>
-      <button class="btn-send" :disabled="!canAsk || !health?.available" @click="send()">发送</button>
+      <div class="composer">
+        <textarea id="agent-question" ref="composerEl" v-model="question" rows="1"
+                  :disabled="!health?.available"
+                  aria-label="输入本次跟进的问题"
+                  title="Enter 发送，Shift + Enter 换行"
+                  placeholder="问一个系统里有数据的问题，例如：挽回价值最高的3个客户"
+                  @input="autoGrow" @keydown="onComposerKeydown"></textarea>
+        <button class="btn-send" :disabled="!canAsk || !health?.available" @click="send()">发送</button>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+.empty-symbol { color:var(--bank-action); margin:0 auto 14px; }
+.entity-actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:10px; font-size:13px; }
+.receipt-link { display:inline-block; margin-left:12px; }
+.batch-assignee select, .batch-assignee input { min-height:40px; max-width:100%; padding:8px; border:1px solid var(--bank-border); border-radius:6px; background:var(--bank-surface); }
+@media(max-width:767px) { .agent-head { flex-direction:column; align-items:stretch !important; gap:12px; } .agent-status { flex-wrap:wrap; } .entity-actions .btn-action { min-height:40px; } }
+
 /* 浅色银行管理台风格 —— 与全站一致 */
-.agent-page { display: flex; flex-direction: column; height: calc(100dvh - 120px); gap: 12px; }
+/* 整页高度吃满可视区：顶栏 56 + 内容 padding 48 = 104，多留一点会白占空间 */
+.agent-page { display: flex; flex-direction: column; height: calc(100dvh - 104px); gap: 10px; }
 .agent-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.agent-title { font-size: 20px; font-weight: 700; color: #17335c; margin: 0 0 4px; }
+/* ⚠ 标题里的两个说明入口（ⓘ 与齿轮）并排：用 flex + gap 保证间距，
+   否则 inline 元素会贴在一起、看起来像重叠。 */
+.agent-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+               font-size: 20px; font-weight: 700; color: #17335c; margin: 0 0 4px; }
 .agent-sub { font-size: 12.5px; color: #5b6b83; margin: 0; max-width: 720px; line-height: 1.6; }
 .agent-status { display: flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }
@@ -1157,21 +1216,17 @@ function warnClass(level) {
                 border: 1px dashed #dfe5ee; border-radius: 7px;
                 padding: 7px 11px; line-height: 1.6; }
 
-.caps { background: #fff; border: 1px solid #e5e9f0; border-radius: 8px; padding: 10px 14px; }
-.caps summary { font-size: 12.5px; color: #5b6b83; cursor: pointer; }
-/* 只剩一栏（能力范围不展示"答不了"），故不再用两列网格 */
-.caps-body { margin-top: 10px; }
-.caps-col h4 { font-size: 12px; color: #17335c; margin: 0 0 6px; }
-.caps-col ul { margin: 0; padding-left: 16px; }
-.caps-col li { font-size: 11.5px; color: #5b6b85; line-height: 1.7; }
-.caps-col code { color: #1d4ed8; font-size: 11px; }
-.caps-note { font-size: 11px; color: #5b6b83; line-height: 1.6; margin: 6px 0 0; }
-.write-tag { font-size: 10px; color: #b45309; border: 1px solid #f0dfa8;
-             background: #fdf6e3; border-radius: 8px; padding: 0 5px; margin-left: 4px; }
+/* 能力清单已收进标题旁的胶囊浮层（见模板里的 InfoTip），这里只保留浮层内排版 */
+.tip-tool { display: block; font-size: 11.5px; line-height: 1.75; color: #4b5563; }
+.tip-write { font-style: normal; color: #b45309; }
 
-.chat { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
-        padding: 16px; background: #fff; border: 1px solid #e5e9f0; border-radius: 10px;
-        box-shadow: 0 1px 3px rgba(15,40,80,.05); }
+/* 对话卡片：消息区滚动，输入区固定贴在卡片底部（同一个容器，不再分两块） */
+.dialog { flex: 1; min-height: 0; display: flex; flex-direction: column;
+          background: #fff; border: 1px solid #e5e9f0; border-radius: 12px;
+          box-shadow: 0 1px 3px rgba(15,40,80,.05); overflow: hidden; }
+
+.chat { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
+        padding: 16px 16px 10px; background: #fff; }
 
 .empty { margin: auto; text-align: center; }
 .empty-icon { font-size: 34px; margin-bottom: 8px; }
@@ -1242,7 +1297,7 @@ function warnClass(level) {
 .fact { display: flex; flex-direction: column; padding: 6px 0; border-bottom: 1px solid #f1f5f9; }
 .f-label { font-size: 10.5px; color: #5b6b83; }
 .f-value { font-size: 14px; font-weight: 600; color: #1f2937; }
-.f-note { font-size: 10px; color: #a8b3c4; margin-top: 1px; }
+.f-note { font-size: 10px; color: #52647f; margin-top: 1px; }
 
 /* ⑤ 解读 */
 .insights { margin: 4px 0 0; padding-left: 18px; }
@@ -1340,14 +1395,19 @@ function warnClass(level) {
            border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.composer { display: flex; gap: 10px; }
-.composer textarea { flex: 1; background: #fff; border: 1px solid #e5e9f0; border-radius: 8px;
-                     color: #1f2937; padding: 10px 12px; font-size: 13px; resize: none;
-                     font-family: inherit; }
-.composer textarea:focus { outline: none; border-color: #1d4ed8; }
+/* 输入区：作为对话卡片的底部一条，不再单独一张卡片（省高度，也少一条边框） */
+.composer { display: flex; align-items: flex-end; gap: 10px; background: #fff;
+            border: 0; border-top: 1px solid #e5e9f0; border-radius: 0; padding: 10px 12px;
+            transition: background-color .15s ease, border-color .15s ease; }
+.composer:focus-within { background: #fbfdff; border-top-color: #c7d6ee; }
+.composer textarea { flex: 1; min-width: 0; background: transparent; border: none; outline: none;
+                     color: #1f2937; padding: 9px 0; font-size: 13.5px; line-height: 1.6;
+                     resize: none; font-family: inherit; min-height: 58px; max-height: 176px;
+                     overflow-y: auto; }
 .composer textarea:disabled { opacity: .5; }
-.btn-send { padding: 0 22px; border-radius: 8px; border: none; background: #1d4ed8; color: #fff;
-            font-size: 13px; font-weight: 600; cursor: pointer; }
+.btn-send { flex: 0 0 auto; height: 40px; padding: 0 22px; border-radius: 9px; border: none;
+            background: #1d4ed8; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
 .btn-send:disabled { background: #e5e9f0; color: #5b6b83; cursor: default; }
-@media(max-width:767px) { .page-head, .as-header, .chat-header { flex-wrap:wrap; gap:8px; } .bubble { max-width:100%; overflow-wrap:anywhere; } .composer { gap:6px; } .composer textarea { min-width:0; } .btn-send { padding:0 12px; } }
+.btn-send:not(:disabled):hover { background: #1743bd; }
+@media(max-width:767px) { .page-head, .as-header, .chat-header { flex-wrap:wrap; gap:8px; } .bubble { max-width:100%; overflow-wrap:anywhere; } .composer { gap:6px; padding:8px 10px; } .composer textarea { min-width:0; } .btn-send { padding:0 12px; } .agent-page { height: calc(100dvh - 92px); } }
 </style>
